@@ -5,9 +5,9 @@ describe("config flag viewer banner policy", () => {
   const api = readFileSync("src/triggers/api.ts", "utf-8");
   const viewer = readFileSync("src/viewer/index.html", "utf-8");
 
-  it("marks disabled auto-compress as informational", () => {
+  it("marks disabled auto-compress as intentionally quiet", () => {
     expect(api).toMatch(
-      /key:\s*"AGENTMEMORY_AUTO_COMPRESS"[\s\S]*?disabledBanner:\s*"info"/,
+      /key:\s*"AGENTMEMORY_AUTO_COMPRESS"[\s\S]*?disabledBanner:\s*"none"/,
     );
   });
 
