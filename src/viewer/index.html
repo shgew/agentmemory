@@ -3729,11 +3729,14 @@
       (cfg.flags || []).forEach(function(f) {
         if (f.enabled) return;
         if (dismissed[f.key]) return;
+        var disabledBanner = f.disabledBanner || 'warn';
+        if (disabledBanner === 'none') return;
+        var bannerKind = disabledBanner === 'info' ? 'info' : 'warn';
         var tabsAffected = (f.affects || []).map(function(t) { return t.toLowerCase(); });
         if (tabsAffected.length && tabsAffected.indexOf(state.activeTab) === -1 && state.activeTab !== 'dashboard') return;
         banners.push({
-          kind: 'warn',
-          icon: '&#9888;',
+          kind: bannerKind,
+          icon: bannerKind === 'info' ? '&#9881;' : '&#9888;',
           title: f.label,
           keyLabel: f.key,
           desc: f.description + (f.needsLlm ? ' Requires an LLM provider key (ANTHROPIC_API_KEY, GEMINI_API_KEY, etc.).' : ''),
