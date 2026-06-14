@@ -209,7 +209,7 @@ export function registerApiTriggers(
           label: "LLM-powered observation compression",
           enabled: isAutoCompressEnabled(),
           default: false,
-          disabledBanner: "none",
+          disabledBanner: "info",
           affects: ["Memories", "Timeline"],
           needsLlm: true,
           description: "Every observation is compressed by the LLM for richer summaries (costs tokens). OFF uses zero-LLM synthetic compression.",
