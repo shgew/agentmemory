@@ -355,6 +355,28 @@ export const V040_TOOLS: McpToolDef[] = [
       },
     },
   },
+  {
+    name: "memory_session_sweep",
+    description:
+      "End sessions that have been status=active for longer than maxAgeMs. Each swept session triggers the canonical end pipeline (summarize, optional graph-extract, optional slot-reflect). Default maxAgeMs is 6h. Use dryRun=true to preview without changes. Optional sessionIds CSV scopes the sweep to specific sessions.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        dryRun: {
+          type: "boolean",
+          description: "Preview which sessions would be swept without writing",
+        },
+        maxAgeMs: {
+          type: "number",
+          description: "Override staleness threshold in milliseconds (default 6h, env SESSION_SWEEP_MAX_AGE_MS)",
+        },
+        sessionIds: {
+          type: "string",
+          description: "Comma-separated session IDs to restrict the sweep to",
+        },
+      },
+    },
+  },
 ];
 
 export const V050_TOOLS: McpToolDef[] = [

@@ -47,6 +47,7 @@ import { registerConsolidateFunction } from "./functions/consolidate.js";
 import { registerPatternsFunction } from "./functions/patterns.js";
 import { registerRememberFunction } from "./functions/remember.js";
 import { registerEvictFunction } from "./functions/evict.js";
+import { registerSessionSweepFunction } from "./functions/session-sweep.js";
 import { registerRelationsFunction } from "./functions/relations.js";
 import { registerTimelineFunction } from "./functions/timeline.js";
 import { registerSmartSearchFunction } from "./functions/smart-search.js";
@@ -250,6 +251,7 @@ async function main() {
   registerPatternsFunction(sdk, kv);
   registerRememberFunction(sdk, kv);
   registerEvictFunction(sdk, kv);
+  registerSessionSweepFunction(sdk, kv);
 
   registerRelationsFunction(sdk, kv);
   registerTimelineFunction(sdk, kv);
@@ -518,7 +520,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 128 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 129 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
@@ -587,6 +589,62 @@ async function main() {
     }, consolidationIntervalMs);
     consolidationTimer.unref();
     bootLog(`Auto-consolidation: enabled (every ${consolidationIntervalMs / 60000}m)`);
+  }
+
+  if (process.env.SESSION_SWEEP_ENABLED !== "false") {
+    const parsePositiveInt = (raw: string | undefined, def: number): number => {
+      const parsed = parseInt(raw || "", 10);
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : def;
+    };
+    const parseHour = (raw: string | undefined, def: number): number => {
+      const parsed = parseInt(raw || "", 10);
+      return Number.isFinite(parsed) && parsed >= 0 && parsed <= 23
+        ? parsed
+        : def;
+    };
+    const sessionSweepIntervalMs = parsePositiveInt(
+      process.env.SESSION_SWEEP_INTERVAL_MS,
+      86400000,
+    );
+    const sessionSweepMaxAgeMs = parsePositiveInt(
+      process.env.SESSION_SWEEP_MAX_AGE_MS,
+      21600000,
+    );
+    const sessionSweepHour = parseHour(process.env.SESSION_SWEEP_HOUR, 3);
+
+    const fireSessionSweep = async () => {
+      try {
+        await sdk.trigger({
+          function_id: "mem::session-sweep",
+          payload: { dryRun: false, maxAgeMs: sessionSweepMaxAgeMs },
+        });
+      } catch {}
+    };
+
+    const msUntilNextOccurrence = (hour: number): number => {
+      const nowDate = new Date();
+      const target = new Date(nowDate);
+      target.setHours(hour, 0, 0, 0);
+      if (target.getTime() <= nowDate.getTime()) {
+        target.setDate(target.getDate() + 1);
+      }
+      return target.getTime() - nowDate.getTime();
+    };
+
+    const startupDelayMs = msUntilNextOccurrence(sessionSweepHour);
+    const sessionSweepInitialTimer = setTimeout(() => {
+      void fireSessionSweep();
+      const sessionSweepRepeatTimer = setInterval(() => {
+        void fireSessionSweep();
+      }, sessionSweepIntervalMs);
+      sessionSweepRepeatTimer.unref();
+    }, startupDelayMs);
+    sessionSweepInitialTimer.unref();
+
+    const startupMinutes = Math.round(startupDelayMs / 60000);
+    bootLog(
+      `Session sweep: enabled (first run at ${String(sessionSweepHour).padStart(2, "0")}:00 local in ${startupMinutes}m, then every ${sessionSweepIntervalMs / 3600000}h, threshold ${sessionSweepMaxAgeMs / 3600000}h)`,
+    );
   }
 
   const shutdown = async () => {

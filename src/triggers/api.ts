@@ -654,6 +654,48 @@ export function registerApiTriggers(
     },
   });
 
+  sdk.registerFunction("api::session-sweep",
+    async (req: ApiRequest<{ dryRun?: boolean; maxAgeMs?: number; sessionIds?: string[] }>): Promise<Response> => {
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const payload: { dryRun?: boolean; maxAgeMs?: number; sessionIds?: string[] } = {};
+      if (body.dryRun !== undefined) {
+        if (typeof body.dryRun !== "boolean") {
+          return { status_code: 400, body: { error: "dryRun must be a boolean" } };
+        }
+        payload.dryRun = body.dryRun;
+      }
+      if (body.maxAgeMs !== undefined) {
+        if (typeof body.maxAgeMs !== "number" || !Number.isFinite(body.maxAgeMs) || body.maxAgeMs <= 0) {
+          return { status_code: 400, body: { error: "maxAgeMs must be a positive number" } };
+        }
+        payload.maxAgeMs = body.maxAgeMs;
+      }
+      if (body.sessionIds !== undefined) {
+        if (
+          !Array.isArray(body.sessionIds) ||
+          body.sessionIds.some((s) => typeof s !== "string" || !s.trim())
+        ) {
+          return { status_code: 400, body: { error: "sessionIds must be an array of non-empty strings" } };
+        }
+        payload.sessionIds = body.sessionIds as string[];
+      }
+      const result = await sdk.trigger({
+        function_id: "mem::session-sweep",
+        payload,
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::session-sweep",
+    config: {
+      api_path: "/agentmemory/session/sweep",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
   sdk.registerFunction("api::summarize", 
     async (req: ApiRequest<{ sessionId: string }>): Promise<Response> => {
       const sessionId = asNonEmptyString((req.body as Record<string, unknown>)?.sessionId);

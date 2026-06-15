@@ -1091,6 +1091,39 @@ export function registerMcpEndpoints(
             return { status_code: 200, body: { content: [{ type: "text", text: JSON.stringify(verifyResult, null, 2) }] } };
           }
 
+          case "memory_session_sweep": {
+            const swDryRun =
+              typeof args.dryRun === "boolean" ? args.dryRun : undefined;
+            const swMaxAgeMs = asNumber(args.maxAgeMs);
+            if (
+              args.maxAgeMs !== undefined &&
+              (!Number.isFinite(swMaxAgeMs) || (swMaxAgeMs ?? 0) <= 0)
+            ) {
+              return {
+                status_code: 400,
+                body: { error: "maxAgeMs must be a positive number" },
+              };
+            }
+            const swSessionIds = parseCsvList(args.sessionIds);
+            const swResult = await sdk.trigger({
+              function_id: "mem::session-sweep",
+              payload: {
+                dryRun: swDryRun,
+                maxAgeMs: swMaxAgeMs,
+                sessionIds:
+                  swSessionIds.length > 0 ? swSessionIds : undefined,
+              },
+            });
+            return {
+              status_code: 200,
+              body: {
+                content: [
+                  { type: "text", text: JSON.stringify(swResult, null, 2) },
+                ],
+              },
+            };
+          }
+
           case "memory_lesson_save": {
             if (typeof args.content !== "string" || !args.content.trim()) {
               return { status_code: 400, body: { error: "content is required" } };
