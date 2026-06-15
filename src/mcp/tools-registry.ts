@@ -358,7 +358,7 @@ export const V040_TOOLS: McpToolDef[] = [
   {
     name: "memory_session_sweep",
     description:
-      "End sessions that have been status=active for longer than maxAgeMs. Each swept session triggers the canonical end pipeline (summarize, optional graph-extract, optional slot-reflect). Default maxAgeMs is 6h. Use dryRun=true to preview without changes. Optional sessionIds CSV scopes the sweep to specific sessions.",
+      "Checkpoint consolidation on stale sessions. Active sessions with no recent activity transition to status=completed exactly once, firing event::session::stopped. Completed sessions with post-close activity (status stays completed) get re-checkpointed via event::session::checkpoint - graph-extract and slot-reflect re-run only over observations after the prior watermark. Default staleness 6h via SESSION_SWEEP_MAX_AGE_MS. Use dryRun=true to preview without changes. Optional sessionIds CSV scopes the sweep.",
     inputSchema: {
       type: "object",
       properties: {
