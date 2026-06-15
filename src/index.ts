@@ -623,8 +623,16 @@ async function main() {
       } catch {}
     };
 
-    const scheduleNextSessionSweep = (): number => {
-      const delayMs = nextCronFireMs(sessionSweepCronSpec);
+    const scheduleNextSessionSweep = (): number | null => {
+      let delayMs: number;
+      try {
+        delayMs = nextCronFireMs(sessionSweepCronSpec);
+      } catch (err) {
+        console.warn(
+          `[agentmemory] Cron expression "${sessionSweepCronExpr}" has no fire within one year: ${err instanceof Error ? err.message : String(err)}. Session sweep schedule disabled.`,
+        );
+        return null;
+      }
       const timer = setTimeout(() => {
         void fireSessionSweep();
         scheduleNextSessionSweep();
@@ -634,10 +642,12 @@ async function main() {
     };
 
     const firstSessionSweepDelayMs = scheduleNextSessionSweep();
-    const firstSessionSweepAt = new Date(Date.now() + firstSessionSweepDelayMs);
-    bootLog(
-      `Session sweep: enabled (cron "${sessionSweepCronExpr}", first run at ${firstSessionSweepAt.toLocaleString()}, threshold ${sessionSweepMaxAgeMs / 3600000}h)`,
-    );
+    if (firstSessionSweepDelayMs !== null) {
+      const firstSessionSweepAt = new Date(Date.now() + firstSessionSweepDelayMs);
+      bootLog(
+        `Session sweep: enabled (cron "${sessionSweepCronExpr}", first run at ${firstSessionSweepAt.toLocaleString()}, threshold ${sessionSweepMaxAgeMs / 3600000}h)`,
+      );
+    }
   }
 
   const shutdown = async () => {

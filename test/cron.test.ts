@@ -108,4 +108,9 @@ describe("nextCronFireMs", () => {
     const ms = nextCronFireMs(spec, from);
     expect(ms).toBe(4.5 * 60 * 60 * 1000);
   });
+
+  it("throws on impossible cron like Feb 31 (no match within one year)", () => {
+    const spec = parseCron("0 0 31 2 *");
+    expect(() => nextCronFireMs(spec)).toThrow(/no match within one year/);
+  });
 });
