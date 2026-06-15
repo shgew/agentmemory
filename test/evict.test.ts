@@ -1,10 +1,11 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, afterEach, vi } from "vitest";
 import type {
   CompressedObservation,
   RawObservation,
   Session,
 } from "../src/types.js";
 import { registerEvictFunction } from "../src/functions/evict.js";
+import { registerEventTriggers } from "../src/triggers/events.js";
 import { KV } from "../src/state/schema.js";
 
 vi.mock("../src/logger.js", () => ({
@@ -14,8 +15,24 @@ vi.mock("../src/logger.js", () => ({
 type Store = Map<string, Map<string, unknown>>;
 type Handler = (payload: unknown) => unknown | Promise<unknown>;
 
+const ORIGINAL_ENV = { ...process.env };
+
+afterEach(() => {
+  process.env = { ...ORIGINAL_ENV };
+});
+
 function daysAgo(days: number): string {
   return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 function makeSession(id: string): Session {
@@ -86,6 +103,7 @@ function mockSdk() {
       registerFunction: (functionId: string, handler: Handler) => {
         handlers.set(functionId, handler);
       },
+      registerTrigger: vi.fn(),
       trigger: async (input: { function_id: string; payload: unknown }) => {
         calls.push(input);
         const handler = handlers.get(input.function_id);
@@ -126,7 +144,7 @@ describe("mem::evict stale sessions", () => {
 
     registerEvictFunction(sdk as never, kv as never);
     sdk.registerFunction("event::session::stopped", async (payload) => {
-      expect(payload).toEqual({ sessionId });
+      expect(payload).toEqual({ sessionId, waitForCompletion: true });
       expect(await kv.get(KV.sessions, sessionId)).toMatchObject({
         id: sessionId,
       });
@@ -155,6 +173,62 @@ describe("mem::evict stale sessions", () => {
     expect(calls.map((call) => call.function_id)).toContain(
       "mem::consolidate-pipeline",
     );
+  });
+
+  it("waits for real queued recovery before deleting a stale observed session", async () => {
+    const sessionId = "ses_real_queue";
+    const store = storeForObservedSession(sessionId);
+    const kv = mockKV(store);
+    const { sdk } = mockSdk();
+    const enteredSummary = deferred();
+    const allowSummary = deferred();
+    let evictSettled = false;
+    let summarySawSession = false;
+
+    process.env.GRAPH_EXTRACTION_ENABLED = "false";
+    registerEventTriggers(sdk as never, kv as never);
+    registerEvictFunction(sdk as never, kv as never);
+    sdk.registerFunction("mem::summarize", async (payload: { sessionId: string }) => {
+      enteredSummary.resolve();
+      await allowSummary.promise;
+      summarySawSession = (await kv.get(KV.sessions, payload.sessionId)) !== null;
+      if (summarySawSession) {
+        await kv.set(KV.summaries, payload.sessionId, {
+          sessionId: payload.sessionId,
+          project: "agentmemory",
+          createdAt: new Date().toISOString(),
+          title: "Recovered stale session",
+          narrative: "Recovered before eviction.",
+          keyDecisions: [],
+          filesModified: [],
+          concepts: [],
+          observationCount: 1,
+        });
+      }
+      return summarySawSession
+        ? { success: true }
+        : { success: false, error: "session_not_found" };
+    });
+
+    const evictPromise = sdk
+      .trigger({ function_id: "mem::evict", payload: {} })
+      .then((result) => {
+        evictSettled = true;
+        return result as { staleSessions: number };
+      });
+
+    await enteredSummary.promise;
+    await Promise.resolve();
+    const settledBeforeRecoveryFinished = evictSettled;
+
+    allowSummary.resolve();
+    const result = await evictPromise;
+
+    expect(settledBeforeRecoveryFinished).toBe(false);
+    expect(summarySawSession).toBe(true);
+    expect(result.staleSessions).toBe(1);
+    expect(await kv.get(KV.summaries, sessionId)).toMatchObject({ sessionId });
+    expect(await kv.get(KV.sessions, sessionId)).toBeNull();
   });
 
   it("keeps a stale observed session when recovery fails", async () => {

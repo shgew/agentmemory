@@ -6,6 +6,48 @@ import { isReflectEnabled } from "../functions/slots.js";
 import { isGraphExtractionEnabled } from "../config.js";
 import { logger } from "../logger.js";
 
+let sessionStoppedQueue: Promise<void> = Promise.resolve();
+let sessionStoppedQueueDepth = 0;
+
+type SessionStoppedPayload = { sessionId: string; waitForCompletion?: boolean };
+type SessionStoppedQueued = { queued: true; sessionId: string; queueDepth: number };
+type QueuedSessionStopped = SessionStoppedQueued & { done: Promise<unknown> };
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function enqueueSessionStopped(
+  sessionId: string,
+  run: () => Promise<unknown>,
+): QueuedSessionStopped {
+  const queueDepth = ++sessionStoppedQueueDepth;
+  const previous = sessionStoppedQueue.catch((err) => {
+    logger.error("Previous session stopped pipeline failed", {
+      error: errorMessage(err),
+    });
+  });
+  const done = previous.then(async () => {
+    logger.info("Session stopped pipeline started", { sessionId, queueDepth });
+    try {
+      const result = await run();
+      logger.info("Session stopped pipeline complete", { sessionId });
+      return result;
+    } catch (err) {
+      const error = errorMessage(err);
+      logger.error("Session stopped pipeline failed", {
+        sessionId,
+        error,
+      });
+      return { success: false, error };
+    } finally {
+      sessionStoppedQueueDepth = Math.max(0, sessionStoppedQueueDepth - 1);
+    }
+  });
+  sessionStoppedQueue = done.then(() => undefined, () => undefined);
+  return { queued: true, sessionId, queueDepth, done };
+}
+
 export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction(
     "event::session::started",
@@ -44,43 +86,52 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     config: { topic: "agentmemory.observation" },
   });
 
-  sdk.registerFunction("event::session::stopped", async (data: { sessionId: string }) => {
-    const summary = await sdk.trigger({ function_id: "mem::summarize", payload: data });
-    if (isReflectEnabled()) {
-      try {
-        sdk.trigger({
-          function_id: "mem::slot-reflect",
-          payload: { sessionId: data.sessionId },
-          action: TriggerAction.Void(),
-        });
-      } catch (err) {
-        logger.warn("slot-reflect trigger failed", {
-          sessionId: data.sessionId,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-    if (isGraphExtractionEnabled()) {
-      try {
-        const observations = await kv.list<CompressedObservation>(
-          KV.observations(data.sessionId),
-        );
-        const compressed = observations.filter((o) => o.title);
-        if (compressed.length > 0) {
+  sdk.registerFunction("event::session::stopped", async (data: SessionStoppedPayload) => {
+    const queued = enqueueSessionStopped(data.sessionId, async () => {
+      const summary = await sdk.trigger({
+        function_id: "mem::summarize",
+        payload: { sessionId: data.sessionId },
+      });
+      if (isReflectEnabled()) {
+        try {
           sdk.trigger({
-            function_id: "mem::graph-extract",
-            payload: { observations: compressed },
+            function_id: "mem::slot-reflect",
+            payload: { sessionId: data.sessionId },
             action: TriggerAction.Void(),
           });
+        } catch (err) {
+          logger.warn("slot-reflect trigger failed", {
+            sessionId: data.sessionId,
+            error: errorMessage(err),
+          });
         }
-      } catch (err) {
-        logger.warn("graph-extract trigger failed", {
-          sessionId: data.sessionId,
-          error: err instanceof Error ? err.message : String(err),
-        });
       }
-    }
-    return summary;
+      if (isGraphExtractionEnabled()) {
+        try {
+          const observations = await kv.list<CompressedObservation>(
+            KV.observations(data.sessionId),
+          );
+          const compressed = observations.filter((o) => o.title);
+          if (compressed.length > 0) {
+            await sdk.trigger({
+              function_id: "mem::graph-extract",
+              payload: { observations: compressed },
+            });
+          }
+        } catch (err) {
+          logger.warn("graph-extract trigger failed", {
+            sessionId: data.sessionId,
+            error: errorMessage(err),
+          });
+        }
+      }
+      return summary;
+    });
+    return data.waitForCompletion ? queued.done : {
+      queued: true,
+      sessionId: queued.sessionId,
+      queueDepth: queued.queueDepth,
+    };
   });
   sdk.registerTrigger({
     type: "durable:subscriber",
@@ -104,7 +155,6 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     config: { topic: "agentmemory.session.ended" },
   });
 
-  // React to observation count changes and emit a lightweight live event for dashboards/viewer.
   sdk.registerFunction(
     "event::session::observation-count-changed",
     async (payload: {
