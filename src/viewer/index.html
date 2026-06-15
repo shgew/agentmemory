@@ -1694,7 +1694,7 @@
       }
 
       html += '<div style="text-align:center;margin-top:20px;"><button class="btn btn-primary" data-action="refresh-dashboard">Refresh</button>';
-      html += '<span style="font-size:10px;color:var(--ink-faint);margin-left:10px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:0.08em;">Auto-refresh 30s</span></div>';
+      html += '<span id="dashboard-refresh-status" style="font-size:10px;color:var(--ink-faint);margin-left:10px;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:0.08em;">' + esc(dashboardRefreshCopy()) + '</span></div>';
 
       el.innerHTML = html;
     }
@@ -1705,6 +1705,16 @@
     var dashboardReloadPending = false;
     function refreshDashboard() {
       loadDashboard({ preserveContent: true });
+    }
+    function dashboardRefreshCopy() {
+      if (pollTimer) return 'Polling every ' + ((POLL_INTERVAL_MS || 10000) / 1000) + 's';
+      var ws = state.ws;
+      if (typeof WebSocket !== 'undefined' && ws && ws.readyState === WebSocket.OPEN) return 'Live updates, 30s backup';
+      return 'Auto-refresh 30s';
+    }
+    function updateDashboardRefreshStatus() {
+      var el = document.getElementById('dashboard-refresh-status');
+      if (el) el.textContent = dashboardRefreshCopy();
     }
     function scheduleDashboardRefresh(delay) {
       if (dashboardRefreshTimer) clearTimeout(dashboardRefreshTimer);
@@ -3591,6 +3601,7 @@
       if (!el) return;
       el.textContent = text;
       el.className = 'ws-status ' + cls;
+      updateDashboardRefreshStatus();
     }
 
     var WS_REPROBE_EVERY_TICKS = 6;
@@ -3623,12 +3634,14 @@
           }
         }
       }, POLL_INTERVAL_MS);
+      updateDashboardRefreshStatus();
     }
 
     function stopPolling() {
       if (!pollTimer) return;
       clearInterval(pollTimer);
       pollTimer = null;
+      updateDashboardRefreshStatus();
     }
 
     var WS_CONNECT_TIMEOUT_MS = 5000;
