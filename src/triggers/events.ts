@@ -9,7 +9,7 @@ import { logger } from "../logger.js";
 let sessionStoppedQueue: Promise<void> = Promise.resolve();
 let sessionStoppedQueueDepth = 0;
 
-type SessionStoppedPayload = { sessionId: string; waitForCompletion?: boolean };
+type SessionStoppedPayload = { sessionId: string; since?: string; until?: string; waitForCompletion?: boolean };
 type SessionStoppedQueued = { queued: true; sessionId: string; queueDepth: number };
 type QueuedSessionStopped = SessionStoppedQueued & { done: Promise<unknown> };
 
@@ -86,47 +86,54 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     config: { topic: "agentmemory.observation" },
   });
 
-  sdk.registerFunction("event::session::stopped", async (data: SessionStoppedPayload) => {
-    const queued = enqueueSessionStopped(data.sessionId, async () => {
-      const summary = await sdk.trigger({
-        function_id: "mem::summarize",
-        payload: { sessionId: data.sessionId },
-      });
-      if (isReflectEnabled()) {
-        try {
-          sdk.trigger({
-            function_id: "mem::slot-reflect",
-            payload: { sessionId: data.sessionId },
-            action: TriggerAction.Void(),
-          });
-        } catch (err) {
-          logger.warn("slot-reflect trigger failed", {
-            sessionId: data.sessionId,
-            error: errorMessage(err),
-          });
-        }
-      }
-      if (isGraphExtractionEnabled()) {
-        try {
-          const observations = await kv.list<CompressedObservation>(
-            KV.observations(data.sessionId),
-          );
-          const compressed = observations.filter((o) => o.title);
-          if (compressed.length > 0) {
-            await sdk.trigger({
-              function_id: "mem::graph-extract",
-              payload: { observations: compressed },
-            });
-          }
-        } catch (err) {
-          logger.warn("graph-extract trigger failed", {
-            sessionId: data.sessionId,
-            error: errorMessage(err),
-          });
-        }
-      }
-      return summary;
+  const runSessionConsolidation = async (params: {
+    sessionId: string;
+    since?: string;
+    until?: string;
+  }): Promise<unknown> => {
+    const { sessionId, since, until } = params;
+    const summary = await sdk.trigger({
+      function_id: "mem::summarize",
+      payload: { sessionId, ...(until ? { until } : {}) },
     });
+    if (isReflectEnabled()) {
+      try {
+        sdk.trigger({
+          function_id: "mem::slot-reflect",
+          payload: { sessionId, ...(since ? { since } : {}), ...(until ? { until } : {}) },
+          action: TriggerAction.Void(),
+        });
+      } catch (err) {
+        logger.warn("slot-reflect trigger failed", { sessionId, error: errorMessage(err) });
+      }
+    }
+    if (isGraphExtractionEnabled()) {
+      try {
+        const observations = await kv.list<CompressedObservation>(
+          KV.observations(sessionId),
+        );
+        const compressed = observations.filter((o) => o.title);
+        if (compressed.length > 0) {
+          await sdk.trigger({
+            function_id: "mem::graph-extract",
+            payload: {
+              observations: compressed,
+              ...(since ? { since } : {}),
+              ...(until ? { until } : {}),
+            },
+          });
+        }
+      } catch (err) {
+        logger.warn("graph-extract trigger failed", { sessionId, error: errorMessage(err) });
+      }
+    }
+    return summary;
+  };
+
+  sdk.registerFunction("event::session::stopped", async (data: SessionStoppedPayload) => {
+    const queued = enqueueSessionStopped(data.sessionId, async () =>
+      runSessionConsolidation({ sessionId: data.sessionId, since: data.since, until: data.until }),
+    );
     return data.waitForCompletion ? queued.done : {
       queued: true,
       sessionId: queued.sessionId,
@@ -139,12 +146,32 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     config: { topic: "agentmemory.session.stopped" },
   });
 
+  sdk.registerFunction("event::session::checkpoint", async (data: SessionStoppedPayload) => {
+    const queued = enqueueSessionStopped(data.sessionId, async () =>
+      runSessionConsolidation({ sessionId: data.sessionId, since: data.since, until: data.until }),
+    );
+    return data.waitForCompletion ? queued.done : {
+      queued: true,
+      sessionId: queued.sessionId,
+      queueDepth: queued.queueDepth,
+    };
+  });
+  sdk.registerTrigger({
+    type: "durable:subscriber",
+    function_id: "event::session::checkpoint",
+    config: { topic: "agentmemory.session.checkpoint" },
+  });
+
   sdk.registerFunction(
     "event::session::ended",
     async (data: { sessionId: string }) => {
+      const existing = await kv.get<Session>(KV.sessions, data.sessionId);
+      const anchor = existing?.updatedAt ?? existing?.startedAt ?? new Date().toISOString();
+      const endedAt = new Date().toISOString();
       await kv.update(KV.sessions, data.sessionId, [
-        { type: "set", path: "endedAt", value: new Date().toISOString() },
+        { type: "set", path: "endedAt", value: endedAt },
         { type: "set", path: "status", value: "completed" },
+        { type: "set", path: "lastCheckpointAt", value: anchor },
       ]);
       return { success: true };
     },

@@ -255,3 +255,49 @@ describe("slots — reflect", () => {
     expect(patterns.slot.content).toMatch(/errors: 2/);
   });
 });
+
+
+describe("slots — reflect windowing", () => {
+  let kv: ReturnType<typeof mockKV>;
+  let handlers: Record<string, (d: Record<string, unknown>) => Promise<Record<string, unknown>>>;
+
+  beforeEach(async () => {
+    ({ kv, handlers } = wire());
+    await waitForSeed(kv);
+  });
+
+  it("filters observations to (since, until] window before reflection", async () => {
+    const sessionId = "sess_window";
+    const obsKey = KV.observations(sessionId);
+    const t0 = "2026-01-01T10:00:00.000Z";
+    const t1 = "2026-01-01T11:00:00.000Z";
+    const t2 = "2026-01-01T12:00:00.000Z";
+    const base = {
+      sessionId,
+      type: "error" as const,
+      subtitle: "",
+      facts: [],
+      narrative: "tsc failed",
+      concepts: [],
+      files: ["src/a.ts"],
+      importance: 5,
+    };
+    await kv.set(obsKey, "before", { ...base, id: "before", title: "compile error before", timestamp: t0 });
+    await kv.set(obsKey, "in", { ...base, id: "in", title: "compile error in", timestamp: t1 });
+    await kv.set(obsKey, "after", { ...base, id: "after", title: "compile error after", timestamp: t2 });
+
+    const res = (await handlers["mem::slot-reflect"]({
+      sessionId,
+      since: t0,
+      until: t1,
+    })) as { success: boolean; observationsReviewed: number; applied: number };
+    expect(res.success).toBe(true);
+    expect(res.observationsReviewed).toBe(1);
+    expect(res.applied).toBeGreaterThan(0);
+
+    const patterns = (await handlers["mem::slot-get"]({ label: "session_patterns" })) as {
+      slot: { content: string };
+    };
+    expect(patterns.slot.content).toMatch(/errors: 1/);
+  });
+});

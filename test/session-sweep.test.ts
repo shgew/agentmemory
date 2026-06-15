@@ -154,7 +154,7 @@ describe("Session Sweep Function", () => {
     expect(stored?.endedAt).toBeUndefined();
   });
 
-  it("ignores sessions whose status is not active", async () => {
+  it("skips legacy completed sessions whose activity anchor is <= endedAt (no post-close activity)", async () => {
     const done = makeSession({
       id: "ses_done",
       startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(),
@@ -166,16 +166,20 @@ describe("Session Sweep Function", () => {
     const result = (await sdk.trigger({
       function_id: "mem::session-sweep",
       payload: {},
-    })) as { swept: string[]; skipped: string[]; totalActive: number };
+    })) as { swept: string[]; checkpointed?: string[]; skipped: string[] };
 
     expect(result.swept).not.toContain("ses_done");
-    expect(result.skipped).not.toContain("ses_done");
-    expect(result.totalActive).toBe(0);
+    expect(result.checkpointed ?? []).not.toContain("ses_done");
+    expect(result.skipped).toContain("ses_done");
 
     const stoppedTriggers = sdk.triggerCalls.filter(
       (c) => c.function_id === "event::session::stopped",
     );
+    const checkpointTriggers = sdk.triggerCalls.filter(
+      (c) => c.function_id === "event::session::checkpoint",
+    );
     expect(stoppedTriggers).toHaveLength(0);
+    expect(checkpointTriggers).toHaveLength(0);
   });
 
   it("dryRun returns swept list without writing KV or firing triggers", async () => {
@@ -344,5 +348,150 @@ describe("Session Sweep Function", () => {
 
     expect(result.swept).toContain("ses_good");
     expect(result.failed.map((f) => f.sessionId)).toContain("ses_bad");
+  });
+});
+
+describe("Session Sweep - Option K checkpoint path", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    registerSessionSweepFunction(sdk as never, kv as never);
+  });
+
+  it("active path sets lastCheckpointAt=activityAnchor when transitioning to completed", async () => {
+    const anchor = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+    const stale = makeSession({
+      id: "ses_active_anchor",
+      startedAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+      updatedAt: anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_active_anchor", stale);
+
+    await sdk.trigger({ function_id: "mem::session-sweep", payload: {} });
+
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_active_anchor");
+    expect(stored?.status).toBe("completed");
+    expect(stored?.endedAt).toBeDefined();
+    expect(stored?.lastCheckpointAt).toBe(anchor);
+  });
+
+  it("S2 - checkpoints completed session with post-close activity after another 6h", async () => {
+    const day1Anchor = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const day2Anchor = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_resumed",
+      startedAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
+      updatedAt: day2Anchor,
+      status: "completed",
+      endedAt: new Date(Date.now() - 18 * 60 * 60 * 1000).toISOString(),
+      lastCheckpointAt: day1Anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_resumed", session);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    })) as { swept: string[]; checkpointed: string[]; skipped: string[] };
+
+    expect(result.checkpointed).toContain("ses_resumed");
+    expect(result.swept).not.toContain("ses_resumed");
+    expect(result.skipped).not.toContain("ses_resumed");
+  });
+
+  it("checkpoint path preserves status=completed and endedAt, advances lastCheckpointAt", async () => {
+    const day1Anchor = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const day2Anchor = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+    const originalEndedAt = new Date(Date.now() - 18 * 60 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_preserve",
+      startedAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
+      updatedAt: day2Anchor,
+      status: "completed",
+      endedAt: originalEndedAt,
+      lastCheckpointAt: day1Anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_preserve", session);
+
+    await sdk.trigger({ function_id: "mem::session-sweep", payload: {} });
+
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_preserve");
+    expect(stored?.status).toBe("completed");
+    expect(stored?.endedAt).toBe(originalEndedAt);
+    expect(stored?.lastCheckpointAt).toBe(day2Anchor);
+  });
+
+  it("checkpoint path fires event::session::checkpoint (not ::stopped) with since+until", async () => {
+    const day1Anchor = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const day2Anchor = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_event",
+      startedAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
+      updatedAt: day2Anchor,
+      status: "completed",
+      endedAt: new Date(Date.now() - 18 * 60 * 60 * 1000).toISOString(),
+      lastCheckpointAt: day1Anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_event", session);
+
+    await sdk.trigger({ function_id: "mem::session-sweep", payload: {} });
+
+    const stoppedTriggers = sdk.triggerCalls.filter(
+      (c) => c.function_id === "event::session::stopped",
+    );
+    const checkpointTriggers = sdk.triggerCalls.filter(
+      (c) => c.function_id === "event::session::checkpoint",
+    );
+    expect(stoppedTriggers).toHaveLength(0);
+    expect(checkpointTriggers).toHaveLength(1);
+    expect((checkpointTriggers[0].payload as any).since).toBe(day1Anchor);
+    expect((checkpointTriggers[0].payload as any).until).toBe(day2Anchor);
+  });
+
+  it("S1 - second sweep skips completed session whose activity anchor <= lastCheckpointAt", async () => {
+    const anchor = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_no_resume",
+      startedAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
+      updatedAt: anchor,
+      status: "completed",
+      endedAt: new Date(Date.now() - 18 * 60 * 60 * 1000).toISOString(),
+      lastCheckpointAt: anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_no_resume", session);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    })) as { swept: string[]; checkpointed: string[]; skipped: string[] };
+
+    expect(result.checkpointed).not.toContain("ses_no_resume");
+    expect(result.swept).not.toContain("ses_no_resume");
+    expect(result.skipped).toContain("ses_no_resume");
+  });
+
+  it("records session_checkpoint audit operation for checkpoint path", async () => {
+    const day1Anchor = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const day2Anchor = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_audit_cp",
+      startedAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
+      updatedAt: day2Anchor,
+      status: "completed",
+      endedAt: new Date(Date.now() - 18 * 60 * 60 * 1000).toISOString(),
+      lastCheckpointAt: day1Anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_audit_cp", session);
+
+    await sdk.trigger({ function_id: "mem::session-sweep", payload: {} });
+
+    const auditEntries = await kv.list<AuditEntry>(AUDIT_SCOPE);
+    const checkpointAudits = auditEntries.filter(
+      (e) => e.operation === "session_checkpoint",
+    );
+    expect(checkpointAudits.length).toBeGreaterThan(0);
+    expect(checkpointAudits[0].targetIds).toContain("ses_audit_cp");
   });
 });

@@ -624,9 +624,13 @@ export function registerApiTriggers(
           body: { error: "sessionId is required and must be a non-empty string" },
         };
       }
+      const existing = await kv.get<Session>(KV.sessions, sessionId);
+      const anchor = existing?.updatedAt ?? existing?.startedAt ?? new Date().toISOString();
+      const endedAt = new Date().toISOString();
       await kv.update(KV.sessions, sessionId, [
-        { type: "set", path: "endedAt", value: new Date().toISOString() },
+        { type: "set", path: "endedAt", value: endedAt },
         { type: "set", path: "status", value: "completed" },
+        { type: "set", path: "lastCheckpointAt", value: anchor },
       ]);
       // Fan out session-stopped lifecycle (non-blocking).
       try {

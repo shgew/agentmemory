@@ -233,7 +233,7 @@ export function registerSummarizeFunction(
   metricsStore?: MetricsStore,
 ): void {
   sdk.registerFunction("mem::summarize", 
-    async (data: { sessionId: string } | undefined) => {
+    async (data: { sessionId: string; until?: string } | undefined) => {
       const startMs = Date.now();
       if (!data || typeof data.sessionId !== "string" || !data.sessionId.trim()) {
         return { success: false, error: "sessionId is required" };
@@ -251,7 +251,10 @@ export function registerSummarizeFunction(
       const observations = await kv.list<CompressedObservation>(
         KV.observations(sessionId),
       );
-      const compressed = observations.filter((o) => o.title);
+      const until = data?.until;
+      const compressed = observations.filter((o) =>
+        o.title && (!until || (typeof o.timestamp === "string" && o.timestamp <= until)),
+      );
 
       if (compressed.length === 0) {
         logger.info("No observations to summarize", {

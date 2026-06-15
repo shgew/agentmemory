@@ -5,6 +5,7 @@ export interface Session {
   startedAt: string;
   updatedAt?: string;
   endedAt?: string;
+  lastCheckpointAt?: string;
   status: "active" | "completed" | "abandoned";
   observationCount: number;
   model?: string;
@@ -610,7 +611,8 @@ export interface AuditEntry {
     | "slot_create"
     | "slot_delete"
     | "slot_reflect"
-    | "session_sweep";
+    | "session_sweep"
+    | "session_checkpoint";
   userId?: string;
   functionId: string;
   targetIds: string[];

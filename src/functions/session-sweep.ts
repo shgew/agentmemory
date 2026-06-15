@@ -16,9 +16,11 @@ interface SweepPayload {
 
 interface SweepResult {
   swept: string[];
+  checkpointed: string[];
   skipped: string[];
   failed: Array<{ sessionId: string; error: string }>;
   totalActive: number;
+  totalCandidates: number;
   maxAgeMs: number;
   dryRun: boolean;
 }
@@ -35,9 +37,15 @@ function resolveMaxAgeMs(payload?: SweepPayload): number {
   return DEFAULT_MAX_AGE_MS;
 }
 
-function sessionAgeMs(session: Session, now: number): number | null {
-  const anchor = session.updatedAt ?? session.startedAt;
-  if (!anchor) return null;
+function activityAnchor(session: Session): string | null {
+  return session.updatedAt ?? session.startedAt ?? null;
+}
+
+function effectiveWatermark(session: Session): string | null {
+  return session.lastCheckpointAt ?? session.endedAt ?? null;
+}
+
+function sessionAgeMs(anchor: string, now: number): number | null {
   const anchorMs = new Date(anchor).getTime();
   if (!Number.isFinite(anchorMs)) return null;
   return now - anchorMs;
@@ -56,24 +64,42 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
 
       const now = Date.now();
       const swept: string[] = [];
+      const checkpointed: string[] = [];
       const skipped: string[] = [];
       const failed: Array<{ sessionId: string; error: string }> = [];
 
       const sessions = await kv.list<Session>(KV.sessions);
       const active = sessions.filter((s) => s.status === "active");
+      const candidates = sessions.filter(
+        (s) => s.status === "active" || s.status === "completed",
+      );
       const scoped = idFilter
-        ? active.filter((s) => idFilter.has(s.id))
-        : active;
+        ? candidates.filter((s) => idFilter.has(s.id))
+        : candidates;
 
       for (const session of scoped) {
-        const ageMs = sessionAgeMs(session, now);
+        const anchor = activityAnchor(session);
+        if (!anchor) {
+          skipped.push(session.id);
+          continue;
+        }
+        const ageMs = sessionAgeMs(anchor, now);
         if (ageMs === null || ageMs <= maxAgeMs) {
+          skipped.push(session.id);
+          continue;
+        }
+        const watermark = effectiveWatermark(session);
+        if (watermark && anchor <= watermark) {
           skipped.push(session.id);
           continue;
         }
 
         if (dryRun) {
-          swept.push(session.id);
+          if (session.status === "active") {
+            swept.push(session.id);
+          } else {
+            checkpointed.push(session.id);
+          }
           continue;
         }
 
@@ -82,29 +108,60 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
             `obs:${session.id}`,
             async (): Promise<
               | { status: "skipped" }
-              | { status: "swept"; ageMs: number; anchor: "updatedAt" | "startedAt" }
+              | { status: "swept"; checkpointAt: string }
+              | { status: "checkpointed"; since: string | null; checkpointAt: string }
             > => {
               const current = await kv.get<Session>(KV.sessions, session.id);
-              if (!current || current.status !== "active") {
+              if (!current) return { status: "skipped" };
+              if (
+                current.status !== "active" &&
+                current.status !== "completed"
+              ) {
                 return { status: "skipped" };
               }
-              const currentAge = sessionAgeMs(current, Date.now());
+              const currentAnchor = activityAnchor(current);
+              if (!currentAnchor) return { status: "skipped" };
+              const currentAge = sessionAgeMs(currentAnchor, Date.now());
               if (currentAge === null || currentAge <= maxAgeMs) {
                 return { status: "skipped" };
               }
-              const endedAt = new Date().toISOString();
+              const currentWatermark = effectiveWatermark(current);
+              if (currentWatermark && currentAnchor <= currentWatermark) {
+                return { status: "skipped" };
+              }
+
+              if (current.status === "active") {
+                const endedAt = new Date().toISOString();
+                await kv.update<Session>(KV.sessions, session.id, [
+                  { type: "set", path: "endedAt", value: endedAt },
+                  { type: "set", path: "status", value: "completed" },
+                  { type: "set", path: "lastCheckpointAt", value: currentAnchor },
+                ]);
+                await sdk.trigger({
+                  function_id: "event::session::stopped",
+                  payload: {
+                    sessionId: session.id,
+                    until: currentAnchor,
+                  },
+                });
+                return { status: "swept", checkpointAt: currentAnchor };
+              }
+
               await kv.update<Session>(KV.sessions, session.id, [
-                { type: "set", path: "endedAt", value: endedAt },
-                { type: "set", path: "status", value: "completed" },
+                { type: "set", path: "lastCheckpointAt", value: currentAnchor },
               ]);
               await sdk.trigger({
-                function_id: "event::session::stopped",
-                payload: { sessionId: session.id },
+                function_id: "event::session::checkpoint",
+                payload: {
+                  sessionId: session.id,
+                  since: currentWatermark,
+                  until: currentAnchor,
+                },
               });
               return {
-                status: "swept",
-                ageMs: currentAge,
-                anchor: current.updatedAt ? "updatedAt" : "startedAt",
+                status: "checkpointed",
+                since: currentWatermark,
+                checkpointAt: currentAnchor,
               };
             },
           );
@@ -114,19 +171,34 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
             continue;
           }
 
-          swept.push(session.id);
-          await safeAudit(
-            kv,
-            "session_sweep",
-            "mem::session-sweep",
-            [session.id],
-            {
-              reason: "stale_active_session_swept",
-              ageMs: outcome.ageMs,
-              maxAgeMs,
-              anchor: outcome.anchor,
-            },
-          );
+          if (outcome.status === "swept") {
+            swept.push(session.id);
+            await safeAudit(
+              kv,
+              "session_sweep",
+              "mem::session-sweep",
+              [session.id],
+              {
+                reason: "stale_active_session_closed",
+                maxAgeMs,
+                checkpointAt: outcome.checkpointAt,
+              },
+            );
+          } else {
+            checkpointed.push(session.id);
+            await safeAudit(
+              kv,
+              "session_checkpoint",
+              "mem::session-sweep",
+              [session.id],
+              {
+                reason: "completed_session_post_close_activity",
+                maxAgeMs,
+                since: outcome.since,
+                until: outcome.checkpointAt,
+              },
+            );
+          }
         } catch (err) {
           failed.push({
             sessionId: session.id,
@@ -137,18 +209,22 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
 
       const result: SweepResult = {
         swept,
+        checkpointed,
         skipped,
         failed,
         totalActive: active.length,
+        totalCandidates: candidates.length,
         maxAgeMs,
         dryRun,
       };
 
       logger.info("Session sweep complete", {
         swept: swept.length,
+        checkpointed: checkpointed.length,
         skipped: skipped.length,
         failed: failed.length,
         totalActive: active.length,
+        totalCandidates: candidates.length,
         maxAgeMs,
         dryRun,
       });

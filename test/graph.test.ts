@@ -730,3 +730,51 @@ describe("Graph Functions", () => {
     });
   });
 });
+
+
+describe("mem::graph-extract windowing", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    vi.clearAllMocks();
+    mockProvider.compress.mockResolvedValue(`<entities></entities><relationships></relationships>`);
+    registerGraphFunction(sdk as never, kv as never, mockProvider as never);
+  });
+
+  it("filters input observations to (since, until] window before LLM call", async () => {
+    const t0 = "2026-01-01T10:00:00.000Z";
+    const t1 = "2026-01-01T11:00:00.000Z";
+    const t2 = "2026-01-01T12:00:00.000Z";
+    const obsA: CompressedObservation = { ...testObs, id: "obs_a", title: "Before window obs A", timestamp: t0 };
+    const obsB: CompressedObservation = { ...testObs, id: "obs_b", title: "In window obs B", timestamp: t1 };
+    const obsC: CompressedObservation = { ...testObs, id: "obs_c", title: "After window obs C", timestamp: t2 };
+
+    await sdk.trigger("mem::graph-extract", {
+      observations: [obsA, obsB, obsC],
+      since: t0,
+      until: t1,
+    });
+
+    expect(mockProvider.compress).toHaveBeenCalledTimes(1);
+    const promptBody = mockProvider.compress.mock.calls[0][1] as string;
+    expect(promptBody).not.toContain("Before window obs A");
+    expect(promptBody).toContain("In window obs B");
+    expect(promptBody).not.toContain("After window obs C");
+  });
+
+  it("returns no_observations when window excludes everything", async () => {
+    const t0 = "2026-01-01T10:00:00.000Z";
+    const t1 = "2026-01-01T11:00:00.000Z";
+    const obsOld: CompressedObservation = { ...testObs, id: "obs_old", timestamp: t0 };
+
+    const result = (await sdk.trigger("mem::graph-extract", {
+      observations: [obsOld],
+      since: t1,
+    })) as { success: boolean; error?: string };
+    expect(result.success).toBe(false);
+    expect(mockProvider.compress).not.toHaveBeenCalled();
+  });
+});

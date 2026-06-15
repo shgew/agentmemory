@@ -360,7 +360,7 @@ export function registerSlotsFunctions(sdk: ISdk, kv: StateKV): void {
 
   sdk.registerFunction(
     "mem::slot-reflect",
-    async (data: { sessionId?: string; maxObservations?: number }) => {
+    async (data: { sessionId?: string; maxObservations?: number; since?: string; until?: string }) => {
       if (!data?.sessionId || typeof data.sessionId !== "string") {
         return { success: false, error: "sessionId required" };
       }
@@ -370,9 +370,18 @@ export function registerSlotsFunctions(sdk: ISdk, kv: StateKV): void {
         data.maxObservations > 0
           ? Math.min(200, data.maxObservations)
           : 50;
-      const observations = await kv.list<CompressedObservation>(
+      const allObservations = await kv.list<CompressedObservation>(
         KV.observations(data.sessionId),
       );
+      const since = data.since;
+      const until = data.until;
+      const observations = (since || until)
+        ? allObservations.filter((o) => {
+            if (since && (!o.timestamp || o.timestamp <= since)) return false;
+            if (until && (!o.timestamp || o.timestamp > until)) return false;
+            return true;
+          })
+        : allObservations;
       if (observations.length === 0) {
         return { success: true, applied: 0, reason: "no observations for session" };
       }

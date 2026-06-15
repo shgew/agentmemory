@@ -456,13 +456,25 @@ export function registerGraphFunction(
   provider: MemoryProvider,
 ): void {
   sdk.registerFunction("mem::graph-extract", 
-    async (data: { observations: CompressedObservation[] }) => {
+    async (data: { observations: CompressedObservation[]; since?: string; until?: string }) => {
       if (!data.observations || data.observations.length === 0) {
         return { success: false, error: "No observations provided" };
       }
+      const since = data.since;
+      const until = data.until;
+      const filtered = (since || until)
+        ? data.observations.filter((o) => {
+            if (since && (!o.timestamp || o.timestamp <= since)) return false;
+            if (until && (!o.timestamp || o.timestamp > until)) return false;
+            return true;
+          })
+        : data.observations;
+      if (filtered.length === 0) {
+        return { success: false, error: "No observations in window" };
+      }
 
       const prompt = buildGraphExtractionPrompt(
-        data.observations.map((o) => ({
+        filtered.map((o) => ({
           title: o.title,
           narrative: o.narrative,
           concepts: o.concepts,
@@ -477,7 +489,7 @@ export function registerGraphFunction(
           prompt,
         );
 
-        const obsIds = data.observations.map((o) => o.id);
+        const obsIds = filtered.map((o) => o.id);
         const { nodes, edges } = parseGraphXml(response, obsIds);
 
         // #814 v2: targeted name-index lookups replace the O(n) scan

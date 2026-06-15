@@ -480,3 +480,36 @@ describe("mem::summarize chunking", () => {
     expect(result.error).toBe("parse_failed");
   });
 });
+
+
+describe("mem::summarize windowing", () => {
+  it("filters observations to timestamp <= until when provided", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const session: Session = {
+      id: "ses_until",
+      project: "test-project",
+      cwd: "/tmp",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      status: "completed",
+      observationCount: 3,
+    };
+    await kv.set("sessions", "ses_until", session);
+    const t0 = "2026-01-01T10:00:00.000Z";
+    const t1 = "2026-01-01T11:00:00.000Z";
+    const t2 = "2026-01-01T12:00:00.000Z";
+    await kv.set("obs:ses_until", "obs_0", { ...makeObs(0, "ses_until"), timestamp: t0 });
+    await kv.set("obs:ses_until", "obs_1", { ...makeObs(1, "ses_until"), timestamp: t1 });
+    await kv.set("obs:ses_until", "obs_2", { ...makeObs(2, "ses_until"), timestamp: t2 });
+    const provider = makeProvider([summaryXml({ title: "windowed" })]);
+    registerSummarizeFunction(sdk as any, kv as any, provider);
+    const handler = sdk.functions.get("mem::summarize")!;
+    const result: any = await handler({ sessionId: "ses_until", until: t1 });
+    expect(result.success).toBe(true);
+    expect(provider.calls).toHaveLength(1);
+    expect(provider.calls[0].user).toContain("Session observations (2 total)");
+    expect(provider.calls[0].user).toContain("obs 0");
+    expect(provider.calls[0].user).toContain("obs 1");
+    expect(provider.calls[0].user).not.toContain("obs 2");
+  });
+});
