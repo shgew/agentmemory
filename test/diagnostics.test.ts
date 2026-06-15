@@ -866,3 +866,65 @@ describe("Diagnostics Functions", () => {
     });
   });
 });
+
+
+describe("diagnose — completed session with uncheckpointed activity (Option K)", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    registerDiagnosticsFunction(sdk as never, kv as never);
+  });
+
+  it("warns about completed sessions with updatedAt > lastCheckpointAt and age over threshold", async () => {
+    const now = Date.now();
+    const stale: Session = {
+      id: "ses_pending_cp",
+      project: "test",
+      cwd: "/tmp",
+      startedAt: new Date(now - 48 * 60 * 60 * 1000).toISOString(),
+      updatedAt: new Date(now - 30 * 60 * 60 * 1000).toISOString(),
+      endedAt: new Date(now - 48 * 60 * 60 * 1000).toISOString(),
+      lastCheckpointAt: new Date(now - 48 * 60 * 60 * 1000).toISOString(),
+      status: "completed",
+      observationCount: 1,
+    };
+    await kv.set(KV.sessions, "ses_pending_cp", stale);
+
+    const result = (await sdk.trigger("mem::diagnose", { categories: ["sessions"] })) as {
+      checks: DiagnosticCheck[];
+    };
+    const pendingChecks = result.checks.filter(
+      (c) => c.name.startsWith("pending-checkpoint:") && c.status === "warn",
+    );
+    expect(pendingChecks.length).toBeGreaterThan(0);
+    expect(pendingChecks[0].name).toContain("ses_pending_cp");
+  });
+
+  it("does not warn about completed sessions where updatedAt <= lastCheckpointAt", async () => {
+    const now = Date.now();
+    const ts = new Date(now - 24 * 60 * 60 * 1000).toISOString();
+    const clean: Session = {
+      id: "ses_clean",
+      project: "test",
+      cwd: "/tmp",
+      startedAt: new Date(now - 48 * 60 * 60 * 1000).toISOString(),
+      updatedAt: ts,
+      endedAt: ts,
+      lastCheckpointAt: ts,
+      status: "completed",
+      observationCount: 1,
+    };
+    await kv.set(KV.sessions, "ses_clean", clean);
+
+    const result = (await sdk.trigger("mem::diagnose", { categories: ["sessions"] })) as {
+      checks: DiagnosticCheck[];
+    };
+    const pendingChecks = result.checks.filter((c) =>
+      c.name.startsWith("pending-checkpoint:"),
+    );
+    expect(pendingChecks).toHaveLength(0);
+  });
+});

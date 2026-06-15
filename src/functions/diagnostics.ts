@@ -305,6 +305,21 @@ export function registerDiagnosticsFunction(sdk: ISdk, kv: StateKV): void {
             });
             sessionIssues++;
           }
+          if (
+            session.status === "completed" &&
+            session.updatedAt &&
+            session.updatedAt > (session.lastCheckpointAt ?? session.endedAt ?? "") &&
+            now - new Date(session.updatedAt).getTime() > TWENTY_FOUR_HOURS_MS
+          ) {
+            checks.push({
+              name: `pending-checkpoint:${session.id}`,
+              category: "sessions",
+              status: "warn",
+              message: `Session ${session.id} is completed but has uncheckpointed activity (updatedAt > lastCheckpointAt) older than 24h`,
+              fixable: false,
+            });
+            sessionIssues++;
+          }
         }
 
         if (sessionIssues === 0) {

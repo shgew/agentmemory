@@ -142,3 +142,110 @@ describe("observe implicit session create (#638)", () => {
     expect(session.updatedAt).toBeTruthy();
   });
 });
+
+
+describe("observe — post-completion warn-once (Option K)", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+  });
+
+  it("does not resurrect a completed session on new observation", async () => {
+    const { registerObserveFunction } = await import("../src/functions/observe.js");
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerObserveFunction(sdk as never, kv as never);
+
+    await kv.set("mem:sessions", "ses_completed", {
+      id: "ses_completed",
+      project: "/repo",
+      cwd: "/repo",
+      startedAt: "2026-01-01T00:00:00Z",
+      endedAt: "2026-01-01T17:00:00Z",
+      status: "completed",
+      observationCount: 5,
+      lastCheckpointAt: "2026-01-01T17:00:00Z",
+    });
+
+    await sdk.trigger("mem::observe", {
+      sessionId: "ses_completed",
+      project: "/repo",
+      cwd: "/repo",
+      hookType: "post_tool_use",
+      timestamp: "2026-01-02T09:00:00Z",
+      data: { tool_name: "Read" },
+    });
+
+    const session = kv.store.get("mem:sessions")!.get("ses_completed") as Record<string, unknown>;
+    expect(session.status).toBe("completed");
+    expect(session.observationCount).toBe(6);
+  });
+
+  it("logs warn when post-completion activity exceeds watermark", async () => {
+    const { logger } = await import("../src/logger.js");
+    const { registerObserveFunction } = await import("../src/functions/observe.js");
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerObserveFunction(sdk as never, kv as never);
+
+    await kv.set("mem:sessions", "ses_warn1", {
+      id: "ses_warn1",
+      project: "/repo",
+      cwd: "/repo",
+      startedAt: "2026-01-01T00:00:00Z",
+      endedAt: "2026-01-01T17:00:00Z",
+      status: "completed",
+      observationCount: 1,
+      lastCheckpointAt: "2026-01-01T17:00:00Z",
+    });
+
+    await sdk.trigger("mem::observe", {
+      sessionId: "ses_warn1",
+      project: "/repo",
+      cwd: "/repo",
+      hookType: "post_tool_use",
+      timestamp: "2026-01-02T09:00:00Z",
+      data: { tool_name: "Read" },
+    });
+
+    const warnCalls = vi.mocked(logger.warn).mock.calls.filter((c) =>
+      typeof c[0] === "string" && c[0].toLowerCase().includes("post-completion"),
+    );
+    expect(warnCalls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("warns once per session even when multiple post-completion observations land", async () => {
+    const { logger } = await import("../src/logger.js");
+    const { registerObserveFunction } = await import("../src/functions/observe.js");
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerObserveFunction(sdk as never, kv as never);
+
+    await kv.set("mem:sessions", "ses_warn2", {
+      id: "ses_warn2",
+      project: "/repo",
+      cwd: "/repo",
+      startedAt: "2026-01-01T00:00:00Z",
+      endedAt: "2026-01-01T17:00:00Z",
+      status: "completed",
+      observationCount: 1,
+      lastCheckpointAt: "2026-01-01T17:00:00Z",
+    });
+
+    for (let i = 0; i < 3; i++) {
+      await sdk.trigger("mem::observe", {
+        sessionId: "ses_warn2",
+        project: "/repo",
+        cwd: "/repo",
+        hookType: "post_tool_use",
+        timestamp: `2026-01-02T0${9 + i}:00:00Z`,
+        data: { tool_name: "Read" },
+      });
+    }
+
+    const warnCalls = vi.mocked(logger.warn).mock.calls.filter((c) =>
+      typeof c[0] === "string" && c[0].toLowerCase().includes("post-completion"),
+    );
+    expect(warnCalls.length).toBe(1);
+  });
+});

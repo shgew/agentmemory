@@ -11,6 +11,8 @@ import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
 
+const postCompletionWarned = new Set<string>();
+
 export function extractImage(d: unknown): string | undefined {
   if (!d) return undefined;
   if (typeof d === "string") {
@@ -142,6 +144,9 @@ export function registerObserveFunction(
           agentId?: string;
           observationCount?: number;
           firstPrompt?: string;
+          status?: string;
+          endedAt?: string;
+          lastCheckpointAt?: string;
         }>(KV.sessions, payload.sessionId);
         const inheritedAgentId = existingSession
           ? existingSession.agentId
@@ -240,6 +245,20 @@ export function registerObserveFunction(
             }
           }
           await kv.update(KV.sessions, payload.sessionId, updates);
+          if (
+            existingSession?.status === "completed" &&
+            typeof payload.timestamp === "string" &&
+            payload.timestamp > (existingSession.lastCheckpointAt ?? existingSession.endedAt ?? "") &&
+            !postCompletionWarned.has(payload.sessionId)
+          ) {
+            postCompletionWarned.add(payload.sessionId);
+            logger.warn("Post-completion session activity observed", {
+              sessionId: payload.sessionId,
+              endedAt: existingSession.endedAt,
+              lastCheckpointAt: existingSession.lastCheckpointAt,
+              timestamp: payload.timestamp,
+            });
+          }
         } else if (
           typeof payload.project === "string" &&
           payload.project.trim().length > 0 &&

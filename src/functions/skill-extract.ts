@@ -123,6 +123,13 @@ export function registerSkillExtractFunctions(
           error: "session must be completed before skill extraction",
         };
       }
+      const watermark = session.lastCheckpointAt ?? session.endedAt ?? "";
+      if (session.updatedAt && session.updatedAt > watermark) {
+        return {
+          success: false,
+          error: "session has uncheckpointed activity; run session sweep first",
+        };
+      }
 
       const [summary, observations] = await Promise.all([
         kv.get<SessionSummary>(KV.summaries, data.sessionId).catch(() => null),

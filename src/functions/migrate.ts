@@ -147,6 +147,7 @@ export function registerMigrateFunction(sdk: ISdk, kv: StateKV): void {
             startedAt:
               row.created_at || row.started_at || new Date().toISOString(),
             endedAt: row.ended_at || row.updated_at,
+            lastCheckpointAt: row.ended_at || row.updated_at,
             status: "completed",
             observationCount: 0,
           };

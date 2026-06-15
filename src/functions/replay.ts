@@ -399,6 +399,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
             existing.endedAt = parsed.endedAt;
           }
           if (existing.status === "active") existing.status = "completed";
+          existing.lastCheckpointAt = parsed.endedAt;
           const existingTags = existing.tags || [];
           if (!existingTags.includes("jsonl-import")) {
             existing.tags = [...existingTags, "jsonl-import"];
@@ -425,6 +426,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
             startedAt: parsed.startedAt,
             endedAt: parsed.endedAt,
             status: "completed",
+            lastCheckpointAt: parsed.endedAt,
             observationCount: parsed.observations.length,
             tags: ["jsonl-import"],
             firstPrompt,

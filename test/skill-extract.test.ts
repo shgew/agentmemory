@@ -196,3 +196,74 @@ describe("skill-extract", () => {
     expect(result.matches[0].skill.name).toBe("Fix JWT Auth");
   });
 });
+
+describe("skill-extract uncheckpointed activity guard (Option K)", () => {
+  let handlers: Record<string, Function>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockKv.get.mockResolvedValue(null);
+    mockKv.set.mockResolvedValue(undefined);
+    mockKv.list.mockResolvedValue([]);
+
+    handlers = {};
+    mockSdk.registerFunction.mockImplementation((idOrMeta: any, handler: any) => {
+      const id = typeof idOrMeta === "string" ? idOrMeta : idOrMeta.id;
+      handlers[id] = handler;
+    });
+
+    registerSkillExtractFunctions(mockSdk as any, mockKv as any, mockProvider);
+  });
+
+  it("rejects extraction when session.updatedAt is past the watermark", async () => {
+    mockKv.get.mockImplementation((scope: string) => {
+      if (scope === "mem:sessions") return Promise.resolve({
+        id: "s_uncheckpointed",
+        project: "test",
+        status: "completed",
+        endedAt: "2026-01-01T10:00:00.000Z",
+        lastCheckpointAt: "2026-01-01T10:00:00.000Z",
+        updatedAt: "2026-01-01T15:00:00.000Z",
+      });
+      return Promise.resolve(null);
+    });
+
+    const result = await handlers["mem::skill-extract"]({ sessionId: "s_uncheckpointed" });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/uncheckpointed|checkpoint/i);
+  });
+
+  it("allows extraction when updatedAt <= watermark (fully consolidated)", async () => {
+    mockKv.get.mockImplementation((scope: string) => {
+      if (scope === "mem:sessions") return Promise.resolve({
+        id: "s_clean",
+        project: "test",
+        status: "completed",
+        endedAt: "2026-01-01T15:00:00.000Z",
+        lastCheckpointAt: "2026-01-01T15:00:00.000Z",
+        updatedAt: "2026-01-01T15:00:00.000Z",
+      });
+      if (scope === "mem:summaries") return Promise.resolve({
+        sessionId: "s_clean",
+        project: "test",
+        title: "Done",
+        narrative: "work done",
+        keyDecisions: [],
+        filesModified: [],
+        concepts: [],
+        createdAt: "2026-01-01T15:00:00.000Z",
+        observationCount: 5,
+      });
+      return Promise.resolve(null);
+    });
+    mockKv.list.mockResolvedValue([
+      { id: "o1", sessionId: "s_clean", timestamp: "2026-01-01T11:00:00Z", type: "file_edit", title: "e1", narrative: "n", importance: 7, concepts: [], files: [], facts: [] },
+      { id: "o2", sessionId: "s_clean", timestamp: "2026-01-01T12:00:00Z", type: "file_edit", title: "e2", narrative: "n", importance: 7, concepts: [], files: [], facts: [] },
+      { id: "o3", sessionId: "s_clean", timestamp: "2026-01-01T13:00:00Z", type: "file_edit", title: "e3", narrative: "n", importance: 7, concepts: [], files: [], facts: [] },
+    ]);
+    mockProvider.summarize.mockResolvedValue("<no-skill/>");
+
+    const result = await handlers["mem::skill-extract"]({ sessionId: "s_clean" });
+    expect(result.success).toBe(true);
+  });
+});
