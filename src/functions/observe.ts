@@ -10,6 +10,7 @@ import { buildSyntheticCompression } from "./compress-synthetic.js";
 import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
+import { isAfter } from "../state/timestamp-compare.js";
 
 const postCompletionWarned = new Set<string>();
 
@@ -248,7 +249,7 @@ export function registerObserveFunction(
           if (
             existingSession?.status === "completed" &&
             typeof payload.timestamp === "string" &&
-            payload.timestamp > (existingSession.lastCheckpointAt ?? existingSession.endedAt ?? "") &&
+            isAfter(payload.timestamp, existingSession.lastCheckpointAt ?? existingSession.endedAt) &&
             !postCompletionWarned.has(payload.sessionId)
           ) {
             postCompletionWarned.add(payload.sessionId);

@@ -15,6 +15,7 @@ import {
 } from "../prompts/graph-extraction.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { isAfter, isAtOrBefore } from "../state/timestamp-compare.js";
 
 // #753: keep the response payload below the iii state channel ceiling.
 // 500 nodes + their incident edges hold well under the limit on the
@@ -464,8 +465,8 @@ export function registerGraphFunction(
       const until = data.until;
       const filtered = (since || until)
         ? data.observations.filter((o) => {
-            if (since && (!o.timestamp || o.timestamp <= since)) return false;
-            if (until && (!o.timestamp || o.timestamp > until)) return false;
+            if (since && !isAfter(o.timestamp, since)) return false;
+            if (until && !isAtOrBefore(o.timestamp, until)) return false;
             return true;
           })
         : data.observations;

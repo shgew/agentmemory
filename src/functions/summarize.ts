@@ -20,6 +20,7 @@ import { scoreSummary } from "../eval/quality.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { isAtOrBefore } from "../state/timestamp-compare.js";
 
 // Per-chunk observation budget when a session is too large to fit in one
 // LLM call. Default ≈ 50k input tokens per chunk at ~110 tok/obs — fits
@@ -253,7 +254,7 @@ export function registerSummarizeFunction(
       );
       const until = data?.until;
       const compressed = observations.filter((o) =>
-        o.title && (!until || (typeof o.timestamp === "string" && o.timestamp <= until)),
+        o.title && (!until || isAtOrBefore(o.timestamp, until)),
       );
 
       if (compressed.length === 0) {

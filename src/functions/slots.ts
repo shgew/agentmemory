@@ -6,6 +6,7 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import { recordAudit } from "./audit.js";
 import { getEnvVar } from "../config.js";
 import { logger } from "../logger.js";
+import { isAfter, isAtOrBefore } from "../state/timestamp-compare.js";
 
 type SlotScope = "project" | "global";
 
@@ -377,8 +378,8 @@ export function registerSlotsFunctions(sdk: ISdk, kv: StateKV): void {
       const until = data.until;
       const observations = (since || until)
         ? allObservations.filter((o) => {
-            if (since && (!o.timestamp || o.timestamp <= since)) return false;
-            if (until && (!o.timestamp || o.timestamp > until)) return false;
+            if (since && !isAfter(o.timestamp, since)) return false;
+            if (until && !isAtOrBefore(o.timestamp, until)) return false;
             return true;
           })
         : allObservations;

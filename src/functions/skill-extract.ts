@@ -10,6 +10,7 @@ import { KV, generateId, fingerprintId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { isAfter } from "../state/timestamp-compare.js";
 
 const SKILL_EXTRACT_SYSTEM = `You are a skill extraction engine. Given a completed multi-step task session, extract a reusable procedural skill document.
 
@@ -123,8 +124,8 @@ export function registerSkillExtractFunctions(
           error: "session must be completed before skill extraction",
         };
       }
-      const watermark = session.lastCheckpointAt ?? session.endedAt ?? "";
-      if (session.updatedAt && session.updatedAt > watermark) {
+      const watermark = session.lastCheckpointAt ?? session.endedAt;
+      if (session.updatedAt && isAfter(session.updatedAt, watermark)) {
         return {
           success: false,
           error: "session has uncheckpointed activity; run session sweep first",

@@ -5,6 +5,7 @@ import { StateKV } from "../state/kv.js";
 import { isReflectEnabled } from "../functions/slots.js";
 import { isGraphExtractionEnabled } from "../config.js";
 import { logger } from "../logger.js";
+import { isAfter } from "../state/timestamp-compare.js";
 
 let sessionStoppedQueue: Promise<void> = Promise.resolve();
 let sessionStoppedQueueDepth = 0;
@@ -166,13 +167,37 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     "event::session::ended",
     async (data: { sessionId: string }) => {
       const existing = await kv.get<Session>(KV.sessions, data.sessionId);
-      const anchor = existing?.updatedAt ?? existing?.startedAt ?? new Date().toISOString();
+      if (!existing) return { success: false, error: "session_not_found" };
+      const anchor = existing.updatedAt ?? existing.startedAt;
+
+      if (existing.status === "completed") {
+        const watermark = existing.lastCheckpointAt ?? existing.endedAt;
+        if (anchor && isAfter(anchor, watermark)) {
+          await kv.update(KV.sessions, data.sessionId, [
+            { type: "set", path: "lastCheckpointAt", value: anchor },
+          ]);
+          sdk.trigger({
+            function_id: "event::session::checkpoint",
+            payload: { sessionId: data.sessionId, since: watermark, until: anchor },
+            action: TriggerAction.Void(),
+          });
+          return { success: true, checkpointed: true };
+        }
+        return { success: true, alreadyCompleted: true };
+      }
+
+      const effectiveAnchor = anchor ?? new Date().toISOString();
       const endedAt = new Date().toISOString();
       await kv.update(KV.sessions, data.sessionId, [
         { type: "set", path: "endedAt", value: endedAt },
         { type: "set", path: "status", value: "completed" },
-        { type: "set", path: "lastCheckpointAt", value: anchor },
+        { type: "set", path: "lastCheckpointAt", value: effectiveAnchor },
       ]);
+      sdk.trigger({
+        function_id: "event::session::stopped",
+        payload: { sessionId: data.sessionId, until: effectiveAnchor },
+        action: TriggerAction.Void(),
+      });
       return { success: true };
     },
   );

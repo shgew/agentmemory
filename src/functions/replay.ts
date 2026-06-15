@@ -17,6 +17,7 @@ import { safeAudit } from "./audit.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
 import { getSearchIndex } from "./search.js";
 import { logger } from "../logger.js";
+import { isAfter, laterTimestamp } from "../state/timestamp-compare.js";
 
 export const MAX_FILES_DEFAULT = 200;
 export const MAX_FILES_UPPER_BOUND = 1000;
@@ -395,11 +396,11 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
         if (existing) {
           existing.observationCount =
             (existing.observationCount || 0) + parsed.observations.length;
-          if (parsed.endedAt > (existing.endedAt || "")) {
+          if (isAfter(parsed.endedAt, existing.endedAt)) {
             existing.endedAt = parsed.endedAt;
           }
           if (existing.status === "active") existing.status = "completed";
-          existing.lastCheckpointAt = parsed.endedAt;
+          existing.lastCheckpointAt = laterTimestamp(existing.lastCheckpointAt, parsed.endedAt);
           const existingTags = existing.tags || [];
           if (!existingTags.includes("jsonl-import")) {
             existing.tags = [...existingTags, "jsonl-import"];

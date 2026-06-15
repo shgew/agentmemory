@@ -5,6 +5,7 @@ import type { StateKV } from "../state/kv.js";
 import { safeAudit } from "./audit.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { logger } from "../logger.js";
+import { isAfter } from "../state/timestamp-compare.js";
 
 const DEFAULT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
@@ -89,7 +90,7 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
           continue;
         }
         const watermark = effectiveWatermark(session);
-        if (watermark && anchor <= watermark) {
+        if (watermark && !isAfter(anchor, watermark)) {
           skipped.push(session.id);
           continue;
         }
@@ -126,7 +127,7 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
                 return { status: "skipped" };
               }
               const currentWatermark = effectiveWatermark(current);
-              if (currentWatermark && currentAnchor <= currentWatermark) {
+              if (currentWatermark && !isAfter(currentAnchor, currentWatermark)) {
                 return { status: "skipped" };
               }
 

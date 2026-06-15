@@ -22,6 +22,7 @@ import type {
   Session,
   Memory,
 } from "../types.js";
+import { isAfter } from "../state/timestamp-compare.js";
 
 const ALL_CATEGORIES = [
   "actions",
@@ -308,7 +309,7 @@ export function registerDiagnosticsFunction(sdk: ISdk, kv: StateKV): void {
           if (
             session.status === "completed" &&
             session.updatedAt &&
-            session.updatedAt > (session.lastCheckpointAt ?? session.endedAt ?? "") &&
+            isAfter(session.updatedAt, session.lastCheckpointAt ?? session.endedAt) &&
             now - new Date(session.updatedAt).getTime() > TWENTY_FOUR_HOURS_MS
           ) {
             checks.push({

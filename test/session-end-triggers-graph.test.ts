@@ -9,23 +9,30 @@ import { readFileSync } from "node:fs";
 // existing. Direct fire-and-forget trigger keeps the HTTP response fast
 // (kv.update runs synchronously, downstream pipeline fan-outs without
 // blocking).
-describe("api::session::end → event::session::stopped (#666)", () => {
+describe("api::session::end → event::session::ended → event::session::stopped (#666 + Option K)", () => {
   const api = readFileSync("src/triggers/api.ts", "utf-8");
+  const events = readFileSync("src/triggers/events.ts", "utf-8");
 
-  it("api::session::end fires event::session::stopped after kv.update", () => {
+  it("api::session::end delegates to event::session::ended", () => {
     expect(api).toMatch(
-      /api::session::end[\s\S]*?kv\.update\(KV\.sessions[\s\S]*?function_id:\s*"event::session::stopped"/,
+      /api::session::end[\s\S]*?function_id:\s*"event::session::ended"/,
+    );
+  });
+
+  it("event::session::ended fires event::session::stopped on active-to-completed transition", () => {
+    expect(events).toMatch(
+      /event::session::ended[\s\S]*?function_id:\s*"event::session::stopped"/,
     );
   });
 
   it("event::session::stopped trigger payload includes sessionId", () => {
-    expect(api).toMatch(
-      /function_id:\s*"event::session::stopped",\s*payload:\s*\{\s*sessionId\s*\}/,
+    expect(events).toMatch(
+      /function_id:\s*"event::session::stopped",\s*payload:\s*\{\s*sessionId[^}]*\}/,
     );
   });
 
   it("event::session::stopped uses TriggerAction.Void for fire-and-forget", () => {
-    expect(api).toMatch(
+    expect(events).toMatch(
       /function_id:\s*"event::session::stopped"[\s\S]*?action:\s*TriggerAction\.Void\(\)/,
     );
   });

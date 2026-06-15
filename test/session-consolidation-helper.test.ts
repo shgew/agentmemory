@@ -217,3 +217,113 @@ describe("event::session::stopped + checkpoint pipeline", () => {
     expect(updated!.lastCheckpointAt).toBe(startedAt);
   });
 });
+
+describe("event::session::ended S4 (already-completed paths)", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    registerEventTriggers(sdk as never, kv as never);
+  });
+
+  it("on already-completed session with post-close activity: fires checkpoint, preserves endedAt, advances lastCheckpointAt", async () => {
+    const sessionId = "ses_S4_active_resume";
+    const initialEndedAt = "2026-01-01T17:00:00.000Z";
+    const initialCheckpointAt = "2026-01-01T17:00:00.000Z";
+    const postActivityTs = "2026-01-02T09:00:00.000Z";
+    await kv.set(KV.sessions, sessionId, {
+      id: sessionId,
+      project: "test",
+      cwd: "/tmp",
+      startedAt: "2026-01-01T09:00:00.000Z",
+      endedAt: initialEndedAt,
+      lastCheckpointAt: initialCheckpointAt,
+      updatedAt: postActivityTs,
+      status: "completed",
+      observationCount: 5,
+    } satisfies Session);
+
+    sdk.calls.length = 0;
+    await sdk.trigger({
+      function_id: "event::session::ended",
+      payload: { sessionId },
+    });
+
+    const updated = await kv.get<Session>(KV.sessions, sessionId);
+    expect(updated!.status).toBe("completed");
+    expect(updated!.endedAt).toBe(initialEndedAt);
+    expect(updated!.lastCheckpointAt).toBe(postActivityTs);
+
+    const stoppedCalls = sdk.calls.filter((c) => c.function_id === "event::session::stopped");
+    const checkpointCalls = sdk.calls.filter((c) => c.function_id === "event::session::checkpoint");
+    expect(stoppedCalls).toHaveLength(0);
+    expect(checkpointCalls).toHaveLength(1);
+    expect((checkpointCalls[0].payload as any).since).toBe(initialCheckpointAt);
+    expect((checkpointCalls[0].payload as any).until).toBe(postActivityTs);
+  });
+
+  it("on already-completed session without post-close activity: no-op, no events", async () => {
+    const sessionId = "ses_S4_no_activity";
+    const ts = "2026-01-01T17:00:00.000Z";
+    await kv.set(KV.sessions, sessionId, {
+      id: sessionId,
+      project: "test",
+      cwd: "/tmp",
+      startedAt: "2026-01-01T09:00:00.000Z",
+      endedAt: ts,
+      lastCheckpointAt: ts,
+      updatedAt: ts,
+      status: "completed",
+      observationCount: 1,
+    } satisfies Session);
+
+    sdk.calls.length = 0;
+    await sdk.trigger({
+      function_id: "event::session::ended",
+      payload: { sessionId },
+    });
+
+    const updated = await kv.get<Session>(KV.sessions, sessionId);
+    expect(updated!.endedAt).toBe(ts);
+    expect(updated!.lastCheckpointAt).toBe(ts);
+
+    const stoppedCalls = sdk.calls.filter((c) => c.function_id === "event::session::stopped");
+    const checkpointCalls = sdk.calls.filter((c) => c.function_id === "event::session::checkpoint");
+    expect(stoppedCalls).toHaveLength(0);
+    expect(checkpointCalls).toHaveLength(0);
+  });
+
+  it("on active session: fresh lifecycle close - fires stopped, writes endedAt+lastCheckpointAt, status->completed", async () => {
+    const sessionId = "ses_S4_fresh_close";
+    const startedAt = "2026-01-01T09:00:00.000Z";
+    const updatedAt = "2026-01-01T17:00:00.000Z";
+    await kv.set(KV.sessions, sessionId, {
+      id: sessionId,
+      project: "test",
+      cwd: "/tmp",
+      startedAt,
+      updatedAt,
+      status: "active",
+      observationCount: 1,
+    } satisfies Session);
+
+    sdk.calls.length = 0;
+    await sdk.trigger({
+      function_id: "event::session::ended",
+      payload: { sessionId },
+    });
+
+    const updated = await kv.get<Session>(KV.sessions, sessionId);
+    expect(updated!.status).toBe("completed");
+    expect(updated!.endedAt).toBeDefined();
+    expect(updated!.lastCheckpointAt).toBe(updatedAt);
+
+    const stoppedCalls = sdk.calls.filter((c) => c.function_id === "event::session::stopped");
+    const checkpointCalls = sdk.calls.filter((c) => c.function_id === "event::session::checkpoint");
+    expect(stoppedCalls).toHaveLength(1);
+    expect((stoppedCalls[0].payload as any).until).toBe(updatedAt);
+    expect(checkpointCalls).toHaveLength(0);
+  });
+});

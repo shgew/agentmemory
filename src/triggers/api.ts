@@ -1,4 +1,4 @@
-import { TriggerAction, type ISdk, type ApiRequest } from "iii-sdk";
+import { type ISdk, type ApiRequest } from "iii-sdk";
 import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
@@ -624,28 +624,19 @@ export function registerApiTriggers(
           body: { error: "sessionId is required and must be a non-empty string" },
         };
       }
-      const existing = await kv.get<Session>(KV.sessions, sessionId);
-      const anchor = existing?.updatedAt ?? existing?.startedAt ?? new Date().toISOString();
-      const endedAt = new Date().toISOString();
-      await kv.update(KV.sessions, sessionId, [
-        { type: "set", path: "endedAt", value: endedAt },
-        { type: "set", path: "status", value: "completed" },
-        { type: "set", path: "lastCheckpointAt", value: anchor },
-      ]);
-      // Fan out session-stopped lifecycle (non-blocking).
       try {
-        sdk.trigger({
-          function_id: "event::session::stopped",
+        const result = await sdk.trigger({
+          function_id: "event::session::ended",
           payload: { sessionId },
-          action: TriggerAction.Void(),
         });
+        return { status_code: 200, body: result ?? { success: true } };
       } catch (err) {
-        logger.warn("event::session::stopped trigger failed", {
+        logger.warn("event::session::ended trigger failed", {
           sessionId,
           error: err instanceof Error ? err.message : String(err),
         });
+        return { status_code: 500, body: { success: false, error: "session_end_failed" } };
       }
-      return { status_code: 200, body: { success: true } };
     },
   );
   sdk.registerTrigger({
