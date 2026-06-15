@@ -74,4 +74,28 @@ describe("ResilientProvider LLM queue", () => {
 
     expect(maxActive).toBe(2);
   });
+
+  it("fails fast when the circuit breaker stays open past AGENTMEMORY_LLM_TIMEOUT_MS", async () => {
+    process.env.AGENTMEMORY_LLM_TIMEOUT_MS = "50";
+    process.env.AGENTMEMORY_CIRCUIT_BREAKER_POLL_MS = "10";
+    const { ResilientProvider } = await import("../src/providers/resilient.js");
+    const inner: MemoryProvider = {
+      name: "inner",
+      async compress() {
+        throw new Error("provider down");
+      },
+      async summarize() {
+        throw new Error("provider down");
+      },
+    };
+    const provider = new ResilientProvider(inner);
+    await expect(provider.compress("s", "a")).rejects.toThrow("provider down");
+    await expect(provider.compress("s", "b")).rejects.toThrow("provider down");
+    await expect(provider.compress("s", "c")).rejects.toThrow("provider down");
+    const startedAt = Date.now();
+    await expect(provider.compress("s", "d")).rejects.toThrow(
+      /circuit breaker open longer than 50ms/,
+    );
+    expect(Date.now() - startedAt).toBeLessThan(500);
+  });
 });

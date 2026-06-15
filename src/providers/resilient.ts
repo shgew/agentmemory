@@ -4,6 +4,7 @@ import { CircuitBreaker } from "./circuit-breaker.js";
 
 const LLM_CONCURRENCY_DEFAULT = 1;
 const BREAKER_POLL_MS_DEFAULT = 1_000;
+const LLM_TIMEOUT_MS_DEFAULT = 60_000;
 
 type Release = () => void;
 
@@ -29,6 +30,10 @@ export class ResilientProvider implements MemoryProvider {
   private readonly breakerPollMs = readPositiveInt(
     "AGENTMEMORY_CIRCUIT_BREAKER_POLL_MS",
     BREAKER_POLL_MS_DEFAULT,
+  );
+  private readonly maxBreakerWaitMs = readPositiveInt(
+    "AGENTMEMORY_LLM_TIMEOUT_MS",
+    LLM_TIMEOUT_MS_DEFAULT,
   );
   name: string;
 
@@ -57,14 +62,21 @@ export class ResilientProvider implements MemoryProvider {
 
   private async waitForBreaker(): Promise<void> {
     let logged = false;
+    const startedAt = Date.now();
     while (!this.breaker.isAllowed) {
       if (!logged) {
         logger.warn("LLM provider circuit breaker open, waiting for recovery", {
           provider: this.name,
           state: this.breaker.getState(),
           queued: this.waiters.length,
+          maxWaitMs: this.maxBreakerWaitMs,
         });
         logged = true;
+      }
+      if (Date.now() - startedAt >= this.maxBreakerWaitMs) {
+        throw new Error(
+          `LLM circuit breaker open longer than ${this.maxBreakerWaitMs}ms, failing fast (set AGENTMEMORY_LLM_TIMEOUT_MS to raise the bound)`,
+        );
       }
       await sleep(this.breakerPollMs);
     }
