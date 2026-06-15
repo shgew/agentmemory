@@ -724,7 +724,7 @@
     .viewer-auth.open { display: block; }
     .viewer-auth-panel {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(180px, 320px) auto;
+      grid-template-columns: minmax(0, 1fr) minmax(180px, 320px) auto auto;
       gap: 10px;
       align-items: center;
       width: min(960px, 100%);
@@ -739,6 +739,8 @@
     .viewer-auth-title { font-weight: 600; color: var(--ink); margin-bottom: 2px; }
     .viewer-auth-desc { color: var(--ink-muted); line-height: 1.4; }
     .viewer-auth-desc code { font-family: var(--font-mono); font-size: 10px; color: var(--ink); }
+    .viewer-auth-remember { display: flex; align-items: center; gap: 6px; color: var(--ink-muted); white-space: nowrap; }
+    .viewer-auth-remember input { width: auto; min-width: 0; padding: 0; }
     .viewer-auth input {
       width: 100%;
       min-width: 0;
@@ -982,6 +984,7 @@
     </a>
     <div class="header-right">
       <span class="dateline" id="dateline"></span>
+      <button class="btn" style="font-size:9px;padding:3px 10px;letter-spacing:0.1em;margin-right:8px;" data-action="forget-viewer-token">Forget secret</button>
       <button id="theme-toggle" class="btn" style="font-size:9px;padding:3px 10px;letter-spacing:0.1em;margin-right:8px;" data-action="toggle-theme">DARK</button>
       <span id="ws-status" class="ws-status disconnected">live updates off</span>
     </div>
@@ -1106,7 +1109,8 @@
     };
     var CB_STATE_COLORS = { closed: 'badge-green', open: 'badge-red', 'half-open': 'badge-yellow' };
     var TAB_IDS = ['dashboard', 'graph', 'memories', 'timeline', 'sessions', 'lessons', 'actions', 'crystals', 'audit', 'activity', 'profile', 'replay'];
-    var VIEWER_TOKEN_STORAGE_KEY = 'agentmemory-viewer-token';
+    var VIEWER_TOKEN_SESSION_STORAGE_KEY = 'agentmemory-viewer-token';
+    var VIEWER_TOKEN_LOCAL_STORAGE_KEY = 'agentmemory-viewer-token-local';
 
     var state = {
       activeTab: 'dashboard',
@@ -1204,13 +1208,45 @@
       }
     }
     function getViewerToken() {
-      try { return sessionStorage.getItem(VIEWER_TOKEN_STORAGE_KEY) || ''; } catch (_) { return ''; }
-    }
-    function setViewerToken(token) {
       try {
-        if (token) sessionStorage.setItem(VIEWER_TOKEN_STORAGE_KEY, token);
-        else sessionStorage.removeItem(VIEWER_TOKEN_STORAGE_KEY);
+        var localToken = localStorage.getItem(VIEWER_TOKEN_LOCAL_STORAGE_KEY);
+        if (localToken) return localToken;
       } catch (_) {}
+      try { return sessionStorage.getItem(VIEWER_TOKEN_SESSION_STORAGE_KEY) || ''; } catch (_) { return ''; }
+    }
+    function setViewerToken(token, remember) {
+      if (!token) {
+        clearViewerToken();
+        return { saved: true, remembered: false };
+      }
+      if (remember) {
+        try {
+          localStorage.setItem(VIEWER_TOKEN_LOCAL_STORAGE_KEY, token);
+          try { sessionStorage.removeItem(VIEWER_TOKEN_SESSION_STORAGE_KEY); } catch (_) {}
+          return { saved: getViewerToken() === token, remembered: true };
+        } catch (_) {
+          try { localStorage.removeItem(VIEWER_TOKEN_LOCAL_STORAGE_KEY); } catch (_) {}
+          try {
+            sessionStorage.setItem(VIEWER_TOKEN_SESSION_STORAGE_KEY, token);
+            return { saved: getViewerToken() === token, remembered: false };
+          } catch (_) {
+            return { saved: false, remembered: false };
+          }
+        }
+      }
+      try {
+        sessionStorage.setItem(VIEWER_TOKEN_SESSION_STORAGE_KEY, token);
+        try { localStorage.removeItem(VIEWER_TOKEN_LOCAL_STORAGE_KEY); } catch (_) {}
+        var localCleared = true;
+        try { localCleared = !localStorage.getItem(VIEWER_TOKEN_LOCAL_STORAGE_KEY); } catch (_) {}
+        return { saved: localCleared && getViewerToken() === token, remembered: false };
+      } catch (_) {
+        return { saved: false, remembered: false };
+      }
+    }
+    function clearViewerToken() {
+      try { sessionStorage.removeItem(VIEWER_TOKEN_SESSION_STORAGE_KEY); } catch (_) {}
+      try { localStorage.removeItem(VIEWER_TOKEN_LOCAL_STORAGE_KEY); } catch (_) {}
     }
     function showViewerAuthPrompt() {
       var host = document.getElementById('viewer-auth');
@@ -1223,7 +1259,9 @@
             '<div id="viewer-auth-desc" class="viewer-auth-desc">Enter <code>AGENTMEMORY_SECRET</code> to unlock viewer API access.</div>' +
           '</div>' +
           '<input id="viewer-auth-token" type="password" autocomplete="off" spellcheck="false" aria-label="AGENTMEMORY_SECRET" aria-describedby="viewer-auth-desc" placeholder="AGENTMEMORY_SECRET" />' +
+          '<label class="viewer-auth-remember"><input id="viewer-auth-remember" type="checkbox" /> Remember on this device</label>' +
           '<button class="btn" data-action="save-viewer-token">Unlock</button>' +
+          '<button class="btn" data-action="forget-viewer-token">Forget secret</button>' +
         '</div>';
       var input = document.getElementById('viewer-auth-token');
       if (input && typeof input.focus === 'function') input.focus();
@@ -3945,20 +3983,27 @@
       }
       if (action === 'save-viewer-token') {
         var tokenInput = document.getElementById('viewer-auth-token');
+        var rememberInput = document.getElementById('viewer-auth-remember');
         var token = tokenInput ? tokenInput.value.trim() : '';
         if (token) {
-          setViewerToken(token);
+          var saveResult = setViewerToken(token, !!(rememberInput && rememberInput.checked));
+          if (!saveResult.saved) {
+            alert('Could not save secret in this browser.');
+            return;
+          }
+          if (!saveResult.remembered && rememberInput && rememberInput.checked) alert('Could not remember secret on this device. Using this session only.');
           hideViewerAuthPrompt();
-          // Re-fetch config/flags so the footer version + flag banners
-          // refresh without a full page reload; fetchFlags() only runs
-          // during bootstrap and would otherwise stay stale until the
-          // user reloads.
           fetchFlags();
           if (state[state.activeTab] && typeof state[state.activeTab] === 'object') {
             state[state.activeTab].loaded = false;
           }
           loadTab(state.activeTab);
         }
+        return;
+      }
+      if (action === 'forget-viewer-token') {
+        clearViewerToken();
+        showViewerAuthPrompt();
         return;
       }
       if (action === 'timeline-filter') {

@@ -134,7 +134,14 @@ function loadViewerSandbox() {
       pathname: "/",
       search: "",
     },
-    localStorage: { getItem: () => null, setItem: () => {} },
+    localStorage: (() => {
+      const values = new Map<string, string>();
+      return {
+        getItem: (key: string) => values.get(key) ?? null,
+        setItem: (key: string, value: string) => values.set(key, value),
+        removeItem: (key: string) => values.delete(key),
+      };
+    })(),
     sessionStorage: (() => {
       const values = new Map<string, string>();
       return {
@@ -190,6 +197,111 @@ describe("viewer session rendering", () => {
 
     expect(requests).toHaveLength(1);
     expect(requests[0].opts.headers?.Authorization).toBe("Bearer viewer-secret");
+  });
+
+  it("prefers a remembered localStorage viewer bearer for API calls", async () => {
+    const { sandbox } = loadViewerSandbox();
+    const requests: Array<{ url: string; opts: { headers?: Record<string, string> } }> = [];
+    sandbox.sessionStorage.setItem("agentmemory-viewer-token", "session-secret");
+    sandbox.localStorage.setItem("agentmemory-viewer-token-local", "remembered-secret");
+    sandbox.fetch = async (url: string, opts: { headers?: Record<string, string> }) => {
+      requests.push({ url, opts });
+      return { ok: true, json: async () => ({ ok: true }) };
+    };
+
+    await sandbox.apiGet("health");
+
+    expect(requests).toHaveLength(1);
+    expect(requests[0].opts.headers?.Authorization).toBe("Bearer remembered-secret");
+  });
+
+  it("saving a non-remembered viewer bearer clears localStorage", () => {
+    const { sandbox } = loadViewerSandbox();
+    sandbox.localStorage.setItem("agentmemory-viewer-token-local", "remembered-secret");
+
+    expect(sandbox.setViewerToken("session-secret", false)).toEqual({
+      saved: true,
+      remembered: false,
+    });
+
+    expect(sandbox.sessionStorage.getItem("agentmemory-viewer-token")).toBe("session-secret");
+    expect(sandbox.localStorage.getItem("agentmemory-viewer-token-local")).toBeNull();
+  });
+
+  it("reports failed non-remembered saves when localStorage cannot be cleared", () => {
+    const { sandbox } = loadViewerSandbox();
+    sandbox.localStorage.setItem("agentmemory-viewer-token-local", "session-secret");
+    sandbox.localStorage.removeItem = () => {
+      throw new Error("localStorage unavailable");
+    };
+
+    expect(sandbox.setViewerToken("session-secret", false)).toEqual({
+      saved: false,
+      remembered: false,
+    });
+  });
+
+  it("saving a remembered viewer bearer clears sessionStorage", () => {
+    const { sandbox } = loadViewerSandbox();
+    sandbox.sessionStorage.setItem("agentmemory-viewer-token", "session-secret");
+
+    expect(sandbox.setViewerToken("remembered-secret", true)).toEqual({
+      saved: true,
+      remembered: true,
+    });
+
+    expect(sandbox.localStorage.getItem("agentmemory-viewer-token-local")).toBe("remembered-secret");
+    expect(sandbox.sessionStorage.getItem("agentmemory-viewer-token")).toBeNull();
+  });
+
+  it("falls back to sessionStorage when remembered storage fails", () => {
+    const { sandbox } = loadViewerSandbox();
+    sandbox.localStorage.setItem("agentmemory-viewer-token-local", "stale-secret");
+    sandbox.localStorage.setItem = () => {
+      throw new Error("localStorage unavailable");
+    };
+
+    expect(sandbox.setViewerToken("session-secret", true)).toEqual({
+      saved: true,
+      remembered: false,
+    });
+
+    expect(sandbox.getViewerToken()).toBe("session-secret");
+    expect(sandbox.sessionStorage.getItem("agentmemory-viewer-token")).toBe("session-secret");
+    expect(sandbox.localStorage.getItem("agentmemory-viewer-token-local")).toBeNull();
+  });
+
+  it("reports failed saves when browser storage is unavailable", () => {
+    const { sandbox } = loadViewerSandbox();
+    sandbox.sessionStorage.setItem = () => {
+      throw new Error("sessionStorage unavailable");
+    };
+    sandbox.localStorage.setItem = () => {
+      throw new Error("localStorage unavailable");
+    };
+    sandbox.localStorage.removeItem = () => {
+      throw new Error("localStorage unavailable");
+    };
+
+    expect(sandbox.setViewerToken("secret", true)).toEqual({
+      saved: false,
+      remembered: false,
+    });
+    expect(sandbox.setViewerToken("secret", false)).toEqual({
+      saved: false,
+      remembered: false,
+    });
+  });
+
+  it("forgetting the viewer bearer clears sessionStorage and localStorage", () => {
+    const { sandbox } = loadViewerSandbox();
+    sandbox.sessionStorage.setItem("agentmemory-viewer-token", "session-secret");
+    sandbox.localStorage.setItem("agentmemory-viewer-token-local", "remembered-secret");
+
+    sandbox.clearViewerToken();
+
+    expect(sandbox.sessionStorage.getItem("agentmemory-viewer-token")).toBeNull();
+    expect(sandbox.localStorage.getItem("agentmemory-viewer-token-local")).toBeNull();
   });
 
   it("shows where to find AGENTMEMORY_SECRET after a viewer auth failure", async () => {
