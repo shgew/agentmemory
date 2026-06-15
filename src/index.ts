@@ -24,6 +24,7 @@ import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
+import { parseCron, nextCronFireMs, type CronSpec } from "./state/cron.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
 import { registerObserveFunction } from "./functions/observe.js";
 import { registerImageQuotaCleanup } from "./functions/image-quota-cleanup.js";
@@ -596,21 +597,22 @@ async function main() {
       const parsed = parseInt(raw || "", 10);
       return Number.isFinite(parsed) && parsed > 0 ? parsed : def;
     };
-    const parseHour = (raw: string | undefined, def: number): number => {
-      const parsed = parseInt(raw || "", 10);
-      return Number.isFinite(parsed) && parsed >= 0 && parsed <= 23
-        ? parsed
-        : def;
-    };
-    const sessionSweepIntervalMs = parsePositiveInt(
-      process.env.SESSION_SWEEP_INTERVAL_MS,
-      86400000,
-    );
     const sessionSweepMaxAgeMs = parsePositiveInt(
       process.env.SESSION_SWEEP_MAX_AGE_MS,
       21600000,
     );
-    const sessionSweepHour = parseHour(process.env.SESSION_SWEEP_HOUR, 3);
+    const sessionSweepCronExpr =
+      process.env.SESSION_SWEEP_CRON?.trim() || "0 3 * * *";
+
+    let sessionSweepCronSpec: CronSpec;
+    try {
+      sessionSweepCronSpec = parseCron(sessionSweepCronExpr);
+    } catch (err) {
+      console.warn(
+        `[agentmemory] Invalid SESSION_SWEEP_CRON "${sessionSweepCronExpr}": ${err instanceof Error ? err.message : String(err)}. Falling back to "0 3 * * *".`,
+      );
+      sessionSweepCronSpec = parseCron("0 3 * * *");
+    }
 
     const fireSessionSweep = async () => {
       try {
@@ -621,29 +623,20 @@ async function main() {
       } catch {}
     };
 
-    const msUntilNextOccurrence = (hour: number): number => {
-      const nowDate = new Date();
-      const target = new Date(nowDate);
-      target.setHours(hour, 0, 0, 0);
-      if (target.getTime() <= nowDate.getTime()) {
-        target.setDate(target.getDate() + 1);
-      }
-      return target.getTime() - nowDate.getTime();
+    const scheduleNextSessionSweep = (): number => {
+      const delayMs = nextCronFireMs(sessionSweepCronSpec);
+      const timer = setTimeout(() => {
+        void fireSessionSweep();
+        scheduleNextSessionSweep();
+      }, delayMs);
+      timer.unref();
+      return delayMs;
     };
 
-    const startupDelayMs = msUntilNextOccurrence(sessionSweepHour);
-    const sessionSweepInitialTimer = setTimeout(() => {
-      void fireSessionSweep();
-      const sessionSweepRepeatTimer = setInterval(() => {
-        void fireSessionSweep();
-      }, sessionSweepIntervalMs);
-      sessionSweepRepeatTimer.unref();
-    }, startupDelayMs);
-    sessionSweepInitialTimer.unref();
-
-    const startupMinutes = Math.round(startupDelayMs / 60000);
+    const firstSessionSweepDelayMs = scheduleNextSessionSweep();
+    const firstSessionSweepAt = new Date(Date.now() + firstSessionSweepDelayMs);
     bootLog(
-      `Session sweep: enabled (first run at ${String(sessionSweepHour).padStart(2, "0")}:00 local in ${startupMinutes}m, then every ${sessionSweepIntervalMs / 3600000}h, threshold ${sessionSweepMaxAgeMs / 3600000}h)`,
+      `Session sweep: enabled (cron "${sessionSweepCronExpr}", first run at ${firstSessionSweepAt.toLocaleString()}, threshold ${sessionSweepMaxAgeMs / 3600000}h)`,
     );
   }
 
