@@ -35,4 +35,31 @@ describe("viewer graph cool-down", () => {
     expect(viewer).toMatch(/graphSim\.quietTicks\s*=\s*0/);
     expect(viewer).toMatch(/if\s*\(graphSim\.running\s*&&\s*!graphSim\.raf\)/);
   });
+
+  it("preserves node positions across graph reloads", () => {
+    expect(viewer).toMatch(/var previousNodes = \{\}/);
+    expect(viewer).toMatch(/previousNodes\[n\.id\] = n/);
+    expect(viewer).toMatch(/x: prev \? prev\.x : Math\.cos\(angle\)/);
+    expect(viewer).toMatch(/y: prev \? prev\.y : Math\.sin\(angle\)/);
+  });
+
+  it("does not rebuild the graph shell when it already exists", () => {
+    expect(viewer).toMatch(/function ensureGraphShell\(\)/);
+    expect(viewer).toMatch(/if \(!el\.querySelector\('\.graph-container'\)\)/);
+  });
+
+  it("does not bind duplicate graph interactions on reload", () => {
+    expect(viewer).toMatch(/if \(canvas\.__graphInteractionBound\) return/);
+    expect(viewer).toMatch(/canvas\.__graphInteractionBound = true/);
+  });
+
+  it("redraws the graph after resize clears the canvas", () => {
+    expect(viewer).toMatch(/if \(graphSim\.initialized\) renderGraph\(\)/);
+  });
+
+  it("ignores hidden zero-size resize and refreshes on returning to graph tab", () => {
+    expect(viewer).toMatch(/if \(r\.width === 0 \|\| r\.height === 0\) return/);
+    expect(viewer).toMatch(/else refreshVisibleGraph\(\)/);
+    expect(viewer).toMatch(/function refreshVisibleGraph\(\)/);
+  });
 });
