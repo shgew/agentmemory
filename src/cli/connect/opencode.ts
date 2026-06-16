@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, rmdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import * as p from "@clack/prompts";
@@ -21,13 +21,17 @@ import { findPluginRoot } from "./codex-hooks.js";
 // `--with-plugin` resolves the bundled `plugin/opencode/agentmemory-capture.ts`
 // from the installed @agentmemory/agentmemory package, copies it under
 // the opencode config dir's plugins/, registers it in the top-level "plugin"
-// array of opencode.json, and copies the agentmemory skills tree from
-// `plugin/skills/` to `<opencode-config>/skills/<name>/SKILL.md`. OpenCode's
-// command registry merges skills into its slash command palette as
-// `source: "skill"`, so /recall, /remember, /health and the other invocable
-// skills all appear in the palette while reference skills load on demand via
-// the native `skill` tool. All paths are resolved lazily so OPENCODE_CONFIG_DIR
-// set per-invocation (and test isolation via process.env mutation) takes effect.
+// array of opencode.json, copies the agentmemory skills tree from
+// `plugin/skills/` to `<opencode-config>/skills/<name>/SKILL.md`, AND removes
+// any deprecated agentmemory legacy slash command files (recall.md,
+// remember.md, health.md) from `<opencode-config>/commands/` left behind by
+// earlier versions of this adapter (backed up to ~/.agentmemory/backups/
+// first). OpenCode's command registry merges skills into its slash command
+// palette as `source: "skill"`, so /recall, /remember, /health and the other
+// invocable skills all appear in the palette while reference skills load on
+// demand via the native `skill` tool. All paths are resolved lazily so
+// OPENCODE_CONFIG_DIR set per-invocation (and test isolation via process.env
+// mutation) takes effect.
 function opencodeDir(): string {
   return process.env["OPENCODE_CONFIG_DIR"]?.trim() || join(homedir(), ".config", "opencode");
 }
@@ -38,6 +42,7 @@ function skillsDir(): string { return join(opencodeDir(), "skills"); }
 const PLUGIN_FILENAME = "agentmemory-capture.ts";
 const PLUGIN_REL_PATH = `./plugins/${PLUGIN_FILENAME}`;
 const SKILL_SOURCE_REL = "skills";
+const LEGACY_COMMAND_FILES = ["recall.md", "remember.md", "health.md"];
 
 // No `environment` block: OpenCode does not expand shell-style
 // `${VAR:-default}` values, and writing them literally would override the
@@ -90,6 +95,34 @@ function copySkillTree(source: string, target: string): string[] {
   return copied;
 }
 
+function cleanupLegacyCommands(dryRun: boolean): string[] {
+  const removed: string[] = [];
+  const legacyDir = join(opencodeDir(), "commands");
+  if (!existsSync(legacyDir)) return removed;
+  for (const name of LEGACY_COMMAND_FILES) {
+    const legacyPath = join(legacyDir, name);
+    if (!existsSync(legacyPath)) continue;
+    if (dryRun) {
+      p.log.info(`[dry-run] Would remove deprecated ${legacyPath} (backed up to ~/.agentmemory/backups/ first)`);
+      removed.push(legacyPath);
+      continue;
+    }
+    const backupPath = backupFile(legacyPath, "opencode-legacy-command", "md");
+    logBackup(backupPath);
+    rmSync(legacyPath);
+    removed.push(legacyPath);
+  }
+  if (!dryRun && removed.length > 0) {
+    try {
+      const remaining = readdirSync(legacyDir);
+      if (remaining.length === 0) rmdirSync(legacyDir);
+    } catch {
+      // dir might have other (user) files; leave alone
+    }
+  }
+  return removed;
+}
+
 function installPluginAssets(
   config: OpencodeConfig,
   opts: ConnectOptions,
@@ -123,6 +156,7 @@ function installPluginAssets(
         `[dry-run] Would copy ${skillDirs.length} skill subtree(s) (${skillDirs.join(", ")}) to ${skillsDir()}/`,
       );
     }
+    cleanupLegacyCommands(true);
     p.log.info(
       `[dry-run] Would merge "${PLUGIN_REL_PATH}" into top-level "plugin" array in ${configPath()}`,
     );
@@ -143,6 +177,9 @@ function installPluginAssets(
     const skillsCopied = copySkillTree(skillSource, skillsDir());
     copied.push(...skillsCopied);
   }
+
+  const removedLegacy = cleanupLegacyCommands(false);
+  copied.push(...removedLegacy);
 
   config["plugin"] = mergePluginArray(config["plugin"], PLUGIN_REL_PATH);
   // resolved entry: ./plugins/agentmemory-capture.ts

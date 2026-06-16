@@ -12,8 +12,12 @@ export type ConnectOptions = {
    * When true, the OpenCode adapter additionally copies the bundled
    * agentmemory-capture.ts plugin into `~/.config/opencode/plugins/`,
    * registers it under the top-level `plugin` array in
-   * `~/.config/opencode/opencode.json`, and copies the recall + remember
-   * slash commands. No-op for other adapters.
+   * `~/.config/opencode/opencode.json`, copies the 16-skill tree from
+   * `plugin/skills/<name>/` to `<OPENCODE_CONFIG_DIR>/skills/<name>/SKILL.md`,
+   * and removes the now-deprecated agentmemory legacy slash command files
+   * (recall.md, remember.md, health.md) from `<OPENCODE_CONFIG_DIR>/commands/`
+   * if they exist from a previous install (backed up to ~/.agentmemory/backups/
+   * first). No-op for other adapters.
    */
   withPlugin?: boolean;
 };

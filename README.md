@@ -101,7 +101,7 @@ agentmemory                                      # start the memory server on :3
 agentmemory demo                                 # seed sample sessions + prove recall
 agentmemory demo --serve                         # one command: boot server, run demo, tear down (no second terminal)
 agentmemory connect claude-code                  # wire MCP into your agent (also: copilot-cli, codex, cursor, gemini-cli, ...)
-npx skills add rohitg00/agentmemory -y           # install 15 native skills (8 you can invoke, 7 reference) so your agent knows when to use the tools
+npx skills add rohitg00/agentmemory -y           # install 16 native skills (9 you can invoke, 7 reference) so your agent knows when to use the tools
 ```
 
 Or via `npx` (no install):
@@ -637,7 +637,7 @@ This is **complementary** to `agentmemory connect <agent>`:
 - `agentmemory connect <agent>` writes the MCP server config so the tools are available.
 - `npx skills add rohitg00/agentmemory` installs the skills so the agent knows when to call them.
 
-For the few agents the skills CLI doesn't cover yet (Zed v1.3.x and below), drop the 15 SKILL.md files under the agent's native skill directory yourself — same format works everywhere.
+For the few agents the skills CLI doesn't cover yet (Zed v1.3.x and below), drop the 16 SKILL.md files under the agent's native skill directory yourself — same format works everywhere.
 
 #### Standard MCP block
 
@@ -675,7 +675,7 @@ The agentmemory entry is the **same MCP server block** across every host that us
 | **Qwen Code** | `~/.qwen/settings.json` | `agentmemory connect qwen` writes the standard `mcpServers` block. Hook payload is field-compatible with Claude Code, so the existing 12-hook scripts work without modification — wire them via the `hooks` section in the same `settings.json`. |
 | **Antigravity** (replaces Gemini CLI) | `mcp_config.json` (in Antigravity's User dir) | `agentmemory connect antigravity` writes the standard `mcpServers` block. macOS: `~/Library/Application Support/Antigravity/User/`. Linux: `~/.config/Antigravity/User/`. Use after the 2026-06-18 Gemini CLI sunset. |
 | **Kiro** | `~/.kiro/settings/mcp.json` | `agentmemory connect kiro` writes the user-level config. Workspace overrides go in `.kiro/settings/mcp.json` next to your code. |
-| **Warp** | `~/.warp/.mcp.json` | `agentmemory connect warp` writes the standard `mcpServers` block. Warp also auto-discovers skills from `.claude/skills/` — once the Claude Code plugin is installed the 8 agentmemory skills (`remember`, `recall`, `recap`, `handoff`, `forget`, `commit-context`, `commit-history`, `session-history`) appear natively in Warp's slash-command palette. |
+| **Warp** | `~/.warp/.mcp.json` | `agentmemory connect warp` writes the standard `mcpServers` block. Warp also auto-discovers skills from `.claude/skills/` — once the Claude Code plugin is installed the 9 agentmemory skills (`remember`, `recall`, `recap`, `handoff`, `forget`, `commit-context`, `commit-history`, `session-history`, `health`) appear natively in Warp's slash-command palette. |
 | **Cline (CLI)** | `~/.cline/mcp.json` | `agentmemory connect cline` writes the standard `mcpServers` block. VS Code extension users: paste the same block via Cline Settings → MCP Servers → Edit JSON. |
 | **Continue.dev** | `~/.continue/config.yaml` (preferred) or `config.json` (legacy) | `agentmemory connect continue` creates `config.yaml` from scratch when neither exists, or modifies existing `config.json`. **If you already have `config.yaml`** the adapter prints the exact block to paste under `mcpServers:` — it won't silently rewrite your yaml because preserving comments and anchors safely needs a YAML parser the package doesn't ship. Continue uses array form (not object) for `mcpServers`. |
 | **Zed** | `~/.config/zed/settings.json` | `agentmemory connect zed` writes under `context_servers` (Zed's key, NOT `mcpServers`). Remote MCP servers can be wired via `{"url": "..."}` instead. |
@@ -1022,7 +1022,7 @@ npm install @xenova/transformers
 
 </details>
 
-### 6 Resources · 3 Prompts · 4 Skills
+### 6 Resources · 3 Prompts · 16 Skills
 
 | Type | Name | Description |
 |------|------|-------------|
@@ -1033,10 +1033,15 @@ npm install @xenova/transformers
 | Prompt | `recall_context` | Search + return context messages |
 | Prompt | `session_handoff` | Handoff data between agents |
 | Prompt | `detect_patterns` | Analyze recurring patterns |
-| Skill | `/recall` | Search memory |
-| Skill | `/remember` | Save to long-term memory |
-| Skill | `/session-history` | Recent session summaries |
-| Skill | `/forget` | Delete observations/sessions |
+| Skill | `/recall` | Search memory (hybrid BM25 + vector + graph) |
+| Skill | `/remember` | Save to long-term memory with concept tags |
+| Skill | `/recap` | Roll up recent sessions for the current project |
+| Skill | `/handoff` | Resume the most recent session, leading with unanswered questions |
+| Skill | `/forget` | Delete observations after confirmation |
+| Skill | `/commit-context` | Trace a file/line back to the session that produced it |
+| Skill | `/commit-history` | List recent agent-linked commits |
+| Skill | `/session-history` | Timeline of recent sessions on this project |
+| Skill | `/health` | Probe the server, list providers, surface stuck items |
 
 ### Standalone MCP
 

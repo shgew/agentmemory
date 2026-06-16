@@ -40,12 +40,25 @@ describe("OpenCode connect adapter: --with-plugin flag", () => {
   });
 
   it("does NOT ship the deleted /recall, /remember, /health markdown commands", () => {
-    expect(adapter).not.toMatch(/recall\.md/);
-    expect(adapter).not.toMatch(/remember\.md/);
-    expect(adapter).not.toMatch(/health\.md/);
-    expect(adapter).not.toMatch(/commandsDir/);
+    // Old ship-path constructs are gone
     expect(adapter).not.toMatch(/SLASH_COMMANDS/);
-    expect(adapter).not.toMatch(/["']commands["']/);
+    expect(adapter).not.toMatch(/function\s+commandsDir/);
+    // No code path that creates or copies INTO a commands/ dir
+    expect(adapter).not.toMatch(/mkdirSync\([^)]*?["']commands["']/);
+    expect(adapter).not.toMatch(/copyFileSync\([^)]*?,\s*join\([^)]*?["']commands["']/);
+  });
+
+  it("removes deprecated agentmemory legacy command files on upgrade", () => {
+    // Cleanup constant + function are present
+    expect(adapter).toMatch(/LEGACY_COMMAND_FILES/);
+    expect(adapter).toMatch(/cleanupLegacyCommands/);
+    // Cleanup names the 3 deprecated files
+    expect(adapter).toMatch(/recall\.md/);
+    expect(adapter).toMatch(/remember\.md/);
+    expect(adapter).toMatch(/health\.md/);
+    // Cleanup backs up before removing
+    expect(adapter).toMatch(/backupFile[^;]*opencode-legacy-command/);
+    expect(adapter).toMatch(/rmSync/);
   });
 
   it("respects opts.dryRun for the plugin install path", () => {
