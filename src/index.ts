@@ -49,6 +49,7 @@ import { registerPatternsFunction } from "./functions/patterns.js";
 import { registerRememberFunction } from "./functions/remember.js";
 import { registerEvictFunction } from "./functions/evict.js";
 import { registerSessionSweepFunction } from "./functions/session-sweep.js";
+import { registerSessionCheckpoint } from "./functions/session-checkpoint.js";
 import { registerRelationsFunction } from "./functions/relations.js";
 import { registerTimelineFunction } from "./functions/timeline.js";
 import { registerSmartSearchFunction } from "./functions/smart-search.js";
@@ -253,6 +254,7 @@ async function main() {
   registerRememberFunction(sdk, kv);
   registerEvictFunction(sdk, kv);
   registerSessionSweepFunction(sdk, kv);
+  registerSessionCheckpoint(sdk, kv);
 
   registerRelationsFunction(sdk, kv);
   registerTimelineFunction(sdk, kv);
