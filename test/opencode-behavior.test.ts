@@ -242,6 +242,34 @@ describe("OpenCode plugin behavior: session.idle separate from session.status", 
   });
 });
 
+describe("OpenCode plugin behavior: vcs.branch.updated", () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
+
+  it("captures the current branch when an active session exists", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await plugin.event!({
+      event: { type: "session.created", properties: { info: { id: "s-vcs" } } } as any,
+    });
+    calls.length = 0;
+    await plugin.event!({
+      event: { type: "vcs.branch.updated", properties: { branch: "feature/oauth" } } as any,
+    });
+    const observe = calls.find((c) => c.body?.hookType === "vcs_branch_updated");
+    expect(observe).toBeDefined();
+    expect(observe!.body.data.branch).toBe("feature/oauth");
+  });
+
+  it("no-ops when no active session is tracked", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await plugin.event!({
+      event: { type: "vcs.branch.updated", properties: { branch: "main" } } as any,
+    });
+    const observe = calls.find((c) => c.body?.hookType === "vcs_branch_updated");
+    expect(observe).toBeUndefined();
+  });
+});
+
 describe("OpenCode plugin behavior: dispose does NOT end session", () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(async () => { await teardownPlugin(); });

@@ -33,7 +33,7 @@ function pluginsDir(): string { return join(opencodeDir(), "plugins"); }
 function commandsDir(): string { return join(opencodeDir(), "commands"); }
 const PLUGIN_FILENAME = "agentmemory-capture.ts";
 const PLUGIN_REL_PATH = `./plugins/${PLUGIN_FILENAME}`;
-const SLASH_COMMANDS = ["recall.md", "remember.md"];
+const SLASH_COMMANDS = ["recall.md", "remember.md", "health.md"];
 
 // No `environment` block: OpenCode does not expand shell-style
 // `${VAR:-default}` values, and writing them literally would override the

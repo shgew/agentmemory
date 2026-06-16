@@ -672,6 +672,16 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         });
       }
 
+      // ── vcs.branch.updated ── (git branch switch context)
+      if (type === "vcs.branch.updated") {
+        const sid = activeSessionId;
+        if (sid) {
+          await observe(sid, "vcs_branch_updated", {
+            branch: (props.branch as string) || null,
+          });
+        }
+      }
+
       // ── command.executed ──
       if (type === "command.executed") {
         const sid = props.sessionID || activeSessionId;

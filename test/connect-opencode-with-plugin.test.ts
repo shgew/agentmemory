@@ -33,9 +33,10 @@ describe("OpenCode connect adapter: --with-plugin flag", () => {
     expect(adapter).toMatch(/["']plugin["']\s*\]?[\s\S]{0,200}?agentmemory-capture/);
   });
 
-  it("copies the recall and remember slash commands to ~/.config/opencode/commands/", () => {
+  it("copies the recall, remember, and health slash commands to ~/.config/opencode/commands/", () => {
     expect(adapter).toMatch(/recall\.md/);
     expect(adapter).toMatch(/remember\.md/);
+    expect(adapter).toMatch(/health\.md/);
     expect(adapter).toMatch(/["']commands["']/);
   });
 

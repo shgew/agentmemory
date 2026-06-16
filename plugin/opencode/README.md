@@ -10,8 +10,8 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/MCP-53_tools-1f6feb?style=flat-square" alt="53 MCP tools" />
-  <img src="https://img.shields.io/badge/Plugin-33_hooks-1f6feb?style=flat-square" alt="33 hooks" />
-  <img src="https://img.shields.io/badge/Commands-2_slash-1f6feb?style=flat-square" alt="2 slash commands" />
+  <img src="https://img.shields.io/badge/Plugin-34_hooks-1f6feb?style=flat-square" alt="34 hooks" />
+  <img src="https://img.shields.io/badge/Commands-3_slash-1f6feb?style=flat-square" alt="3 slash commands" />
   <img src="https://img.shields.io/badge/R@5-95.2%25-00875f?style=flat-square" alt="95.2% R@5" />
 </p>
 
@@ -33,7 +33,7 @@ The server starts on `http://localhost:3111`.
 agentmemory connect opencode --with-plugin
 ```
 
-`--with-plugin` writes the MCP block to `~/.config/opencode/opencode.json`, copies the auto-capture plugin to `~/.config/opencode/plugins/agentmemory-capture.ts`, copies the `/recall` and `/remember` slash commands to `~/.config/opencode/commands/`, and adds `"plugin": ["./plugins/agentmemory-capture.ts"]` to `opencode.json`. The merge is idempotent and backs up any existing files first.
+`--with-plugin` writes the MCP block to `~/.config/opencode/opencode.json`, copies the auto-capture plugin to `~/.config/opencode/plugins/agentmemory-capture.ts`, copies the `/recall`, `/remember`, and `/health` slash commands to `~/.config/opencode/commands/`, and adds `"plugin": ["./plugins/agentmemory-capture.ts"]` to `opencode.json`. The merge is idempotent and backs up any existing files first.
 
 Without `--with-plugin`, `agentmemory connect opencode` writes the MCP block only, leaving the plugin install to you.
 
@@ -133,6 +133,7 @@ Restart OpenCode or open a new session. The plugin auto-captures session lifecyc
 | Task tracking (w/ priority) | `todo.updated` | POST /observe |
 | Command (pre-execute) | `command.execute.before` | POST /observe |
 | Command (executed) | `command.executed` | POST /observe |
+| Git branch switch | `vcs.branch.updated` | POST /observe (current branch) |
 
 ### Model and config
 
@@ -238,6 +239,7 @@ agentmemory already persists everything in SQLite (`data/state_store.db`). Addin
 
 - `/recall <query>` - Search past observations and lessons
 - `/remember <text>` - Save an insight to long-term memory
+- `/health` - Probe the agentmemory server and surface diagnostics (LLM/embedding providers, session counts, recent activity, stuck-item categories)
 
 ## Session instruction injection
 

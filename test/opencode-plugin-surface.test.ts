@@ -27,6 +27,7 @@ const EVENT_BRANCHES = [
   "permission.v2.asked",
   "permission.v2.replied",
   "todo.updated",
+  "vcs.branch.updated",
   "command.executed",
 ] as const;
 
