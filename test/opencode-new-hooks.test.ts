@@ -39,7 +39,6 @@ describe("OpenCode plugin: dispose cleanup hook", () => {
     expect(block).toMatch(/seenToolCallIds\.clear\(\)/);
     expect(block).toMatch(/contextInjectedSessions\.clear\(\)/);
     expect(block).toMatch(/startContextCache\.clear\(\)/);
-    expect(block).toMatch(/lastSummarizeAt\.clear\(\)/);
   });
 
   it("does NOT post /session/end on dispose (plugin reload, not session end)", () => {

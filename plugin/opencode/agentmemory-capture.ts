@@ -10,7 +10,6 @@ const SECRET = process.env.AGENTMEMORY_SECRET || "";
 
 const TIMEOUT_MS = Number(process.env.OPENCODE_AGENTMEMORY_TIMEOUT_MS) || 5000;
 const HEAVY_TIMEOUT_MS = Number(process.env.OPENCODE_AGENTMEMORY_HEAVY_TIMEOUT_MS) || 30_000;
-const SUMMARIZE_DEBOUNCE_MS = Number(process.env.OPENCODE_AGENTMEMORY_SUMMARIZE_DEBOUNCE_MS) || 600_000;
 
 const LOOPBACK_HOSTS = new Set([
   "localhost",
@@ -77,7 +76,6 @@ const seenSubtaskIds = new Map<string, Set<string>>();
 const seenToolCallIds = new Map<string, Set<string>>();
 const contextInjectedSessions = new Set<string>();
 const startContextCache = new Map<string, string>();
-const lastSummarizeAt = new Map<string, number>();
 
 function stashFor(sid: string): Set<string> {
   let s = stashedFiles.get(sid);
@@ -97,13 +95,6 @@ function toolCallSetFor(sid: string): Set<string> {
   return s;
 }
 
-function shouldSummarize(sid: string): boolean {
-  const now = Date.now();
-  const last = lastSummarizeAt.get(sid);
-  if (last !== undefined && now - last < SUMMARIZE_DEBOUNCE_MS) return false;
-  lastSummarizeAt.set(sid, now);
-  return true;
-}
 
 function safeSlice(v: unknown, max: number): string {
   if (typeof v === "string") return v.slice(0, max);
@@ -246,7 +237,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         seenSubtaskIds.delete(activeSessionId);
         seenToolCallIds.delete(activeSessionId);
         contextInjectedSessions.delete(activeSessionId);
-        lastSummarizeAt.delete(activeSessionId);
         const sessionId = activeSessionId;
         const startResult = await postJson("/session/start", {
           sessionId,
@@ -269,8 +259,8 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
       // ── session.idle ── (distinct v1 bus event; also debounced for safety)
       if (type === "session.idle") {
         const sid = props.sessionID || activeSessionId;
-        if (sid && shouldSummarize(sid)) {
-          await post("/summarize", { sessionId: sid });
+        if (sid) {
+          await post("/session/checkpoint", { sessionId: sid });
         }
       }
 
@@ -279,8 +269,8 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         const status = props.status as Record<string, unknown> | undefined;
         const sid = props.sessionID || activeSessionId;
         if (!sid || !status) return;
-        if (status.type === "idle" && shouldSummarize(sid)) {
-          await post("/summarize", { sessionId: sid });
+        if (status.type === "idle") {
+          await post("/session/checkpoint", { sessionId: sid });
         }
         await observe(sid, "session_status", {
           status_type: status.type,
@@ -293,9 +283,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
       if (type === "session.compacted") {
         const sid = props.sessionID || activeSessionId;
         if (sid) {
-          if (shouldSummarize(sid)) {
-            await post("/summarize", { sessionId: sid });
-          }
+          await post("/session/checkpoint", { sessionId: sid });
           await observe(sid, "session_compacted", {});
         }
       }
@@ -361,7 +349,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         seenSubtaskIds.delete(sid);
         seenToolCallIds.delete(sid);
         contextInjectedSessions.delete(sid);
-        lastSummarizeAt.delete(sid);
       }
 
       // ── session.error ──
@@ -875,12 +862,14 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
     // Posting /session/end here would mark a live session as completed
     // and re-trigger the consolidation pipeline incorrectly.
     dispose: async () => {
+      if (activeSessionId) {
+        void post("/session/checkpoint", { sessionId: activeSessionId });
+      }
       stashedFiles.clear();
       seenSubtaskIds.clear();
       seenToolCallIds.clear();
       contextInjectedSessions.clear();
       startContextCache.clear();
-      lastSummarizeAt.clear();
       activeSessionId = null;
       pendingConfig = null;
     },

@@ -224,38 +224,21 @@ describe("OpenCode plugin behavior: session.idle separate from session.status", 
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(async () => { await teardownPlugin(); });
 
-  it("fires /summarize on bare session.idle event (also debounced)", async () => {
+  it("fires /session/checkpoint on bare session.idle event", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
       event: { type: "session.idle", properties: { sessionID: "s8" } } as any,
     });
-    const summarize = calls.find((c) => c.url.endsWith("/agentmemory/summarize"));
-    expect(summarize).toBeDefined();
+    const checkpoint = calls.find((c) => c.url.endsWith("/agentmemory/session/checkpoint"));
+    expect(checkpoint).toBeDefined();
   });
 
-  it("second immediate session.idle is debounced", async () => {
+  it("fires /session/checkpoint on every session.idle (no debounce)", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({ event: { type: "session.idle", properties: { sessionID: "s9" } } as any });
     await plugin.event!({ event: { type: "session.idle", properties: { sessionID: "s9" } } as any });
-    const summarizes = calls.filter((c) => c.url.endsWith("/agentmemory/summarize"));
-    expect(summarizes.length).toBe(1);
-  });
-
-  it("allows another session.idle after the default 10 minute window", async () => {
-    vi.useFakeTimers();
-    try {
-      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
-      const { plugin, calls } = await loadPlugin();
-      await plugin.event!({ event: { type: "session.idle", properties: { sessionID: "s10" } } as any });
-      vi.setSystemTime(new Date("2026-01-01T00:09:59.999Z"));
-      await plugin.event!({ event: { type: "session.idle", properties: { sessionID: "s10" } } as any });
-      vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
-      await plugin.event!({ event: { type: "session.idle", properties: { sessionID: "s10" } } as any });
-      const summarizes = calls.filter((c) => c.url.endsWith("/agentmemory/summarize"));
-      expect(summarizes.length).toBe(2);
-    } finally {
-      vi.useRealTimers();
-    }
+    const checkpoints = calls.filter((c) => c.url.endsWith("/agentmemory/session/checkpoint"));
+    expect(checkpoints.length).toBe(2);
   });
 });
 
