@@ -383,3 +383,59 @@ describe("event::session::stopped passes timeoutMs to mem::summarize", () => {
     expect(summarizeCall!.timeoutMs).toBe(600000);
   });
 });
+
+describe("event::session::stopped passes timeoutMs to mem::graph-extract", () => {
+  const ORIGINAL_ENV = { ...process.env };
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    delete process.env.AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS;
+    sdk = mockSdk();
+    kv = mockKV();
+    registerEventTriggers(sdk as never, kv as never);
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  it("dispatches mem::graph-extract with default timeoutMs=180000 when env unset", async () => {
+    const sessionId = "ses_graph_timeout_default";
+    await kv.set(
+      KV.observations(sessionId),
+      "obs_1",
+      makeObs("obs_1", sessionId, "2026-01-01T10:00:00.000Z"),
+    );
+
+    const result: any = await sdk.trigger({
+      function_id: "event::session::stopped",
+      payload: { sessionId, waitForCompletion: true },
+    });
+    await result;
+
+    const graphCall = sdk.calls.find((c) => c.function_id === "mem::graph-extract");
+    expect(graphCall).toBeDefined();
+    expect(graphCall!.timeoutMs).toBe(180000);
+  });
+
+  it("dispatches mem::graph-extract with overridden timeoutMs when env set", async () => {
+    process.env.AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS = "600000";
+    const sessionId = "ses_graph_timeout_override";
+    await kv.set(
+      KV.observations(sessionId),
+      "obs_1",
+      makeObs("obs_1", sessionId, "2026-01-01T10:00:00.000Z"),
+    );
+
+    const result: any = await sdk.trigger({
+      function_id: "event::session::stopped",
+      payload: { sessionId, waitForCompletion: true },
+    });
+    await result;
+
+    const graphCall = sdk.calls.find((c) => c.function_id === "mem::graph-extract");
+    expect(graphCall).toBeDefined();
+    expect(graphCall!.timeoutMs).toBe(600000);
+  });
+});

@@ -41,6 +41,23 @@ const SNAPSHOT_KEY = "current";
 // invocation deadline.
 const LIVE_ENUMERATION_BUDGET_MS = 6000;
 
+// Wall-clock budget for one mem::graph-extract orchestration: one or
+// more LLM extraction calls plus KV writes (node + edge dedup,
+// snapshot inline update). Bounds the whole orchestration via
+// iii-sdk's TriggerRequest.timeoutMs, overriding the worker-level
+// invocationTimeoutMs default. Each individual outbound LLM fetch is
+// separately bounded by AGENTMEMORY_LLM_TIMEOUT_MS. Raise for
+// large sessions (hundreds of compressed observations) where the
+// extraction LLM call alone exceeds the default 3-min budget.
+const GRAPH_EXTRACT_TIMEOUT_MS_DEFAULT = 180_000;
+
+export function getGraphExtractTimeoutMs(): number {
+  const raw = process.env.AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS;
+  if (!raw) return GRAPH_EXTRACT_TIMEOUT_MS_DEFAULT;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : GRAPH_EXTRACT_TIMEOUT_MS_DEFAULT;
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const t = setTimeout(

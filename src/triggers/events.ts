@@ -7,6 +7,7 @@ import { isGraphExtractionEnabled } from "../config.js";
 import { logger } from "../logger.js";
 import { isAfter } from "../state/timestamp-compare.js";
 import { getSummarizeTimeoutMs } from "../functions/summarize.js";
+import { getGraphExtractTimeoutMs } from "../functions/graph.js";
 
 let sessionStoppedQueue: Promise<void> = Promise.resolve();
 let sessionStoppedQueueDepth = 0;
@@ -124,6 +125,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
               ...(since ? { since } : {}),
               ...(until ? { until } : {}),
             },
+            timeoutMs: getGraphExtractTimeoutMs(),
           });
         }
       } catch (err) {

@@ -36,6 +36,18 @@ describe("api::session::end → event::session::ended → event::session::stoppe
       /function_id:\s*"event::session::stopped"[\s\S]*?action:\s*TriggerAction\.Void\(\)/,
     );
   });
+
+  it("event::session::stopped passes timeoutMs from getGraphExtractTimeoutMs() to mem::graph-extract", () => {
+    expect(events).toMatch(
+      /function_id:\s*"mem::graph-extract",[\s\S]*?timeoutMs:\s*getGraphExtractTimeoutMs\(\)/,
+    );
+  });
+
+  it("events.ts imports getGraphExtractTimeoutMs from functions/graph.js", () => {
+    expect(events).toMatch(
+      /import\s*\{\s*getGraphExtractTimeoutMs\s*\}\s*from\s*"\.\.\/functions\/graph\.js"/,
+    );
+  });
 });
 
 // #666: viewer's "Build Graph" button used to POST /agentmemory/graph/build
@@ -73,6 +85,18 @@ describe("api::graph-build endpoint (#666)", () => {
 
   it("response shape matches what the viewer expects (success + nodes)", () => {
     expect(api).toMatch(/success:\s*true,\s*sessions:[\s\S]*?nodes:\s*totalNodes/);
+  });
+
+  it("passes timeoutMs from getGraphExtractTimeoutMs() to each mem::graph-extract batch trigger", () => {
+    expect(api).toMatch(
+      /function_id:\s*"mem::graph-extract",[\s\S]*?payload:\s*\{\s*observations:\s*batch\s*\},[\s\S]*?timeoutMs:\s*getGraphExtractTimeoutMs\(\)/,
+    );
+  });
+
+  it("imports getGraphExtractTimeoutMs from functions/graph.js", () => {
+    expect(api).toMatch(
+      /import\s*\{\s*getGraphExtractTimeoutMs\s*\}\s*from\s*"\.\.\/functions\/graph\.js"/,
+    );
   });
 });
 

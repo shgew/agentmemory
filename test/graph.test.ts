@@ -1,10 +1,10 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { registerGraphFunction } from "../src/functions/graph.js";
+import { registerGraphFunction, getGraphExtractTimeoutMs } from "../src/functions/graph.js";
 import type {
   CompressedObservation,
   GraphNode,
@@ -777,4 +777,39 @@ describe("mem::graph-extract windowing", () => {
     expect(result.success).toBe(false);
     expect(mockProvider.compress).not.toHaveBeenCalled();
   });
-});
+
+describe("getGraphExtractTimeoutMs", () => {
+  const ORIGINAL_ENV = { ...process.env };
+
+  beforeEach(() => {
+    delete process.env.AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS;
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  it("returns default 180000 when AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS is unset", () => {
+    expect(getGraphExtractTimeoutMs()).toBe(180000);
+  });
+
+  it("parses a valid positive integer override", () => {
+    process.env.AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS = "600000";
+    expect(getGraphExtractTimeoutMs()).toBe(600000);
+  });
+
+  it("falls back to default on malformed string", () => {
+    process.env.AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS = "abc";
+    expect(getGraphExtractTimeoutMs()).toBe(180000);
+  });
+
+  it("falls back to default on zero", () => {
+    process.env.AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS = "0";
+    expect(getGraphExtractTimeoutMs()).toBe(180000);
+  });
+
+  it("falls back to default on negative", () => {
+    process.env.AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS = "-1000";
+    expect(getGraphExtractTimeoutMs()).toBe(180000);
+  });
+});});

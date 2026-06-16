@@ -24,6 +24,7 @@ import {
   isAgentScopeIsolated,
 } from "../config.js";
 import { getSummarizeTimeoutMs } from "../functions/summarize.js";
+import { getGraphExtractTimeoutMs } from "../functions/graph.js";
 
 type Response = {
   status_code: number;
@@ -1575,7 +1576,11 @@ export function registerApiTriggers(
         };
       }
       try {
-        const result = await sdk.trigger({ function_id: "mem::graph-extract", payload: req.body });
+        const result = await sdk.trigger({
+          function_id: "mem::graph-extract",
+          payload: req.body,
+          timeoutMs: getGraphExtractTimeoutMs(),
+        });
         return { status_code: 200, body: result };
       } catch {
         return graphDisabledResponse();
@@ -1617,6 +1622,7 @@ export function registerApiTriggers(
               const result = (await sdk.trigger({
                 function_id: "mem::graph-extract",
                 payload: { observations: batch },
+                timeoutMs: getGraphExtractTimeoutMs(),
               })) as { success?: boolean; nodesAdded?: number; edgesAdded?: number };
               if (result?.success) {
                 totalNodes += Number(result.nodesAdded) || 0;

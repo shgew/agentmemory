@@ -1456,6 +1456,26 @@ Create `~/.agentmemory/.env`:
                                           # first; bump the yaml or use the event-
                                           # driven path (session.stopped pipeline).
 
+# Graph-extract invocation timeout
+# AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS=180000  # Default: 180 000 ms (3 min). Caps the total
+                                          # wall-clock budget for one mem::graph-extract
+                                          # orchestration (one or more LLM extraction
+                                          # calls + KV writes for node/edge dedup and
+                                          # snapshot inline update). Distinct from
+                                          # AGENTMEMORY_LLM_TIMEOUT_MS, which bounds each
+                                          # individual outbound HTTP call. Raise for
+                                          # large sessions (hundreds of compressed
+                                          # observations passed to a single graph-extract
+                                          # call) where the extraction LLM call alone
+                                          # exceeds the default 3-min budget on slow
+                                          # local models. Note: when calling
+                                          # POST /agentmemory/graph/extract or
+                                          # /agentmemory/graph/build with a value above
+                                          # iii-http.default_timeout (180000 in
+                                          # iii-config.yaml), the HTTP layer may close
+                                          # first; bump the yaml or use the event-
+                                          # driven path (session.stopped pipeline).
+
 # Search tuning
 # BM25_WEIGHT=0.4
 # VECTOR_WEIGHT=0.6
