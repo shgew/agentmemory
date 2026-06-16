@@ -10,7 +10,7 @@ const SECRET = process.env.AGENTMEMORY_SECRET || "";
 
 const TIMEOUT_MS = Number(process.env.OPENCODE_AGENTMEMORY_TIMEOUT_MS) || 5000;
 const HEAVY_TIMEOUT_MS = Number(process.env.OPENCODE_AGENTMEMORY_HEAVY_TIMEOUT_MS) || 30_000;
-const SUMMARIZE_DEBOUNCE_MS = Number(process.env.OPENCODE_AGENTMEMORY_SUMMARIZE_DEBOUNCE_MS) || 60_000;
+const SUMMARIZE_DEBOUNCE_MS = Number(process.env.OPENCODE_AGENTMEMORY_SUMMARIZE_DEBOUNCE_MS) || 600_000;
 
 const LOOPBACK_HOSTS = new Set([
   "localhost",
@@ -99,8 +99,8 @@ function toolCallSetFor(sid: string): Set<string> {
 
 function shouldSummarize(sid: string): boolean {
   const now = Date.now();
-  const last = lastSummarizeAt.get(sid) ?? 0;
-  if (now - last < SUMMARIZE_DEBOUNCE_MS) return false;
+  const last = lastSummarizeAt.get(sid);
+  if (last !== undefined && now - last < SUMMARIZE_DEBOUNCE_MS) return false;
   lastSummarizeAt.set(sid, now);
   return true;
 }

@@ -13,9 +13,9 @@ describe("OpenCode plugin: summarize debounce", () => {
     );
   });
 
-  it("reads OPENCODE_AGENTMEMORY_SUMMARIZE_DEBOUNCE_MS with a 60_000 default", () => {
+  it("reads OPENCODE_AGENTMEMORY_SUMMARIZE_DEBOUNCE_MS with a 600_000 default", () => {
     expect(plugin).toMatch(
-      /OPENCODE_AGENTMEMORY_SUMMARIZE_DEBOUNCE_MS[\s\S]*?60[_]?000/,
+      /OPENCODE_AGENTMEMORY_SUMMARIZE_DEBOUNCE_MS[\s\S]*?600[_]?000/,
     );
   });
 

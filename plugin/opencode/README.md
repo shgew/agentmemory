@@ -71,7 +71,7 @@ Restart OpenCode or open a new session. The plugin auto-captures session lifecyc
 | Event | Hook | agentmemory API |
 |---|---|---|
 | Session start | `session.created` | POST /session/start |
-| Idle (debounced) | `session.idle` + `session.status` (idle) | POST /summarize (per-session, default 60s window) |
+| Idle (debounced) | `session.idle` + `session.status` (idle) | POST /summarize (per-session, default 10m window) |
 | Status transitions | `session.status` (idle/busy/retry) | POST /observe |
 | Compaction (debounced) | `session.compacted` | POST /summarize + POST /observe (same debounce) |
 | Metadata updates / resume | `session.updated` | POST /observe; first sighting of a sid without a prior session.created treats it as a resume - re-fires POST /session/start to repopulate context cache and clear context-injected flag |
@@ -164,7 +164,7 @@ The plugin is built to survive busy sessions, slow networks, and unattended shut
 
 ### Summarize debounce
 
-`session.status` (idle) and `session.compacted` both trigger `/summarize`. Without a guard, an active session can flood the server with 30+ LLM-bound calls per minute. The plugin keeps a per-session `lastSummarizeAt` timestamp and skips the call if the previous summarize fired less than `OPENCODE_AGENTMEMORY_SUMMARIZE_DEBOUNCE_MS` ago (default 60_000 ms). The `session_status` and `session_compacted` observations still emit unconditionally, so you keep the lifecycle signal without the LLM cost.
+`session.status` (idle) and `session.compacted` both trigger `/summarize`. Without a guard, an active session can flood the server with 30+ LLM-bound calls per minute. The plugin keeps a per-session `lastSummarizeAt` timestamp and skips the call if the previous summarize fired less than `OPENCODE_AGENTMEMORY_SUMMARIZE_DEBOUNCE_MS` ago (default 600_000 ms). The server rewrites the session summary from the beginning through the current anchor, so a longer default avoids repeated full-session LLM work while preserving lifecycle observations unconditionally.
 
 ### HTTPS guard
 
@@ -190,7 +190,7 @@ Abandoned-session consolidation runs only on `session.deleted` (`/session/end` +
 |---|---|---|
 | `OPENCODE_AGENTMEMORY_TIMEOUT_MS` | `5000` | `/observe`, `/context`, `/enrich`, `/summarize`, `/session/start`, `/session/end` |
 | `OPENCODE_AGENTMEMORY_HEAVY_TIMEOUT_MS` | `30000` | `/crystals/auto` and `/consolidate-pipeline` fan-out on `session.deleted` |
-| `OPENCODE_AGENTMEMORY_SUMMARIZE_DEBOUNCE_MS` | `60000` | minimum interval between `/summarize` calls per session |
+| `OPENCODE_AGENTMEMORY_SUMMARIZE_DEBOUNCE_MS` | `600000` | minimum interval between `/summarize` calls per session |
 | `OPENCODE_AGENTMEMORY_DEBUG` | unset | when `=1`, log POST failures + fire the init health probe |
 | `AGENTMEMORY_URL` | `http://localhost:3111` | inherited from shell; agentmemory server base URL |
 | `AGENTMEMORY_SECRET` | unset | inherited from shell; bearer token for protected deployments |

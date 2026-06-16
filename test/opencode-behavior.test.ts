@@ -240,6 +240,23 @@ describe("OpenCode plugin behavior: session.idle separate from session.status", 
     const summarizes = calls.filter((c) => c.url.endsWith("/agentmemory/summarize"));
     expect(summarizes.length).toBe(1);
   });
+
+  it("allows another session.idle after the default 10 minute window", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+      const { plugin, calls } = await loadPlugin();
+      await plugin.event!({ event: { type: "session.idle", properties: { sessionID: "s10" } } as any });
+      vi.setSystemTime(new Date("2026-01-01T00:09:59.999Z"));
+      await plugin.event!({ event: { type: "session.idle", properties: { sessionID: "s10" } } as any });
+      vi.setSystemTime(new Date("2026-01-01T00:10:00.000Z"));
+      await plugin.event!({ event: { type: "session.idle", properties: { sessionID: "s10" } } as any });
+      const summarizes = calls.filter((c) => c.url.endsWith("/agentmemory/summarize"));
+      expect(summarizes.length).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("OpenCode plugin behavior: vcs.branch.updated", () => {
