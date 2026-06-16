@@ -100,6 +100,21 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
       payload: { sessionId, ...(until ? { until } : {}) },
       timeoutMs: getSummarizeTimeoutMs(),
     });
+    if (
+      summary &&
+      typeof summary === "object" &&
+      (summary as { success?: boolean }).success === false
+    ) {
+      const error = (summary as { error?: string }).error ?? "unknown";
+      if (error === "no_provider" || error === "no_observations") {
+        logger.info("Summarize skipped as no-op, pipeline continues", {
+          sessionId,
+          error,
+        });
+      } else {
+        throw new Error(`mem::summarize returned failure: ${error}`);
+      }
+    }
     if (isReflectEnabled()) {
       try {
         await sdk.trigger({
@@ -176,31 +191,38 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
       if (existing.status === "completed") {
         const watermark = existing.lastCheckpointAt ?? existing.endedAt;
         if (anchor && isAfter(anchor, watermark)) {
+          await sdk.trigger({
+            function_id: "event::session::checkpoint",
+            payload: {
+              sessionId: data.sessionId,
+              since: watermark,
+              until: anchor,
+              waitForCompletion: true,
+            },
+          });
           await kv.update(KV.sessions, data.sessionId, [
             { type: "set", path: "lastCheckpointAt", value: anchor },
           ]);
-          sdk.trigger({
-            function_id: "event::session::checkpoint",
-            payload: { sessionId: data.sessionId, since: watermark, until: anchor },
-            action: TriggerAction.Void(),
-          });
           return { success: true, checkpointed: true };
         }
         return { success: true, alreadyCompleted: true };
       }
 
       const effectiveAnchor = anchor ?? new Date().toISOString();
+      await sdk.trigger({
+        function_id: "event::session::stopped",
+        payload: {
+          sessionId: data.sessionId,
+          until: effectiveAnchor,
+          waitForCompletion: true,
+        },
+      });
       const endedAt = new Date().toISOString();
       await kv.update(KV.sessions, data.sessionId, [
         { type: "set", path: "endedAt", value: endedAt },
         { type: "set", path: "status", value: "completed" },
         { type: "set", path: "lastCheckpointAt", value: effectiveAnchor },
       ]);
-      sdk.trigger({
-        function_id: "event::session::stopped",
-        payload: { sessionId: data.sessionId, until: effectiveAnchor },
-        action: TriggerAction.Void(),
-      });
       return { success: true };
     },
   );

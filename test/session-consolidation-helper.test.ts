@@ -439,3 +439,84 @@ describe("event::session::stopped passes timeoutMs to mem::graph-extract", () =>
     expect(graphCall!.timeoutMs).toBe(600000);
   });
 });
+
+describe("event::session::ended restart safety", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    registerEventTriggers(sdk as never, kv as never);
+  });
+
+  it("active path: pipeline failure leaves KV untouched", async () => {
+    sdk.registerFunction("mem::summarize", async () => {
+      throw new Error("simulated pipeline failure");
+    });
+    sdk.registerFunction("mem::slot-reflect", async () => ({ success: true }));
+    sdk.registerFunction("mem::graph-extract", async () => ({ success: true }));
+
+    const sessionId = "ses_ended_active_crash";
+    const startedAt = "2026-01-01T09:00:00.000Z";
+    const updatedAt = "2026-01-01T17:00:00.000Z";
+    await kv.set(KV.sessions, sessionId, {
+      id: sessionId,
+      project: "test",
+      cwd: "/tmp",
+      startedAt,
+      updatedAt,
+      status: "active",
+      observationCount: 1,
+    } satisfies Session);
+    await kv.set(KV.observations(sessionId), "obs_1", makeObs("obs_1", sessionId, updatedAt));
+
+    await expect(
+      sdk.trigger({
+        function_id: "event::session::ended",
+        payload: { sessionId },
+      }),
+    ).rejects.toThrow();
+
+    const stored = await kv.get<Session>(KV.sessions, sessionId);
+    expect(stored!.status).toBe("active");
+    expect(stored!.endedAt).toBeUndefined();
+    expect(stored!.lastCheckpointAt).toBeUndefined();
+  });
+
+  it("checkpoint path: pipeline failure leaves lastCheckpointAt unchanged", async () => {
+    sdk.registerFunction("mem::summarize", async () => {
+      throw new Error("simulated pipeline failure");
+    });
+    sdk.registerFunction("mem::slot-reflect", async () => ({ success: true }));
+    sdk.registerFunction("mem::graph-extract", async () => ({ success: true }));
+
+    const sessionId = "ses_ended_cp_crash";
+    const originalCheckpoint = "2026-01-01T10:00:00.000Z";
+    const originalEndedAt = "2026-01-01T11:00:00.000Z";
+    const postActivityAt = "2026-01-02T10:00:00.000Z";
+    await kv.set(KV.sessions, sessionId, {
+      id: sessionId,
+      project: "test",
+      cwd: "/tmp",
+      startedAt: "2026-01-01T09:00:00.000Z",
+      endedAt: originalEndedAt,
+      lastCheckpointAt: originalCheckpoint,
+      updatedAt: postActivityAt,
+      status: "completed",
+      observationCount: 2,
+    } satisfies Session);
+    await kv.set(KV.observations(sessionId), "obs_1", makeObs("obs_1", sessionId, postActivityAt));
+
+    await expect(
+      sdk.trigger({
+        function_id: "event::session::ended",
+        payload: { sessionId },
+      }),
+    ).rejects.toThrow();
+
+    const stored = await kv.get<Session>(KV.sessions, sessionId);
+    expect(stored!.lastCheckpointAt).toBe(originalCheckpoint);
+    expect(stored!.endedAt).toBe(originalEndedAt);
+  });
+});

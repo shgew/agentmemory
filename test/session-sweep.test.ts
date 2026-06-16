@@ -744,3 +744,102 @@ describe("Session Sweep - restart safety", () => {
     expect(auditAfter2).toBe(auditAfter1);
   });
 });
+
+describe("Session Sweep - summarize success:false handling", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    registerSessionSweepFunction(sdk as never, kv as never);
+    registerEventTriggers(sdk as never, kv as never);
+    sdk.registerFunction("mem::slot-reflect", async () => ({ success: true }));
+    sdk.registerFunction("mem::graph-extract", async () => ({ success: true }));
+  });
+
+  it("summarize transient failure (empty_provider_response) leaves KV untouched", async () => {
+    sdk.registerFunction("mem::summarize", async () => ({
+      success: false,
+      error: "empty_provider_response",
+    }));
+
+    const stale = makeSession({
+      id: "ses_transient_fail",
+      startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(),
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_transient_fail", stale);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_transient_fail"] },
+    })) as {
+      swept: string[];
+      failed: Array<{ sessionId: string; error: string }>;
+    };
+
+    expect(result.swept).not.toContain("ses_transient_fail");
+    expect(result.failed.map((f) => f.sessionId)).toContain("ses_transient_fail");
+
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_transient_fail");
+    expect(stored?.status).toBe("active");
+    expect(stored?.endedAt).toBeUndefined();
+    expect(stored?.lastCheckpointAt).toBeUndefined();
+  });
+
+  it("summarize permanent no-op (no_provider) advances KV as successful sweep", async () => {
+    sdk.registerFunction("mem::summarize", async () => ({
+      success: false,
+      error: "no_provider",
+    }));
+
+    const stale = makeSession({
+      id: "ses_no_provider",
+      startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(),
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_no_provider", stale);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_no_provider"] },
+    })) as {
+      swept: string[];
+      failed: Array<{ sessionId: string; error: string }>;
+    };
+
+    expect(result.swept).toContain("ses_no_provider");
+    expect(result.failed).toHaveLength(0);
+
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_no_provider");
+    expect(stored?.status).toBe("completed");
+    expect(stored?.endedAt).toBeDefined();
+    expect(stored?.lastCheckpointAt).toBeDefined();
+  });
+
+  it("summarize permanent no-op (no_observations) advances KV as successful sweep", async () => {
+    sdk.registerFunction("mem::summarize", async () => ({
+      success: false,
+      error: "no_observations",
+    }));
+
+    const stale = makeSession({
+      id: "ses_no_obs",
+      startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(),
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_no_obs", stale);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_no_obs"] },
+    })) as {
+      swept: string[];
+      failed: Array<{ sessionId: string; error: string }>;
+    };
+
+    expect(result.swept).toContain("ses_no_obs");
+    expect(result.failed).toHaveLength(0);
+
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_no_obs");
+    expect(stored?.status).toBe("completed");
+  });
+});
