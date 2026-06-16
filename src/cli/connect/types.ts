@@ -8,6 +8,14 @@ export type ConnectOptions = {
    * hooks from dispatching on Codex Desktop. No-op for other adapters.
    */
   withHooks?: boolean;
+  /**
+   * When true, the OpenCode adapter additionally copies the bundled
+   * agentmemory-capture.ts plugin into `~/.config/opencode/plugins/`,
+   * registers it under the top-level `plugin` array in
+   * `~/.config/opencode/opencode.json`, and copies the recall + remember
+   * slash commands. No-op for other adapters.
+   */
+  withPlugin?: boolean;
 };
 
 export type ConnectAdapter = {

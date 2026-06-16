@@ -172,7 +172,7 @@ agentmemory works with any agent that supports hooks, MCP, or REST API. All agen
 <td align="center" width="12.5%">
 <a href="https://github.com/opencode-ai/opencode"><picture><source media="(prefers-color-scheme: dark)" srcset="https://svgl.app/library/opencode-dark.svg"><img src="https://svgl.app/library/opencode.svg" alt="OpenCode" width="48" height="48" /></picture></a><br/>
 <strong>OpenCode</strong><br/>
-<sub>22 hooks + MCP + plugin</sub>
+<sub>28 hooks + MCP + plugin</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/cline/cline"><img src="https://github.com/cline.png?size=120" alt="Cline" width="48" height="48" /></a><br/>
@@ -669,7 +669,7 @@ The agentmemory entry is the **same MCP server block** across every host that us
 | **Codex CLI (MCP only)** | `.codex/config.toml` | TOML shape: `codex mcp add agentmemory -- npx -y @agentmemory/mcp`, or add `[mcp_servers.agentmemory]` manually. |
 | **Codex CLI (full plugin)** | Codex plugin marketplace | `codex plugin marketplace add rohitg00/agentmemory` then `codex plugin add agentmemory@agentmemory`. Registers MCP + 6 lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, Stop) + 15 skills. On Codex Desktop, also run `agentmemory connect codex --with-hooks` until [openai/codex#16430](https://github.com/openai/codex/issues/16430) lands — plugin hooks are currently silent there. |
 | **OpenCode (MCP only)** | `opencode.json` | Different shape — top-level `mcp` key, command as array: `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`. |
-| **OpenCode (full plugin)** | `plugin/opencode/` | 22 auto-capture hooks covering session lifecycle, messages, tools, errors. Two slash commands (`/recall`, `/remember`). Copy `plugin/opencode/` into your OpenCode workspace and add the plugin entry to `opencode.json`. See [`plugin/opencode/README.md`](plugin/opencode/README.md) for the full hook table + gap analysis. |
+| **OpenCode (full plugin)** | `plugin/opencode/` | 28 auto-capture hooks (session lifecycle, messages, tools, file enrichment, permissions including `permission.asked`, debounced summarize, dispose cleanup, base64/image sanitization, command.execute.before and tool.execute.after). Two slash commands (`/recall`, `/remember`). One-shot install: `agentmemory connect opencode --with-plugin` (copies plugin file + commands and updates `opencode.json`). See [`plugin/opencode/README.md`](plugin/opencode/README.md) for the full hook table. |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | Copy [`integrations/pi`](integrations/pi/) and restart pi. |
 | **Hermes Agent** | `~/.hermes/config.yaml` | Use the deeper [memory provider plugin](integrations/hermes/) with `memory.provider: agentmemory`. |
 | **Qwen Code** | `~/.qwen/settings.json` | `agentmemory connect qwen` writes the standard `mcpServers` block. Hook payload is field-compatible with Claude Code, so the existing 12-hook scripts work without modification — wire them via the `hooks` section in the same `settings.json`. |
@@ -1080,8 +1080,10 @@ OpenCode (`opencode.json`):
 }
 ```
 
-Copy the plugin file from the repo:
+Copy the plugin file from the repo, or run the one-shot install:
 ```bash
+agentmemory connect opencode --with-plugin
+# or, manually:
 mkdir -p ~/.config/opencode/plugins
 cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
 cp plugin/opencode/commands/*.md ~/.config/opencode/commands/

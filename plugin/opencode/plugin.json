@@ -1,7 +1,7 @@
 {
   "name": "agentmemory-capture",
-  "version": "0.9.20",
-  "description": "OpenCode plugin for agentmemory — full Claude Code hook parity: session lifecycle (create/idle/status/compacted/update/diff/delete/error), messages & prompts (chat.message, message.updated user+assistant, message.removed), tool lifecycle (ToolPart states with timing), part tracking (subtask, step-finish, reasoning, file, patch, compaction, agent, retry), file enrichment pipeline, permissions, task tracking (w/ priority), commands, config & model tracking. 22 hooks, 2 slash commands.",
+  "version": "0.9.27",
+  "description": "OpenCode plugin for agentmemory - 28 hooks with full Claude Code parity, plus newer typed hooks (tool.execute.after, dispose, command.execute.before, experimental.chat.messages.transform), the permission.asked bus event, and a user message capture branch. Session lifecycle (create/idle/status/compacted/update/diff/delete/error), messages and prompts (chat.message, message.updated user+assistant, message.removed), tool lifecycle (ToolPart states + tool.execute.before/after with shared dedup), part tracking (subtask, step-finish, reasoning, file, patch, compaction, agent, retry), file enrichment pipeline (stash + experimental.chat.system.transform inject), permissions (updated + asked + replied), task tracking (todo.updated w/ priority), commands (command.execute.before + command.executed), config + chat.params. Built-in reliability: per-session /summarize debounce (default 60s, override via OPENCODE_AGENTMEMORY_SUMMARIZE_DEBOUNCE_MS), HTTPS bearer warning, DEBUG-only /health probe at init, tool output base64/image sanitization, env-driven timeouts (OPENCODE_AGENTMEMORY_TIMEOUT_MS, OPENCODE_AGENTMEMORY_HEAVY_TIMEOUT_MS). Two slash commands (recall, remember). One-shot install via `agentmemory connect opencode --with-plugin`.",
   "author": {
     "name": "Rohit Ghumare",
     "url": "https://github.com/rohitg00"

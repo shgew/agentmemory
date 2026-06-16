@@ -8,13 +8,25 @@ const MAX_STASHED_FILES = 20;
 const DEBUG = process.env.OPENCODE_AGENTMEMORY_DEBUG === "1";
 const SECRET = process.env.AGENTMEMORY_SECRET || "";
 
+const TIMEOUT_MS = Number(process.env.OPENCODE_AGENTMEMORY_TIMEOUT_MS) || 5000;
+const HEAVY_TIMEOUT_MS = Number(process.env.OPENCODE_AGENTMEMORY_HEAVY_TIMEOUT_MS) || 30_000;
+const SUMMARIZE_DEBOUNCE_MS = Number(process.env.OPENCODE_AGENTMEMORY_SUMMARIZE_DEBOUNCE_MS) || 60_000;
+
+const LOOPBACK_HOSTS = new Set([
+  "localhost",
+  "127.0.0.1",
+  "::1",
+  "0.0.0.0",
+  "[::1]",
+]);
+
 function authHeaders(): Record<string, string> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (SECRET) headers["Authorization"] = `Bearer ${SECRET}`;
   return headers;
 }
 
-async function post(path: string, body: Record<string, unknown>, timeoutMs = 5000): Promise<void> {
+async function post(path: string, body: Record<string, unknown>, timeoutMs = TIMEOUT_MS): Promise<void> {
   try {
     await fetch(`${API}/agentmemory${path}`, {
       method: "POST",
@@ -33,7 +45,7 @@ async function postJson(path: string, body: Record<string, unknown>): Promise<un
       method: "POST",
       headers: authHeaders(),
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     return res.ok ? await res.json() : null;
   } catch (e) {
@@ -64,12 +76,8 @@ const stashedFiles = new Map<string, Set<string>>();
 const seenSubtaskIds = new Map<string, Set<string>>();
 const seenToolCallIds = new Map<string, Set<string>>();
 const contextInjectedSessions = new Set<string>();
-// cache the context returned by POST /session/start so the chat
-// system-transform hook can inject it without a second /context fetch.
-// Auto-injection now happens at session.created (immediately) AND at
-// the first prompt_submit (fallback for older OpenCode builds that
-// don't implement experimental.chat.system.transform).
 const startContextCache = new Map<string, string>();
+const lastSummarizeAt = new Map<string, number>();
 
 function stashFor(sid: string): Set<string> {
   let s = stashedFiles.get(sid);
@@ -89,16 +97,59 @@ function toolCallSetFor(sid: string): Set<string> {
   return s;
 }
 
-function pruneSessionMaps(sid: string): void {
-  stashedFiles.delete(sid);
-  seenSubtaskIds.delete(sid);
-  seenToolCallIds.delete(sid);
+function shouldSummarize(sid: string): boolean {
+  const now = Date.now();
+  const last = lastSummarizeAt.get(sid) ?? 0;
+  if (now - last < SUMMARIZE_DEBOUNCE_MS) return false;
+  lastSummarizeAt.set(sid, now);
+  return true;
 }
 
 function safeSlice(v: unknown, max: number): string {
   if (typeof v === "string") return v.slice(0, max);
   if (v == null) return "";
   try { return JSON.stringify(v).slice(0, max); } catch { return ""; }
+}
+
+function sanitizeOutput(v: unknown): unknown {
+  const BASE64_PREFIX_RE = /^(?:iVBORw0KGgo|\/9j\/|R0lGOD|UklGR|PHN2Z|JVBERi0)/;
+  const stripBlob = (s: string): string => {
+    if (s.length <= 100) return s;
+  if (s.startsWith("data:image/") || s.startsWith("data:application/") || s.startsWith("data:audio/") || s.startsWith("data:video/")) {
+      return `<blob:stripped:${s.length}b>`;
+    }
+    if (BASE64_PREFIX_RE.test(s)) {
+      return `<base64:stripped:${s.length}b>`;
+    }
+    return s;
+  };
+  if (typeof v === "string") return stripBlob(v);
+  if (v == null) return v;
+  if (Array.isArray(v)) {
+    return v.map((item) => (typeof item === "string" ? stripBlob(item) : item));
+  }
+  if (typeof v === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+      out[k] = typeof val === "string" ? stripBlob(val) : val;
+    }
+    return out;
+  }
+  return v;
+}
+
+function assertHttpsOrLoopback(): void {
+  if (!SECRET) return;
+  try {
+    const u = new URL(API);
+    if (u.protocol === "http:" && !LOOPBACK_HOSTS.has(u.hostname.toLowerCase())) {
+      console.warn(
+        `[agentmemory] AGENTMEMORY_SECRET is set but AGENTMEMORY_URL is plaintext http to a non-loopback host (${API}). Use HTTPS or an SSH tunnel to protect the bearer token.`,
+      );
+    }
+  } catch {
+    // unparseable URL: leave it to fetch() to surface the error
+  }
 }
 
 const AGENTMEMORY_INSTRUCTIONS = `<agentmemory-instructions>
@@ -170,6 +221,17 @@ function extractErrorMessage(err: unknown): string {
 export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
   projectPath = ctx.worktree || ctx.project?.id || process.cwd();
 
+  assertHttpsOrLoopback();
+
+  if (DEBUG) {
+    fetch(`${API}/agentmemory/health`, {
+      headers: authHeaders(),
+      signal: AbortSignal.timeout(2000),
+    })
+      .then((r) => console.error(`[agentmemory] health probe ${r.status}`))
+      .catch((e) => console.error(`[agentmemory] health unreachable:`, (e as Error).message));
+  }
+
   return {
     event: async ({ event }) => {
       const type = event.type;
@@ -184,9 +246,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         seenSubtaskIds.delete(activeSessionId);
         seenToolCallIds.delete(activeSessionId);
         contextInjectedSessions.delete(activeSessionId);
-        // Snapshot the session id locally — `activeSessionId` is mutable
-        // and another `session.created` event during the await could
-        // rebind it, causing context to be cached against the wrong key.
+        lastSummarizeAt.delete(activeSessionId);
         const sessionId = activeSessionId;
         const startResult = await postJson("/session/start", {
           sessionId,
@@ -196,8 +256,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
           project: projectPath,
           cwd: projectPath,
         });
-        // cache the context returned at session/start so the
-        // chat.system.transform hook injects it without a second fetch.
         const startCtx = (startResult as any)?.context;
         if (typeof startCtx === "string" && startCtx.length > 0) {
           startContextCache.set(sessionId, startCtx);
@@ -215,7 +273,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         const status = props.status as Record<string, unknown> | undefined;
         const sid = props.sessionID || activeSessionId;
         if (!sid || !status) return;
-        if (status.type === "idle") {
+        if (status.type === "idle" && shouldSummarize(sid)) {
           await post("/summarize", { sessionId: sid });
         }
         await observe(sid, "session_status", {
@@ -229,7 +287,9 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
       if (type === "session.compacted") {
         const sid = props.sessionID || activeSessionId;
         if (sid) {
-          await post("/summarize", { sessionId: sid });
+          if (shouldSummarize(sid)) {
+            await post("/summarize", { sessionId: sid });
+          }
           await observe(sid, "session_compacted", {});
         }
       }
@@ -239,6 +299,10 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         const info = props.info as Record<string, unknown> | undefined;
         const sid = (info?.id as string) || props.sessionID || activeSessionId;
         if (!sid) return;
+        if (!stashedFiles.has(sid)) {
+          stashedFiles.set(sid, new Set());
+          contextInjectedSessions.delete(sid);
+        }
         await observe(sid, "session_updated", {
           title: info?.title ?? null,
           parentID: info?.parentID ?? null,
@@ -269,14 +333,15 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
           return;
         }
         await post("/session/end", { sessionId: sid });
-        post("/crystals/auto", { olderThanDays: 7 }, 30000);
-        post("/consolidate-pipeline", { tier: "all", force: true }, 30000);
+        post("/crystals/auto", { olderThanDays: 7 }, HEAVY_TIMEOUT_MS);
+        post("/consolidate-pipeline", { tier: "all", force: true }, HEAVY_TIMEOUT_MS);
         if (sid === activeSessionId) activeSessionId = null;
         stashedFiles.delete(sid);
         startContextCache.delete(sid);
         seenSubtaskIds.delete(sid);
         seenToolCallIds.delete(sid);
         contextInjectedSessions.delete(sid);
+        lastSummarizeAt.delete(sid);
       }
 
       // ── session.error ──
@@ -320,6 +385,15 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
             duration_ms: (info.time && typeof (info.time as any).completed === "number")
               ? (info.time as any).completed - ((info.time as any).created || 0)
               : null,
+          });
+        } else if (info.role === "user") {
+          const sid = props.sessionID || (info.sessionID as string) || activeSessionId;
+          if (!sid) return;
+          await observe(sid, "user_message", {
+            messageID: info.id,
+            parentID: info.parentID,
+            mode: info.mode ?? null,
+            time_created: (info.time as any)?.created ?? null,
           });
         }
       }
@@ -375,7 +449,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
               tool_name: toolName,
               call_id: callId,
               tool_input: safeSlice(st.input, 4000),
-              tool_output: safeSlice(st.output, 8000),
+              tool_output: safeSlice(sanitizeOutput(st.output), 8000),
               title: st.title ?? null,
               metadata: st.metadata || {},
               duration_ms: (startTime != null && endTime != null) ? endTime - startTime : null,
@@ -395,7 +469,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
               tool_name: toolName,
               call_id: callId,
               tool_input: safeSlice(st.input, 4000),
-              tool_output: safeSlice(st.error, 8000),
+              tool_output: safeSlice(sanitizeOutput(st.error), 8000),
               duration_ms: (startTime != null && endTime != null) ? endTime - startTime : null,
             });
           }
@@ -489,6 +563,21 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
             : (props.pattern || ""),
           tool_call_id: props.callID || null,
           title: props.title || props.type || "",
+          metadata: props.metadata || {},
+        });
+      }
+
+      // ── permission.asked ──
+      if (type === "permission.asked") {
+        const sid = props.sessionID || activeSessionId;
+        if (!sid) return;
+        await observe(sid, "permission_asked", {
+          permission_id: props.permissionID || props.id || "",
+          tool_call_id: props.callID || null,
+          title: props.title || "",
+          pattern: Array.isArray(props.pattern)
+            ? props.pattern.join(", ")
+            : (props.pattern || ""),
           metadata: props.metadata || {},
         });
       }
@@ -597,6 +686,29 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
       }
     },
 
+    // ── tool.execute.after ──
+    "tool.execute.after": async (input, output) => {
+      const sid = input.sessionID || activeSessionId;
+      if (!sid) return;
+      const callId = (input as any).callID as string | undefined;
+      if (!callId) return;
+      const callSet = toolCallSetFor(sid);
+      if (callSet.has(callId)) return;
+      callSet.add(callId);
+      const out = output as Record<string, unknown> | undefined;
+      const args = (input as any).args as Record<string, unknown> | undefined;
+      await observe(sid, "post_tool_use", {
+        tool_name: input.tool,
+        call_id: callId,
+        tool_input: safeSlice(args, 4000),
+        tool_output: safeSlice(sanitizeOutput(out?.output), 8000),
+        title: out?.title ?? null,
+        metadata: out?.metadata || {},
+        duration_ms: null,
+        attachments: [],
+      });
+    },
+
     // ── experimental.chat.system.transform ──
     "experimental.chat.system.transform": async (input, output) => {
       const sid = input.sessionID || activeSessionId;
@@ -605,9 +717,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
       if (!contextInjectedSessions.has(sid)) {
         if (!Array.isArray(output.system)) return;
         output.system.push(AGENTMEMORY_INSTRUCTIONS);
-        // prefer the context already fetched at session.created;
-        // fall back to a fresh /context call if the cache missed (e.g.
-        // session resumed across plugin reloads).
         let ctx = startContextCache.get(sid);
         if (typeof ctx !== "string" || ctx.length === 0) {
           const result = await postJson("/context", {
@@ -643,6 +752,18 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
       }
     },
 
+    // ── experimental.chat.messages.transform ──
+    "experimental.chat.messages.transform": async (input, output) => {
+      const sid = input.sessionID || activeSessionId;
+      if (!sid) return;
+      const msgs = (output as any)?.messages;
+      const msgCount = Array.isArray(msgs) ? msgs.length : 0;
+      await observe(sid, "messages_transform", {
+        source: (input as any).source ?? "unknown",
+        message_count: msgCount,
+      });
+    },
+
     // ── experimental.session.compacting (WIP) ──
     "experimental.session.compacting": async (input, output) => {
       const sid = input.sessionID || activeSessionId;
@@ -658,6 +779,32 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
           output.context.push(ctx);
         }
       }
+    },
+
+    // ── command.execute.before ──
+    "command.execute.before": async (input, output) => {
+      const sid = (input as any).sessionID || activeSessionId;
+      if (!sid) return;
+      const args = (output as any)?.arguments ?? (input as any).arguments ?? "";
+      await observe(sid, "command_before", {
+        name: (input as any).name,
+        arguments: safeSlice(args, 2000),
+      });
+    },
+
+    // ── dispose ──
+    dispose: async () => {
+      if (activeSessionId) {
+        await post("/session/end", { sessionId: activeSessionId });
+      }
+      stashedFiles.clear();
+      seenSubtaskIds.clear();
+      seenToolCallIds.clear();
+      contextInjectedSessions.clear();
+      startContextCache.clear();
+      lastSummarizeAt.clear();
+      activeSessionId = null;
+      pendingConfig = null;
     },
 
     // ── config ──

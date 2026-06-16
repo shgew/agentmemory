@@ -55,6 +55,7 @@ function parseFlags(args: string[]): {
   force: boolean;
   all: boolean;
   withHooks: boolean;
+  withPlugin: boolean;
   positional: string[];
 } {
   const positional: string[] = [];
@@ -62,14 +63,16 @@ function parseFlags(args: string[]): {
   let force = false;
   let all = false;
   let withHooks = false;
+  let withPlugin = false;
   for (const a of args) {
     if (a === "--dry-run") dryRun = true;
     else if (a === "--force") force = true;
     else if (a === "--all") all = true;
     else if (a === "--with-hooks") withHooks = true;
+    else if (a === "--with-plugin") withPlugin = true;
     else if (!a.startsWith("-")) positional.push(a);
   }
-  return { dryRun, force, all, withHooks, positional };
+  return { dryRun, force, all, withHooks, withPlugin, positional };
 }
 
 export async function runAdapter(
@@ -97,7 +100,7 @@ export async function runAdapter(
 }
 
 export async function runConnect(args: string[]): Promise<void> {
-  const { dryRun, force, all, withHooks, positional } = parseFlags(args);
+  const { dryRun, force, all, withHooks, withPlugin, positional } = parseFlags(args);
   const allowWindowsAdapter =
     positional.length === 1 && positional[0]?.toLowerCase() === "copilot-cli";
   if (platform() === "win32" && !allowWindowsAdapter) {
@@ -109,7 +112,7 @@ export async function runConnect(args: string[]): Promise<void> {
     return;
   }
 
-  const opts: ConnectOptions = { dryRun, force, withHooks };
+  const opts: ConnectOptions = { dryRun, force, withHooks, withPlugin };
 
   p.intro("agentmemory connect");
 
