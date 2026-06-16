@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import * as p from "@clack/prompts";
@@ -21,19 +21,23 @@ import { findPluginRoot } from "./codex-hooks.js";
 // `--with-plugin` resolves the bundled `plugin/opencode/agentmemory-capture.ts`
 // from the installed @agentmemory/agentmemory package, copies it under
 // the opencode config dir's plugins/, registers it in the top-level "plugin"
-// array of opencode.json, and copies the recall + remember slash commands.
-// All paths are resolved lazily so OPENCODE_CONFIG_DIR set per-invocation
-// (and test isolation via process.env mutation) takes effect.
+// array of opencode.json, and copies the agentmemory skills tree from
+// `plugin/skills/` to `<opencode-config>/skills/<name>/SKILL.md`. OpenCode's
+// command registry merges skills into its slash command palette as
+// `source: "skill"`, so /recall, /remember, /health and the other invocable
+// skills all appear in the palette while reference skills load on demand via
+// the native `skill` tool. All paths are resolved lazily so OPENCODE_CONFIG_DIR
+// set per-invocation (and test isolation via process.env mutation) takes effect.
 function opencodeDir(): string {
   return process.env["OPENCODE_CONFIG_DIR"]?.trim() || join(homedir(), ".config", "opencode");
 }
 function configPath(): string { return join(opencodeDir(), "opencode.json"); }
 function detectDir(): string { return opencodeDir(); }
 function pluginsDir(): string { return join(opencodeDir(), "plugins"); }
-function commandsDir(): string { return join(opencodeDir(), "commands"); }
+function skillsDir(): string { return join(opencodeDir(), "skills"); }
 const PLUGIN_FILENAME = "agentmemory-capture.ts";
 const PLUGIN_REL_PATH = `./plugins/${PLUGIN_FILENAME}`;
-const SLASH_COMMANDS = ["recall.md", "remember.md", "health.md"];
+const SKILL_SOURCE_REL = "skills";
 
 // No `environment` block: OpenCode does not expand shell-style
 // `${VAR:-default}` values, and writing them literally would override the
@@ -64,6 +68,28 @@ function mergePluginArray(existing: unknown, entry: string): string[] {
   return [...current, entry];
 }
 
+function copySkillTree(source: string, target: string): string[] {
+  const copied: string[] = [];
+  if (!existsSync(source)) return copied;
+  mkdirSync(target, { recursive: true });
+  const entries = readdirSync(source, { withFileTypes: true });
+  for (const entry of entries) {
+    const sourcePath = join(source, entry.name);
+    const targetPath = join(target, entry.name);
+    if (entry.isDirectory()) {
+      copied.push(...copySkillTree(sourcePath, targetPath));
+    } else if (entry.isFile()) {
+      if (existsSync(targetPath)) {
+        const backupPath = backupFile(targetPath, "opencode-skill", "md");
+        logBackup(backupPath);
+      }
+      copyFileSync(sourcePath, targetPath);
+      copied.push(targetPath);
+    }
+  }
+  return copied;
+}
+
 function installPluginAssets(
   config: OpencodeConfig,
   opts: ConnectOptions,
@@ -88,8 +114,14 @@ function installPluginAssets(
     p.log.info(
       `[dry-run] Would copy ${PLUGIN_FILENAME} to ${pluginsDir()}/`,
     );
-    for (const cmd of SLASH_COMMANDS) {
-      p.log.info(`[dry-run] Would copy ${cmd} to ${commandsDir()}/`);
+    const skillSource = join(pluginRoot, SKILL_SOURCE_REL);
+    if (existsSync(skillSource)) {
+      const skillDirs = readdirSync(skillSource, { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name);
+      p.log.info(
+        `[dry-run] Would copy ${skillDirs.length} skill subtree(s) (${skillDirs.join(", ")}) to ${skillsDir()}/`,
+      );
     }
     p.log.info(
       `[dry-run] Would merge "${PLUGIN_REL_PATH}" into top-level "plugin" array in ${configPath()}`,
@@ -106,17 +138,10 @@ function installPluginAssets(
   copyFileSync(pluginSource, pluginTarget);
   copied.push(pluginTarget);
 
-  mkdirSync(commandsDir(), { recursive: true });
-  for (const cmd of SLASH_COMMANDS) {
-    const cmdSource = join(pluginRoot, "opencode", "commands", cmd);
-    if (!existsSync(cmdSource)) continue;
-    const cmdTarget = join(commandsDir(), cmd);
-    if (existsSync(cmdTarget)) {
-      const backupPath = backupFile(cmdTarget, "opencode-command", "md");
-      logBackup(backupPath);
-    }
-    copyFileSync(cmdSource, cmdTarget);
-    copied.push(cmdTarget);
+  const skillSource = join(pluginRoot, SKILL_SOURCE_REL);
+  if (existsSync(skillSource)) {
+    const skillsCopied = copySkillTree(skillSource, skillsDir());
+    copied.push(...skillsCopied);
   }
 
   config["plugin"] = mergePluginArray(config["plugin"], PLUGIN_REL_PATH);
@@ -131,7 +156,7 @@ export const adapter: ConnectAdapter = {
   category: "mcp",
   docs: "https://github.com/rohitg00/agentmemory#other-agents",
   protocolNote:
-    "Using MCP via ~/.config/opencode/opencode.json (top-level `mcp` key). Pass --with-plugin to also install the auto-capture plugin and slash commands.",
+    "Using MCP via ~/.config/opencode/opencode.json (top-level `mcp` key). Pass --with-plugin to also install the auto-capture plugin and 16 skills (9 invocable: recall, remember, health, recap, handoff, forget, commit-context, commit-history, session-history; 7 reference). OpenCode surfaces invocable skills in the slash command palette automatically.",
 
   detect(): boolean {
     return existsSync(detectDir());

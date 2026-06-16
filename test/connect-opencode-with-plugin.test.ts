@@ -33,11 +33,19 @@ describe("OpenCode connect adapter: --with-plugin flag", () => {
     expect(adapter).toMatch(/["']plugin["']\s*\]?[\s\S]{0,200}?agentmemory-capture/);
   });
 
-  it("copies the recall, remember, and health slash commands to ~/.config/opencode/commands/", () => {
-    expect(adapter).toMatch(/recall\.md/);
-    expect(adapter).toMatch(/remember\.md/);
-    expect(adapter).toMatch(/health\.md/);
-    expect(adapter).toMatch(/["']commands["']/);
+  it("copies the agentmemory skills tree from plugin/skills/ to ~/.config/opencode/skills/", () => {
+    expect(adapter).toMatch(/["']skills["']/);
+    expect(adapter).toMatch(/skillsDir|SKILL_SOURCE|copySkillTree|join\([^)]*?["']skills["']/);
+    expect(adapter).toMatch(/readdirSync|cpSync|recursive/);
+  });
+
+  it("does NOT ship the deleted /recall, /remember, /health markdown commands", () => {
+    expect(adapter).not.toMatch(/recall\.md/);
+    expect(adapter).not.toMatch(/remember\.md/);
+    expect(adapter).not.toMatch(/health\.md/);
+    expect(adapter).not.toMatch(/commandsDir/);
+    expect(adapter).not.toMatch(/SLASH_COMMANDS/);
+    expect(adapter).not.toMatch(/["']commands["']/);
   });
 
   it("respects opts.dryRun for the plugin install path", () => {

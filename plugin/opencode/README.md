@@ -11,7 +11,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/MCP-53_tools-1f6feb?style=flat-square" alt="53 MCP tools" />
   <img src="https://img.shields.io/badge/Plugin-34_hooks-1f6feb?style=flat-square" alt="34 hooks" />
-  <img src="https://img.shields.io/badge/Commands-3_slash-1f6feb?style=flat-square" alt="3 slash commands" />
+  <img src="https://img.shields.io/badge/Skills-16-1f6feb?style=flat-square" alt="16 skills" />
   <img src="https://img.shields.io/badge/R@5-95.2%25-00875f?style=flat-square" alt="95.2% R@5" />
 </p>
 
@@ -33,7 +33,7 @@ The server starts on `http://localhost:3111`.
 agentmemory connect opencode --with-plugin
 ```
 
-`--with-plugin` writes the MCP block to `~/.config/opencode/opencode.json`, copies the auto-capture plugin to `~/.config/opencode/plugins/agentmemory-capture.ts`, copies the `/recall`, `/remember`, and `/health` slash commands to `~/.config/opencode/commands/`, and adds `"plugin": ["./plugins/agentmemory-capture.ts"]` to `opencode.json`. The merge is idempotent and backs up any existing files first.
+`--with-plugin` writes the MCP block to `~/.config/opencode/opencode.json`, copies the auto-capture plugin to `~/.config/opencode/plugins/agentmemory-capture.ts`, copies 16 skills (9 invocable + 7 reference) to `~/.config/opencode/skills/<name>/`, and adds `"plugin": ["./plugins/agentmemory-capture.ts"]` to `opencode.json`. The merge is idempotent and backs up any existing files first. OpenCode merges skills into its unified slash command palette (`source: "skill"`), so `/recall`, `/remember`, `/health` work directly from the palette.
 
 Without `--with-plugin`, `agentmemory connect opencode` writes the MCP block only, leaving the plugin install to you.
 
@@ -57,9 +57,9 @@ Add to `~/.config/opencode/opencode.json`:
 Copy the bundled files:
 
 ```bash
-mkdir -p ~/.config/opencode/plugins ~/.config/opencode/commands
+mkdir -p ~/.config/opencode/plugins ~/.config/opencode/skills
 cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
-cp plugin/opencode/commands/*.md ~/.config/opencode/commands/
+cp -R plugin/skills/* ~/.config/opencode/skills/
 ```
 
 Restart OpenCode or open a new session. The plugin auto-captures session lifecycle, messages, tool execution, file edits, permissions, todos, and config events.
@@ -235,11 +235,29 @@ agentmemory  --push-->  OpenCode system prompt
 
 agentmemory already persists everything in SQLite (`data/state_store.db`). Adding an intermediate MEMORY.md file would duplicate data, introduce sync lag, and require the model to re-parse structured context from markdown. Direct injection delivers the same data with lower latency and zero staleness - the agent always sees what agentmemory knows right now.
 
-## Slash commands
+## Skills
 
-- `/recall <query>` - Search past observations and lessons
-- `/remember <text>` - Save an insight to long-term memory
-- `/health` - Probe the agentmemory server and surface diagnostics (LLM/embedding providers, session counts, recent activity, stuck-item categories)
+Sixteen skills land at `~/.config/opencode/skills/<name>/SKILL.md`. OpenCode's command registry merges them into the unified slash command palette as `source: "skill"`, so the 9 invocable ones appear as slash commands AND are also loadable by the agent via the native `skill` tool based on description matching.
+
+**Invocable (9)**:
+- `/recall <query>` - Search past observations and lessons (hybrid BM25 + vector + graph).
+- `/remember <text>` - Save an insight to long-term memory with searchable concept tags.
+- `/health` - Probe the server, list providers + counts, surface stuck items, suggest `memory_heal`.
+- `/recap <window>` - Roll up recent sessions for the current project, grouped by date.
+- `/handoff [cwd]` - Resume the most recent session for the working directory, leading with any unanswered question.
+- `/forget <query>` - Show matches, get explicit yes, then `memory_governance_delete` the chosen memory ids.
+- `/commit-context <ref>` - Trace a file/function/line back to the agent session that produced its current commit.
+- `/commit-history [filters]` - List recent agent-linked commits, optionally filtered by branch or repo.
+- `/session-history` - Show what happened in recent sessions on this project as a clean timeline.
+
+**Reference (7, loaded on demand by the agent)**:
+- `agentmemory-mcp-tools` - Map of every MCP tool, what it does, parameters.
+- `agentmemory-rest-api` - HTTP REST endpoint surface.
+- `agentmemory-config` - Env vars, ports, feature flags.
+- `agentmemory-agents` - How `agentmemory connect` wires each host.
+- `agentmemory-hooks` - Plugin hooks that auto-capture observations.
+- `agentmemory-architecture` - iii engine primitives, storage model, viewer.
+- `write-agentmemory-skill` - House format for authoring new skills.
 
 ## Session instruction injection
 

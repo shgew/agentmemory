@@ -10,6 +10,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **`AGENTMEMORY_SUMMARIZE_TIMEOUT_MS` env var** - configurable wall-clock cap for the `mem::summarize` orchestration (default 180 000 ms, matching the previously-hardcoded ceiling). Passed as `sdk.trigger`'s `timeoutMs` at the `event::session::stopped` consolidation site ([`src/triggers/events.ts`](src/triggers/events.ts)) and the `POST /agentmemory/summarize` REST handler ([`src/triggers/api.ts`](src/triggers/api.ts)). Distinct from `AGENTMEMORY_LLM_TIMEOUT_MS`, which bounds individual outbound LLM/embedding fetches. Resolves the recurring `Invocation timeout after 180000ms: mem::summarize` failure on bulk-imported sessions that produce 100+ summarise chunks.
 
+### Changed
+
+- **OpenCode plugin**: replaced the three slash-command markdown files (`/recall`, `/remember`, `/health` at `plugin/opencode/commands/*.md`) with the unified `plugin/skills/<name>/SKILL.md` tree. `agentmemory connect opencode --with-plugin` now copies the full 16-skill tree (9 invocable + 7 reference, plus the shared `_shared/TROUBLESHOOTING.md`) to `<OPENCODE_CONFIG_DIR>/skills/<name>/` instead of three markdown files under `commands/`. OpenCode's command registry merges skills into the slash command palette as `source: "skill"`, so `/recall`, `/remember`, `/health` continue to work from the user side without any change. The skill bodies are richer than the deleted commands (multi-file with EXAMPLES.md siblings, anti-patterns + checklist sections, shared troubleshooting via `../_shared/`).
+
+- **New `health` skill** at `plugin/skills/health/{SKILL.md, EXAMPLES.md}` preserving the previous `/health` slash-command behavior (probes `memory_diagnose` + `memory_sessions`, recommends `memory_heal` on non-zero issue categories). This bumps the total skill count from 15 to 16 (9 invocable, 7 reference).
+
+### Removed
+
+- `plugin/opencode/commands/` directory and the three markdown files inside it (functionality preserved via the skills tree above).
+
 ## [0.9.27] — 2026-06-07
 
 Wave release closing several breaking regressions reported against v0.9.26, plus an agent-scope isolation security fix, an iii version-pin audit fix, and a benchmark scorecard correction. No breaking changes; drop-in upgrade.
