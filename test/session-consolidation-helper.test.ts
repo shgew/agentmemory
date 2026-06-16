@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -55,7 +55,7 @@ function mockKV() {
   };
 }
 
-type Call = { function_id: string; payload: unknown };
+type Call = { function_id: string; payload: unknown; timeoutMs?: number };
 
 function mockSdk() {
   const calls: Call[] = [];
@@ -70,8 +70,8 @@ function mockSdk() {
       functions.set(id, handler);
     },
     registerTrigger: () => {},
-    trigger: async (input: { function_id: string; payload?: unknown; action?: unknown }) => {
-      calls.push({ function_id: input.function_id, payload: input.payload });
+    trigger: async (input: { function_id: string; payload?: unknown; action?: unknown; timeoutMs?: number }) => {
+      calls.push({ function_id: input.function_id, payload: input.payload, timeoutMs: input.timeoutMs });
       const fn = functions.get(input.function_id);
       if (!fn) return {};
       return fn(input.payload);
@@ -325,5 +325,61 @@ describe("event::session::ended S4 (already-completed paths)", () => {
     expect(stoppedCalls).toHaveLength(1);
     expect((stoppedCalls[0].payload as any).until).toBe(updatedAt);
     expect(checkpointCalls).toHaveLength(0);
+  });
+});
+
+describe("event::session::stopped passes timeoutMs to mem::summarize", () => {
+  const ORIGINAL_ENV = { ...process.env };
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    delete process.env.AGENTMEMORY_SUMMARIZE_TIMEOUT_MS;
+    sdk = mockSdk();
+    kv = mockKV();
+    registerEventTriggers(sdk as never, kv as never);
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  it("dispatches mem::summarize with default timeoutMs=180000 when env unset", async () => {
+    const sessionId = "ses_timeout_default";
+    await kv.set(
+      KV.observations(sessionId),
+      "obs_1",
+      makeObs("obs_1", sessionId, "2026-01-01T10:00:00.000Z"),
+    );
+
+    const result: any = await sdk.trigger({
+      function_id: "event::session::stopped",
+      payload: { sessionId, waitForCompletion: true },
+    });
+    await result;
+
+    const summarizeCall = sdk.calls.find((c) => c.function_id === "mem::summarize");
+    expect(summarizeCall).toBeDefined();
+    expect(summarizeCall!.timeoutMs).toBe(180000);
+  });
+
+  it("dispatches mem::summarize with overridden timeoutMs when env set", async () => {
+    process.env.AGENTMEMORY_SUMMARIZE_TIMEOUT_MS = "600000";
+    const sessionId = "ses_timeout_override";
+    await kv.set(
+      KV.observations(sessionId),
+      "obs_1",
+      makeObs("obs_1", sessionId, "2026-01-01T10:00:00.000Z"),
+    );
+
+    const result: any = await sdk.trigger({
+      function_id: "event::session::stopped",
+      payload: { sessionId, waitForCompletion: true },
+    });
+    await result;
+
+    const summarizeCall = sdk.calls.find((c) => c.function_id === "mem::summarize");
+    expect(summarizeCall).toBeDefined();
+    expect(summarizeCall!.timeoutMs).toBe(600000);
   });
 });

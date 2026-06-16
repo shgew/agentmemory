@@ -6,6 +6,7 @@ import { isReflectEnabled } from "../functions/slots.js";
 import { isGraphExtractionEnabled } from "../config.js";
 import { logger } from "../logger.js";
 import { isAfter } from "../state/timestamp-compare.js";
+import { getSummarizeTimeoutMs } from "../functions/summarize.js";
 
 let sessionStoppedQueue: Promise<void> = Promise.resolve();
 let sessionStoppedQueueDepth = 0;
@@ -96,6 +97,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     const summary = await sdk.trigger({
       function_id: "mem::summarize",
       payload: { sessionId, ...(until ? { until } : {}) },
+      timeoutMs: getSummarizeTimeoutMs(),
     });
     if (isReflectEnabled()) {
       try {

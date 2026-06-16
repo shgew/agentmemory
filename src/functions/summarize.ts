@@ -27,15 +27,22 @@ import { isAtOrBefore } from "../state/timestamp-compare.js";
 // comfortably in 128k-window models. Override via SUMMARIZE_CHUNK_SIZE.
 const CHUNK_SIZE_DEFAULT = 400;
 // Concurrent in-flight chunk calls. 6 keeps a 100-chunk session under
-// iii's 180s function-invocation timeout at ~8s/call while staying
-// inside generous-but-not-unlimited provider rate limits (well below
-// OpenAI free tier's 500 RPM). High-throughput providers
-// (Novita / DeepInfra / DeepSeek) typically allow 100+ concurrent — set
-// SUMMARIZE_CHUNK_CONCURRENCY higher to cover ~1000+ chunk sessions.
+// the default AGENTMEMORY_SUMMARIZE_TIMEOUT_MS budget (180s) at
+// ~8s/call while staying inside generous-but-not-unlimited provider
+// rate limits (well below OpenAI free tier's 500 RPM). High-throughput
+// providers (Novita / DeepInfra / DeepSeek) typically allow 100+
+// concurrent; set SUMMARIZE_CHUNK_CONCURRENCY higher for larger sessions.
 const CHUNK_CONCURRENCY_DEFAULT = 6;
 // Bail on the merged summary if more than this fraction of chunks fail
 // to parse — a half-blind narrative is worse than a clean error.
 const MAX_SKIP_RATIO = 0.5;
+// Wall-clock budget for one mem::summarize orchestration: N parallel
+// chunk LLM calls plus 1 reduce call, each bounded by
+// AGENTMEMORY_LLM_TIMEOUT_MS (per-fetch). This knob bounds the whole
+// orchestration via iii-sdk's TriggerRequest.timeoutMs, overriding the
+// worker-level invocationTimeoutMs default. Raise for very large
+// bulk-imported sessions (100+ chunks).
+const SUMMARIZE_TIMEOUT_MS_DEFAULT = 180_000;
 
 function getChunkSize(): number {
   const raw = process.env.SUMMARIZE_CHUNK_SIZE;
@@ -49,6 +56,13 @@ function getChunkConcurrency(): number {
   if (!raw) return CHUNK_CONCURRENCY_DEFAULT;
   const n = parseInt(raw, 10);
   return Number.isFinite(n) && n > 0 ? n : CHUNK_CONCURRENCY_DEFAULT;
+}
+
+export function getSummarizeTimeoutMs(): number {
+  const raw = process.env.AGENTMEMORY_SUMMARIZE_TIMEOUT_MS;
+  if (!raw) return SUMMARIZE_TIMEOUT_MS_DEFAULT;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : SUMMARIZE_TIMEOUT_MS_DEFAULT;
 }
 
 // One chunk call with retry-once. Returns null when both attempts fail —

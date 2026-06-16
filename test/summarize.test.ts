@@ -29,7 +29,7 @@ vi.mock("../src/functions/audit.js", () => ({
   safeAudit: vi.fn(),
 }));
 
-import { registerSummarizeFunction } from "../src/functions/summarize.js";
+import { registerSummarizeFunction, getSummarizeTimeoutMs } from "../src/functions/summarize.js";
 import type {
   CompressedObservation,
   Session,
@@ -511,5 +511,41 @@ describe("mem::summarize windowing", () => {
     expect(provider.calls[0].user).toContain("obs 0");
     expect(provider.calls[0].user).toContain("obs 1");
     expect(provider.calls[0].user).not.toContain("obs 2");
+  });
+});
+
+describe("getSummarizeTimeoutMs", () => {
+  const ORIGINAL_ENV = { ...process.env };
+
+  beforeEach(() => {
+    delete process.env.AGENTMEMORY_SUMMARIZE_TIMEOUT_MS;
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  it("returns default 180000 when AGENTMEMORY_SUMMARIZE_TIMEOUT_MS is unset", () => {
+    expect(getSummarizeTimeoutMs()).toBe(180000);
+  });
+
+  it("parses a valid positive integer override", () => {
+    process.env.AGENTMEMORY_SUMMARIZE_TIMEOUT_MS = "600000";
+    expect(getSummarizeTimeoutMs()).toBe(600000);
+  });
+
+  it("falls back to default on malformed string", () => {
+    process.env.AGENTMEMORY_SUMMARIZE_TIMEOUT_MS = "abc";
+    expect(getSummarizeTimeoutMs()).toBe(180000);
+  });
+
+  it("falls back to default on zero", () => {
+    process.env.AGENTMEMORY_SUMMARIZE_TIMEOUT_MS = "0";
+    expect(getSummarizeTimeoutMs()).toBe(180000);
+  });
+
+  it("falls back to default on negative", () => {
+    process.env.AGENTMEMORY_SUMMARIZE_TIMEOUT_MS = "-1000";
+    expect(getSummarizeTimeoutMs()).toBe(180000);
   });
 });

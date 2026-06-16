@@ -1431,6 +1431,24 @@ Create `~/.agentmemory/.env`:
                                           # Increase for slow networks or large batch calls;
                                           # decrease to fail-fast on rate-limit holds.
 
+# Summarize invocation timeout
+# AGENTMEMORY_SUMMARIZE_TIMEOUT_MS=180000  # Default: 180 000 ms (3 min). Caps the total
+                                          # wall-clock budget for one mem::summarize
+                                          # orchestration (N parallel chunk LLM calls +
+                                          # 1 reduce call). Distinct from
+                                          # AGENTMEMORY_LLM_TIMEOUT_MS, which bounds each
+                                          # individual outbound HTTP call. Raise for
+                                          # very large bulk-imported sessions (100+
+                                          # chunks) that exhaust the default 3-min
+                                          # budget; consider raising
+                                          # SUMMARIZE_CHUNK_CONCURRENCY first if the
+                                          # provider tolerates it. Note: when calling
+                                          # POST /agentmemory/summarize with a value
+                                          # above iii-http.default_timeout (180000 in
+                                          # iii-config.yaml), the HTTP layer may close
+                                          # first; bump the yaml or use the event-
+                                          # driven path (session.stopped pipeline).
+
 # Search tuning
 # BM25_WEIGHT=0.4
 # VECTOR_WEIGHT=0.6

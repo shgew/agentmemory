@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`AGENTMEMORY_SUMMARIZE_TIMEOUT_MS` env var** - configurable wall-clock cap for the `mem::summarize` orchestration (default 180 000 ms, matching the previously-hardcoded ceiling). Passed as `sdk.trigger`'s `timeoutMs` at the `event::session::stopped` consolidation site ([`src/triggers/events.ts`](src/triggers/events.ts)) and the `POST /agentmemory/summarize` REST handler ([`src/triggers/api.ts`](src/triggers/api.ts)). Distinct from `AGENTMEMORY_LLM_TIMEOUT_MS`, which bounds individual outbound LLM/embedding fetches. Resolves the recurring `Invocation timeout after 180000ms: mem::summarize` failure on bulk-imported sessions that produce 100+ summarise chunks.
+
 ## [0.9.27] — 2026-06-07
 
 Wave release closing several breaking regressions reported against v0.9.26, plus an agent-scope isolation security fix, an iii version-pin audit fix, and a benchmark scorecard correction. No breaking changes; drop-in upgrade.

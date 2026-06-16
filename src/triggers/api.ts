@@ -23,6 +23,7 @@ import {
   getAgentId,
   isAgentScopeIsolated,
 } from "../config.js";
+import { getSummarizeTimeoutMs } from "../functions/summarize.js";
 
 type Response = {
   status_code: number;
@@ -700,6 +701,7 @@ export function registerApiTriggers(
       const result = await sdk.trigger({
         function_id: "mem::summarize",
         payload: { sessionId },
+        timeoutMs: getSummarizeTimeoutMs(),
       });
       return { status_code: 200, body: result };
     },
