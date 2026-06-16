@@ -40,6 +40,8 @@ type MessageInfoPayload = {
 };
 type ToolTimePayload = { start?: number; end?: number };
 type TodoPayload = { content?: string; priority?: string; status?: string };
+type QuestionPayload = { question?: unknown; header?: unknown };
+type QuestionToolPayload = { callID?: string; messageID?: string };
 
 const API = env.AGENTMEMORY_URL || "http://localhost:3111";
 const FILE_TOOLS = new Set(["Read", "Write", "Edit", "Glob", "Grep"]);
@@ -141,6 +143,58 @@ function safeSlice(v: unknown, max: number): string {
   if (typeof v === "string") return v.slice(0, max);
   if (v == null) return "";
   try { return JSON.stringify(v).slice(0, max); } catch { return ""; }
+}
+
+function safeStringOrNull(v: unknown, max: number): string | null {
+  if (v == null) return null;
+  return safeSlice(v, max);
+}
+
+function stringArrayCappedByJson(values: string[], max: number): string[] {
+  const json = safeSlice(values, max);
+  try {
+    const parsed = JSON.parse(json);
+    if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) {
+      return parsed;
+    }
+  } catch {}
+  const capped: string[] = [];
+  for (const value of values) {
+    const next = [...capped, value];
+    if (safeSlice(next, max).length !== JSON.stringify(next).length) break;
+    capped.push(value);
+  }
+  return capped;
+}
+
+function questionAskedData(
+  id: string,
+  questions: readonly QuestionPayload[],
+  tool?: QuestionToolPayload,
+): Record<string, unknown> {
+  const first = questions[0];
+  return {
+    question_id: id,
+    questions: questions.length,
+    header: safeStringOrNull(first?.header, 2000),
+    prompt: safeStringOrNull(first?.question, 2000),
+    tool_call_id: tool?.callID ?? null,
+    tool_message_id: tool?.messageID ?? null,
+  };
+}
+
+function questionRepliedData(requestID: string, answers: readonly (readonly string[])[]): Record<string, unknown> {
+  const flattened: string[] = [];
+  for (const answer of answers) {
+    for (const value of answer) {
+      flattened.push(safeSlice(value, 2000));
+    }
+  }
+  return {
+    request_id: requestID,
+    answer_count: answers.length,
+    answers: stringArrayCappedByJson(flattened, 4000),
+  };
 }
 
 function sanitizeOutput(v: unknown): unknown {
@@ -722,6 +776,77 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
           });
         }
       }
+
+      if (event.type === "lsp.client.diagnostics") {
+        const sid = activeSessionId;
+        if (!sid) return;
+        await observe(sid, "lsp_diagnostics", {
+          serverID: event.properties.serverID,
+          path: event.properties.path,
+        });
+      }
+
+      if (event.type === "question.asked") {
+        const sid = event.properties.sessionID ?? activeSessionId;
+        if (!sid) return;
+        await observe(sid, "question_asked", questionAskedData(
+          event.properties.id,
+          event.properties.questions,
+          event.properties.tool,
+        ));
+      }
+
+      if (event.type === "question.replied") {
+        const sid = event.properties.sessionID ?? activeSessionId;
+        if (!sid) return;
+        await observe(sid, "question_replied", questionRepliedData(
+          event.properties.requestID,
+          event.properties.answers,
+        ));
+      }
+
+      if (event.type === "question.rejected") {
+        const sid = event.properties.sessionID ?? activeSessionId;
+        if (!sid) return;
+        await observe(sid, "question_rejected", {
+          request_id: event.properties.requestID,
+        });
+      }
+
+      if (event.type === "question.v2.asked") {
+        const sid = event.properties.sessionID ?? activeSessionId;
+        if (!sid) return;
+        await observe(sid, "question_v2_asked", questionAskedData(
+          event.properties.id,
+          event.properties.questions,
+          event.properties.tool,
+        ));
+      }
+
+      if (event.type === "question.v2.replied") {
+        const sid = event.properties.sessionID ?? activeSessionId;
+        if (!sid) return;
+        await observe(sid, "question_v2_replied", questionRepliedData(
+          event.properties.requestID,
+          event.properties.answers,
+        ));
+      }
+
+      if (event.type === "question.v2.rejected") {
+        const sid = event.properties.sessionID ?? activeSessionId;
+        if (!sid) return;
+        await observe(sid, "question_v2_rejected", {
+          request_id: event.properties.requestID,
+        });
+      }
+
+      if (event.type === "mcp.tools.changed") {
+        const sid = activeSessionId;
+        if (!sid) return;
+        await observe(sid, "mcp_tools_changed", {
+          server: event.properties.server,
+        });
+      }
     },
 
     // ── chat.message ──
@@ -885,6 +1010,18 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
           output.context.push(ctx);
         }
       }
+    },
+
+    "experimental.compaction.autocontinue": async (input, output) => {
+      const enabled = output.enabled;
+      const sid = input.sessionID || activeSessionId;
+      if (!sid) return;
+      await observe(sid, "compaction_autocontinue", {
+        agent: input.agent,
+        model_id: `${input.model.providerID}/${input.model.id}`,
+        overflow: input.overflow,
+        enabled,
+      });
     },
 
     // ── command.execute.before ──

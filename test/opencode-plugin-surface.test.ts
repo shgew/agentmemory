@@ -29,6 +29,14 @@ const EVENT_BRANCHES = [
   "todo.updated",
   "vcs.branch.updated",
   "command.executed",
+  "lsp.client.diagnostics",
+  "question.asked",
+  "question.replied",
+  "question.rejected",
+  "question.v2.asked",
+  "question.v2.replied",
+  "question.v2.rejected",
+  "mcp.tools.changed",
 ] as const;
 
 const TYPED_HOOKS = [
@@ -39,6 +47,7 @@ const TYPED_HOOKS = [
   "experimental.chat.system.transform",
   "experimental.chat.messages.transform",
   "experimental.session.compacting",
+  "experimental.compaction.autocontinue",
   "command.execute.before",
   "config",
 ] as const;
