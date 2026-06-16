@@ -40,7 +40,8 @@ type MessageInfoPayload = {
 };
 type ToolTimePayload = { start?: number; end?: number };
 type TodoPayload = { content?: string; priority?: string; status?: string };
-type QuestionPayload = { question?: unknown; header?: unknown };
+type QuestionOptionPayload = { label?: unknown; description?: unknown };
+type QuestionPayload = { question?: unknown; header?: unknown; options?: readonly QuestionOptionPayload[] };
 type QuestionToolPayload = { callID?: string; messageID?: string };
 
 const API = env.AGENTMEMORY_URL || "http://localhost:3111";
@@ -173,11 +174,18 @@ function questionAskedData(
   tool?: QuestionToolPayload,
 ): Record<string, unknown> {
   const first = questions[0];
+  const firstOptions: readonly QuestionOptionPayload[] = Array.isArray(first?.options) ? first.options : [];
+  const optionsCapped = firstOptions.slice(0, 8).map((opt) => ({
+    label: safeStringOrNull(opt?.label, 200),
+    description: safeStringOrNull(opt?.description, 500),
+  }));
   return {
     question_id: id,
     questions: questions.length,
     header: safeStringOrNull(first?.header, 2000),
     prompt: safeStringOrNull(first?.question, 2000),
+    options_count: firstOptions.length,
+    options: optionsCapped,
     tool_call_id: tool?.callID ?? null,
     tool_message_id: tool?.messageID ?? null,
   };

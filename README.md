@@ -172,7 +172,7 @@ agentmemory works with any agent that supports hooks, MCP, or REST API. All agen
 <td align="center" width="12.5%">
 <a href="https://github.com/opencode-ai/opencode"><picture><source media="(prefers-color-scheme: dark)" srcset="https://svgl.app/library/opencode-dark.svg"><img src="https://svgl.app/library/opencode.svg" alt="OpenCode" width="48" height="48" /></picture></a><br/>
 <strong>OpenCode</strong><br/>
-<sub>43 hooks + MCP + plugin</sub>
+<sub>43 capture paths + MCP + plugin</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/cline/cline"><img src="https://github.com/cline.png?size=120" alt="Cline" width="48" height="48" /></a><br/>
@@ -669,7 +669,7 @@ The agentmemory entry is the **same MCP server block** across every host that us
 | **Codex CLI (MCP only)** | `.codex/config.toml` | TOML shape: `codex mcp add agentmemory -- npx -y @agentmemory/mcp`, or add `[mcp_servers.agentmemory]` manually. |
 | **Codex CLI (full plugin)** | Codex plugin marketplace | `codex plugin marketplace add rohitg00/agentmemory` then `codex plugin add agentmemory@agentmemory`. Registers MCP + 6 lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, Stop) + 16 skills. On Codex Desktop, also run `agentmemory connect codex --with-hooks` until [openai/codex#16430](https://github.com/openai/codex/issues/16430) lands — plugin hooks are currently silent there. |
 | **OpenCode (MCP only)** | `opencode.json` | Different shape — top-level `mcp` key, command as array: `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`. |
-| **OpenCode (full plugin)** | `plugin/opencode/` | 43 auto-capture hooks: session lifecycle, messages and parts (including `message.part.removed`), tool execution (`tool.execute.before` + `tool.execute.after`), file edits + watcher, permissions (including `permission.asked` and `permission.v2.*`), todos, commands (including `command.execute.before`), git branch switches (`vcs.branch.updated`), LSP diagnostics (`lsp.client.diagnostics`), interactive questions (`question.asked` / `question.replied` / `question.rejected` v1 + v2 buses), MCP tool registry changes (`mcp.tools.changed`), PTY lifecycle (`pty.created` + `pty.exited`), compaction auto-continue (`experimental.compaction.autocontinue`, observe-only), server-side `/session/checkpoint` debounce (default 10 min, `AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS`), plugin-reload `dispose`, base64/image sanitization, and resumed-session re-injection. Plugin source is type-narrowed against `EventV1 | EventV2` with zero blanket as-any casts. 16 skills land at `~/.config/opencode/skills/<name>/SKILL.md` - OpenCode's command registry merges them into the slash command palette as `source: "skill"`, so `/recall`, `/remember`, `/health` and the other 6 invocable skills work directly from the palette. One-shot install: `agentmemory connect opencode --with-plugin` (copies plugin file + skill tree and updates `opencode.json`; honors `OPENCODE_CONFIG_DIR`). See [`plugin/opencode/README.md`](plugin/opencode/README.md) for the full hook table. |
+| **OpenCode (full plugin)** | `plugin/opencode/` | 43 auto-capture paths (one `event` dispatcher with 31 narrowed bus-event branches plus 10 typed hooks plus `dispose`): session lifecycle, messages and parts (including `message.part.removed`), tool execution (`tool.execute.before` + `tool.execute.after`), file edits + watcher, permissions (including `permission.asked` and `permission.v2.*`), todos, commands (including `command.execute.before`), git branch switches (`vcs.branch.updated`), LSP diagnostics (`lsp.client.diagnostics`), interactive questions with options summary (`question.asked` / `question.replied` / `question.rejected` v1 + v2 buses), MCP tool registry changes (`mcp.tools.changed`), PTY lifecycle (`pty.created` + `pty.exited`), compaction auto-continue (`experimental.compaction.autocontinue`, observe-only), server-side `/session/checkpoint` debounce (default 10 min, `AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS`), plugin-reload `dispose`, base64/image sanitization, and resumed-session re-injection. Plugin source is type-narrowed against `EventV1 | EventV2` with zero blanket as-any casts. 16 skills land at `~/.config/opencode/skills/<name>/SKILL.md` - OpenCode's command registry merges them into the slash command palette as `source: "skill"`, so `/recall`, `/remember`, `/health` and the other 6 invocable skills work directly from the palette. One-shot install: `agentmemory connect opencode --with-plugin` (copies plugin file + skill tree and updates `opencode.json`; honors `OPENCODE_CONFIG_DIR`). See [`plugin/opencode/README.md`](plugin/opencode/README.md) for the full hook table. |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | Copy [`integrations/pi`](integrations/pi/) and restart pi. |
 | **Hermes Agent** | `~/.hermes/config.yaml` | Use the deeper [memory provider plugin](integrations/hermes/) with `memory.provider: agentmemory`. |
 | **Qwen Code** | `~/.qwen/settings.json` | `agentmemory connect qwen` writes the standard `mcpServers` block. Hook payload is field-compatible with Claude Code, so the existing 12-hook scripts work without modification — wire them via the `hooks` section in the same `settings.json`. |
@@ -1496,13 +1496,16 @@ Create `~/.agentmemory/.env`:
                                           # disable (legacy pre-debounce behavior:
                                           # every activity-bearing POST fires a
                                           # full summarize + graph-extract chain).
-                                          # Designed for clients like OpenCode that
-                                          # fire `session.idle` between background
-                                          # agent waves; the throttle keeps a live
-                                          # session from re-summarizing every few
-                                          # seconds while still consolidating
-                                          # eventually via the next eligible POST
-                                          # or the session-sweep cron.
+                                          # Designed for OpenCode-shaped clients where
+                                          # the plugin posts /session/checkpoint on every
+                                          # `session.status` (idle) transition (canonical
+                                          # v2 signal; the deprecated `session.idle` v1
+                                          # event is intentionally not handled). The
+                                          # throttle keeps a live session from
+                                          # re-summarizing every few seconds between
+                                          # background agent waves while still
+                                          # consolidating eventually via the next eligible
+                                          # POST or the session-sweep cron.
 
 # MCP shim (@agentmemory/mcp) proxy call timeouts
 # AGENTMEMORY_MCP_CALL_TIMEOUT_MS=15000   # Default: 15 000 ms (15 s). Caps each

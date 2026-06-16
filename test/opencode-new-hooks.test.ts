@@ -195,8 +195,13 @@ describe("OpenCode plugin behavior: question.asked", () => {
           id: "q-1",
           sessionID: "s_new_q1",
           questions: [
-            { question: "Choose a deployment target", header: "Deploy", options: ["staging", "prod"] },
-            { question: "Confirm", header: "Confirm", options: ["yes"] },
+            { question: "Choose a deployment target", header: "Deploy", options: [
+              { label: "staging", description: "deploy to staging cluster" },
+              { label: "prod", description: "deploy to production cluster" },
+            ] },
+            { question: "Confirm", header: "Confirm", options: [
+              { label: "yes", description: "confirm the action" },
+            ] },
           ],
           tool: { messageID: "msg-q1", callID: "call-q1" },
         },
@@ -210,6 +215,11 @@ describe("OpenCode plugin behavior: question.asked", () => {
     expect(observe!.body.data.prompt).toBe("Choose a deployment target");
     expect(observe!.body.data.tool_call_id).toBe("call-q1");
     expect(observe!.body.data.tool_message_id).toBe("msg-q1");
+    expect(observe!.body.data.options_count).toBe(2);
+    expect(observe!.body.data.options).toEqual([
+      { label: "staging", description: "deploy to staging cluster" },
+      { label: "prod", description: "deploy to production cluster" },
+    ]);
   });
 });
 
@@ -274,7 +284,10 @@ describe("OpenCode plugin behavior: question.v2.asked", () => {
           id: "q-2",
           sessionID: "s_new_q2",
           questions: [
-            { question: "Pick a model", header: "Model", options: ["fast", "smart"] },
+            { question: "Pick a model", header: "Model", options: [
+              { label: "fast", description: "low-latency mode" },
+              { label: "smart", description: "higher-quality mode" },
+            ] },
           ],
           tool: { messageID: "msg-q2", callID: "call-q2" },
         },
@@ -288,6 +301,11 @@ describe("OpenCode plugin behavior: question.v2.asked", () => {
     expect(observe!.body.data.prompt).toBe("Pick a model");
     expect(observe!.body.data.tool_call_id).toBe("call-q2");
     expect(observe!.body.data.tool_message_id).toBe("msg-q2");
+    expect(observe!.body.data.options_count).toBe(2);
+    expect(observe!.body.data.options).toEqual([
+      { label: "fast", description: "low-latency mode" },
+      { label: "smart", description: "higher-quality mode" },
+    ]);
   });
 });
 
@@ -487,5 +505,93 @@ describe("OpenCode plugin behavior: pty.exited", () => {
       } as any,
     });
     expect(findObserve(calls, "pty_exited")).toBeUndefined();
+  });
+});
+
+describe("OpenCode plugin behavior: file stash invariants", () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
+
+  const transformInput = (sid: string) => ({ sessionID: sid, model: {} as any });
+
+  it("stashes file.edited paths and surfaces them on the next experimental.chat.system.transform via /enrich", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await createActiveSession(plugin, calls, "s_stash_edited");
+    await plugin.event!({
+      event: { type: "file.edited", properties: { sessionID: "s_stash_edited", file: "src/auth/jwt.ts" } } as any,
+    });
+    await plugin.event!({
+      event: { type: "file.edited", properties: { sessionID: "s_stash_edited", file: "src/auth/refresh.ts" } } as any,
+    });
+    const transformOutput = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!(transformInput("s_stash_edited"), transformOutput);
+    const enrichCalls = calls.filter((c) => c.url.endsWith("/agentmemory/enrich"));
+    expect(enrichCalls.length).toBe(1);
+    expect(enrichCalls[0].body.files).toEqual(
+      expect.arrayContaining(["src/auth/jwt.ts", "src/auth/refresh.ts"]),
+    );
+    expect(enrichCalls[0].body.sessionId).toBe("s_stash_edited");
+  });
+
+  it("stashes message.part.updated (file) attachments alongside file.edited entries", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await createActiveSession(plugin, calls, "s_stash_part");
+    await plugin.event!({
+      event: { type: "file.edited", properties: { sessionID: "s_stash_part", file: "docs/spec.md" } } as any,
+    });
+    await plugin.event!({
+      event: {
+        type: "message.part.updated",
+        properties: {
+          part: {
+            sessionID: "s_stash_part",
+            id: "part-file-1",
+            type: "file",
+            filename: "assets/diagram.png",
+          },
+        },
+      } as any,
+    });
+    const transformOutput = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!(transformInput("s_stash_part"), transformOutput);
+    const enrichCalls = calls.filter((c) => c.url.endsWith("/agentmemory/enrich"));
+    expect(enrichCalls.length).toBe(1);
+    expect(enrichCalls[0].body.files).toEqual(
+      expect.arrayContaining(["docs/spec.md", "assets/diagram.png"]),
+    );
+  });
+
+  it("clears the stash after a successful /enrich so the next transform skips /enrich", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await createActiveSession(plugin, calls, "s_stash_clear");
+    await plugin.event!({
+      event: { type: "file.edited", properties: { sessionID: "s_stash_clear", file: "only.ts" } } as any,
+    });
+    const output1 = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!(transformInput("s_stash_clear"), output1);
+    expect(calls.filter((c) => c.url.endsWith("/agentmemory/enrich")).length).toBe(1);
+    calls.length = 0;
+    const output2 = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!(transformInput("s_stash_clear"), output2);
+    expect(calls.filter((c) => c.url.endsWith("/agentmemory/enrich")).length).toBe(0);
+  });
+
+  it("trims the stash to MAX_STASHED_FILES (20) when the cap is exceeded", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await createActiveSession(plugin, calls, "s_stash_cap");
+    for (let i = 0; i < 25; i++) {
+      await plugin.event!({
+        event: { type: "file.edited", properties: { sessionID: "s_stash_cap", file: `f-${i}.ts` } } as any,
+      });
+    }
+    const transformOutput = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!(transformInput("s_stash_cap"), transformOutput);
+    const enrichCall = calls.find((c) => c.url.endsWith("/agentmemory/enrich"));
+    expect(enrichCall).toBeDefined();
+    expect(enrichCall!.body.files.length).toBe(10);
+    expect(enrichCall!.body.files).not.toContain("f-0.ts");
+    expect(enrichCall!.body.files).not.toContain("f-4.ts");
+    expect(enrichCall!.body.files).toContain("f-5.ts");
+    expect(enrichCall!.body.files).toContain("f-14.ts");
   });
 });
