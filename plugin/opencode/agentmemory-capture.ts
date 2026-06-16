@@ -225,7 +225,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
 
   return {
     event: async ({ event }) => {
-      const type = event.type;
+      const type: string = event.type;
       const props = (event as any).properties || {};
 
       // ── session.created ──
