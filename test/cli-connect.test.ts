@@ -221,13 +221,16 @@ describe("agentmemory connect — opencode adapter (#872)", () => {
   let tmpHome: string;
   let originalHome: string | undefined;
   let originalUserprofile: string | undefined;
+  let originalOpencodeConfigDir: string | undefined;
 
   beforeEach(() => {
     tmpHome = mkdtempSync(join(tmpdir(), "am-opencode-"));
     originalHome = process.env["HOME"];
     originalUserprofile = process.env["USERPROFILE"];
+    originalOpencodeConfigDir = process.env["OPENCODE_CONFIG_DIR"];
     process.env["HOME"] = tmpHome;
     process.env["USERPROFILE"] = tmpHome;
+    delete process.env["OPENCODE_CONFIG_DIR"];
     vi.resetModules();
   });
 
@@ -237,6 +240,8 @@ describe("agentmemory connect — opencode adapter (#872)", () => {
     if (originalUserprofile !== undefined)
       process.env["USERPROFILE"] = originalUserprofile;
     else delete process.env["USERPROFILE"];
+    if (originalOpencodeConfigDir !== undefined)
+      process.env["OPENCODE_CONFIG_DIR"] = originalOpencodeConfigDir;
     rmSync(tmpHome, { recursive: true, force: true });
     vi.resetModules();
   });

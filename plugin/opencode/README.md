@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/MCP-53_tools-1f6feb?style=flat-square" alt="53 MCP tools" />
-  <img src="https://img.shields.io/badge/Plugin-28_hooks-1f6feb?style=flat-square" alt="28 hooks" />
+  <img src="https://img.shields.io/badge/Plugin-33_hooks-1f6feb?style=flat-square" alt="33 hooks" />
   <img src="https://img.shields.io/badge/Commands-2_slash-1f6feb?style=flat-square" alt="2 slash commands" />
   <img src="https://img.shields.io/badge/R@5-95.2%25-00875f?style=flat-square" alt="95.2% R@5" />
 </p>
@@ -62,7 +62,7 @@ cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
 cp plugin/opencode/commands/*.md ~/.config/opencode/commands/
 ```
 
-Restart OpenCode or open a new session. The plugin auto-captures everything.
+Restart OpenCode or open a new session. The plugin auto-captures session lifecycle, messages, tool execution, file edits, permissions, todos, and config events.
 
 ## What gets captured
 
@@ -71,10 +71,10 @@ Restart OpenCode or open a new session. The plugin auto-captures everything.
 | Event | Hook | agentmemory API |
 |---|---|---|
 | Session start | `session.created` | POST /session/start |
-| Idle (debounced) | `session.status` (idle) | POST /summarize (per-session, default 60s window) |
+| Idle (debounced) | `session.idle` + `session.status` (idle) | POST /summarize (per-session, default 60s window) |
 | Status transitions | `session.status` (idle/busy/retry) | POST /observe |
 | Compaction (debounced) | `session.compacted` | POST /summarize + POST /observe (same debounce) |
-| Metadata updates | `session.updated` | POST /observe + resume signal clears context-injected flag |
+| Metadata updates / resume | `session.updated` | POST /observe; first sighting of a sid without a prior session.created treats it as a resume - re-fires POST /session/start to repopulate context cache and clear context-injected flag |
 | Code change tracking | `session.diff` | POST /observe |
 | Session delete | `session.deleted` | POST /session/end + /crystals/auto + /consolidate-pipeline |
 | Session error | `session.error` | POST /observe |
@@ -88,6 +88,7 @@ Restart OpenCode or open a new session. The plugin auto-captures everything.
 | Assistant response | `message.updated` (assistant) | POST /observe |
 | Transcript transforms | `experimental.chat.messages.transform` | POST /observe |
 | Message removed (undo) | `message.removed` | POST /observe |
+| Message part removed | `message.part.removed` | POST /observe |
 
 ### Parts and steps
 
@@ -110,6 +111,7 @@ Restart OpenCode or open a new session. The plugin auto-captures everything.
 |---|---|---|
 | File tool params | `tool.execute.before` -> stash paths | - |
 | File edited | `file.edited` -> stash paths | - |
+| External file watcher event | `file.watcher.updated` | POST /observe (add/change/unlink) |
 | File part attached | `message.part.updated` (file) -> stash paths | - |
 | Enrichment inject | `experimental.chat.system.transform` | POST /enrich -> `output.system[]` |
 | Memory context inject | `experimental.chat.system.transform` | POST /context -> `output.system[]` |
@@ -118,9 +120,11 @@ Restart OpenCode or open a new session. The plugin auto-captures everything.
 
 | Event | Hook | agentmemory API |
 |---|---|---|
-| Permission ask (model requests) | `permission.asked` | POST /observe |
+| Permission ask (v1 bus) | `permission.asked` | POST /observe (id, permission, patterns, always, tool.callID, metadata) |
+| Permission ask (v2 bus) | `permission.v2.asked` | POST /observe (id, action, resources, save, metadata) |
 | Permission state changed | `permission.updated` | POST /observe |
-| Permission reply | `permission.replied` | POST /observe |
+| Permission reply (v1) | `permission.replied` | POST /observe |
+| Permission reply (v2) | `permission.v2.replied` | POST /observe (requestID, reply) |
 
 ### Tasks and commands
 

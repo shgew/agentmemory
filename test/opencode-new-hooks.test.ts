@@ -42,10 +42,11 @@ describe("OpenCode plugin: dispose cleanup hook", () => {
     expect(block).toMatch(/lastSummarizeAt\.clear\(\)/);
   });
 
-  it("flushes /session/end for the active session on dispose", () => {
+  it("does NOT post /session/end on dispose (plugin reload, not session end)", () => {
     const start = plugin.indexOf("dispose:");
-    const block = plugin.slice(start, start + 800);
-    expect(block).toMatch(/post\(["']\/session\/end["']/);
+    const end = plugin.indexOf("// \u2500\u2500 config \u2500\u2500", start);
+    const block = plugin.slice(start, end > start ? end : start + 800);
+    expect(block).not.toMatch(/post\(\s*["']\/session\/end["']/);
   });
 });
 

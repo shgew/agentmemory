@@ -266,7 +266,13 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         }
       }
 
-      // ── session.idle ── (summarize handled in session.status idle branch)
+      // ── session.idle ── (distinct v1 bus event; also debounced for safety)
+      if (type === "session.idle") {
+        const sid = props.sessionID || activeSessionId;
+        if (sid && shouldSummarize(sid)) {
+          await post("/summarize", { sessionId: sid });
+        }
+      }
 
       // ── session.status ──
       if (type === "session.status") {
@@ -299,9 +305,23 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         const info = props.info as Record<string, unknown> | undefined;
         const sid = (info?.id as string) || props.sessionID || activeSessionId;
         if (!sid) return;
-        if (!stashedFiles.has(sid)) {
+        const isResumed = !stashedFiles.has(sid);
+        if (isResumed) {
           stashedFiles.set(sid, new Set());
           contextInjectedSessions.delete(sid);
+          if (!activeSessionId) activeSessionId = sid;
+          const resumeResult = await postJson("/session/start", {
+            sessionId: sid,
+            title: info?.title ?? null,
+            parentID: info?.parentID ?? null,
+            project: projectPath,
+            cwd: projectPath,
+            resumed: true,
+          });
+          const resumeCtx = (resumeResult as any)?.context;
+          if (typeof resumeCtx === "string" && resumeCtx.length > 0) {
+            startContextCache.set(sid, resumeCtx);
+          }
         }
         await observe(sid, "session_updated", {
           title: info?.title ?? null,
@@ -404,6 +424,17 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         if (sid) {
           await observe(sid, "message_removed", {
             messageID: props.messageID,
+          });
+        }
+      }
+
+      // ── message.part.removed ──
+      if (type === "message.part.removed") {
+        const sid = props.sessionID || activeSessionId;
+        if (sid) {
+          await observe(sid, "message_part_removed", {
+            messageID: props.messageID,
+            partID: props.partID,
           });
         }
       }
@@ -551,6 +582,17 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         }
       }
 
+      // ── file.watcher.updated ── (external fs change)
+      if (type === "file.watcher.updated") {
+        const sid = activeSessionId;
+        if (sid && typeof props.file === "string" && props.file.length > 0) {
+          await observe(sid, "file_watcher", {
+            file: props.file,
+            event: (props.event as string) || "change",
+          });
+        }
+      }
+
       // ── permission.updated ──
       if (type === "permission.updated") {
         const sid = props.sessionID || activeSessionId;
@@ -567,18 +609,42 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         });
       }
 
-      // ── permission.asked ──
+      // ── permission.asked ── (v2 SDK bus event shape)
       if (type === "permission.asked") {
         const sid = props.sessionID || activeSessionId;
         if (!sid) return;
+        const tool = props.tool as { messageID?: string; callID?: string } | undefined;
         await observe(sid, "permission_asked", {
-          permission_id: props.permissionID || props.id || "",
-          tool_call_id: props.callID || null,
-          title: props.title || "",
-          pattern: Array.isArray(props.pattern)
-            ? props.pattern.join(", ")
-            : (props.pattern || ""),
+          permission_id: props.id || "",
+          permission: props.permission || "",
+          patterns: Array.isArray(props.patterns) ? props.patterns : [],
+          always: Array.isArray(props.always) ? props.always : [],
+          tool_call_id: tool?.callID ?? null,
+          tool_message_id: tool?.messageID ?? null,
           metadata: props.metadata || {},
+        });
+      }
+
+      // ── permission.v2.asked ──
+      if (type === "permission.v2.asked") {
+        const sid = props.sessionID || activeSessionId;
+        if (!sid) return;
+        await observe(sid, "permission_v2_asked", {
+          permission_id: props.id || "",
+          action: props.action || "",
+          resources: Array.isArray(props.resources) ? props.resources : [],
+          save: Array.isArray(props.save) ? props.save : [],
+          metadata: props.metadata || {},
+        });
+      }
+
+      // ── permission.v2.replied ──
+      if (type === "permission.v2.replied") {
+        const sid = props.sessionID || activeSessionId;
+        if (!sid) return;
+        await observe(sid, "permission_v2_replied", {
+          request_id: props.requestID || "",
+          reply: safeSlice(props.reply, 1000),
         });
       }
 
@@ -753,13 +819,14 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
     },
 
     // ── experimental.chat.messages.transform ──
-    "experimental.chat.messages.transform": async (input, output) => {
-      const sid = input.sessionID || activeSessionId;
+    // SDK shape: input is {}, output has messages[]. No sessionID on input;
+    // observe against activeSessionId when present.
+    "experimental.chat.messages.transform": async (_input, output) => {
+      const sid = activeSessionId;
       if (!sid) return;
       const msgs = (output as any)?.messages;
       const msgCount = Array.isArray(msgs) ? msgs.length : 0;
       await observe(sid, "messages_transform", {
-        source: (input as any).source ?? "unknown",
         message_count: msgCount,
       });
     },
@@ -782,21 +849,22 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
     },
 
     // ── command.execute.before ──
-    "command.execute.before": async (input, output) => {
+    // SDK shape: input has {command, sessionID, arguments}, output has {parts}.
+    "command.execute.before": async (input, _output) => {
       const sid = (input as any).sessionID || activeSessionId;
       if (!sid) return;
-      const args = (output as any)?.arguments ?? (input as any).arguments ?? "";
       await observe(sid, "command_before", {
-        name: (input as any).name,
-        arguments: safeSlice(args, 2000),
+        command: (input as any).command,
+        arguments: safeSlice((input as any).arguments, 2000),
       });
     },
 
     // ── dispose ──
+    // Fires on plugin reload, NOT on session end. The OpenCode session
+    // is still alive; resetting in-process state is the entire contract.
+    // Posting /session/end here would mark a live session as completed
+    // and re-trigger the consolidation pipeline incorrectly.
     dispose: async () => {
-      if (activeSessionId) {
-        await post("/session/end", { sessionId: activeSessionId });
-      }
       stashedFiles.clear();
       seenSubtaskIds.clear();
       seenToolCallIds.clear();
