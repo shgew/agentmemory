@@ -141,7 +141,7 @@ Restart OpenCode or open a new session. The plugin auto-captures session lifecyc
 | LLM parameters | `chat.params` | POST /observe |
 | Config loaded | `config` | POST /observe |
 | Compaction (WIP upstream) | `experimental.session.compacting` | POST /context -> `output.context[]` |
-| Plugin shutdown | `dispose` | POST /session/end + clears all session-scoped maps |
+| Plugin reload | `dispose` | clears all session-scoped maps in-process (does NOT post /session/end - the OpenCode session is still alive) |
 
 ### File enrichment + memory injection (two-layer pipeline)
 
@@ -179,7 +179,9 @@ When `OPENCODE_AGENTMEMORY_DEBUG=1` the plugin fires a single `GET /agentmemory/
 
 ### Dispose cleanup
 
-The `dispose` hook fires when OpenCode unloads the plugin. It posts `/session/end` for the active session (so abandoned sessions still trigger consolidation) and clears every module-level map, so a hot reload does not see stale state.
+The `dispose` hook fires when OpenCode unloads the plugin (hot reload, host shutdown). It does NOT post `/session/end` - plugin teardown is not session termination, and the OpenCode session may still be alive in the host. `dispose` only clears every module-level map (`stashedFiles`, `seenSubtaskIds`, `seenToolCallIds`, `contextInjectedSessions`, `startContextCache`, `lastSummarizeAt`) and resets `activeSessionId` so a re-instantiated plugin starts clean.
+
+Abandoned-session consolidation runs only on `session.deleted` (`/session/end` + `/crystals/auto` + `/consolidate-pipeline`). If a session is closed without an explicit delete in the OpenCode UI, the server-side `session-sweep` cron handles late finalization.
 
 ### Configurable timeouts
 
@@ -250,4 +252,4 @@ Agentmemory usage instructions are injected into the system prompt on the first 
 | `SubagentStop` / `task.completed` / `subtask.completed` | OpenCode's `SubtaskPart` type still has no completion / result fields ([packages/core SubtaskPart](https://github.com/anomalyco/opencode/blob/main/packages/core/src/v1/session.ts)). Closest signal is `session.idle`, already covered. |
 | Claude `MEMORY.md` bridge | OpenCode-specific - OpenCode uses its own `AGENTS.md` mechanism, not Claude's `MEMORY.md`. |
 | `shell.env`, `chat.headers`, `tool.definition`, `experimental.text.complete`, `experimental.provider.small_model`, `experimental.compaction.autocontinue` typed hooks | Lower-signal hooks; not wired. Open an issue if a use case appears. |
-| `message.part.removed`, `file.watcher.updated`, `installation.*`, `lsp.*`, `tui.*` bus events | Lower-signal bus events; not wired. Same as above. |
+| `installation.*`, `lsp.*`, `tui.*` bus events | Lower-signal bus events; not wired. Open an issue if a use case appears. |

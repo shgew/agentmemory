@@ -31,15 +31,26 @@ function installFetchMock(): PostCall[] {
   return calls;
 }
 
+let activePlugin: PluginInstance | null = null;
+
 async function loadPlugin(): Promise<{ plugin: PluginInstance; calls: PostCall[] }> {
   const calls = installFetchMock();
   const plugin = await AgentmemoryCapturePlugin(FAKE_CTX);
+  activePlugin = plugin;
   return { plugin, calls };
+}
+
+async function teardownPlugin(): Promise<void> {
+  if (activePlugin?.dispose) {
+    try { await activePlugin.dispose(); } catch { /* tolerate */ }
+  }
+  activePlugin = null;
+  vi.unstubAllGlobals();
 }
 
 describe("OpenCode plugin behavior: command.execute.before payload", () => {
   beforeEach(() => vi.unstubAllGlobals());
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
 
   it("posts /observe with command + arguments from input (not output.arguments)", async () => {
     const { plugin, calls } = await loadPlugin();
@@ -57,7 +68,7 @@ describe("OpenCode plugin behavior: command.execute.before payload", () => {
 
 describe("OpenCode plugin behavior: tool.execute.after payload", () => {
   beforeEach(() => vi.unstubAllGlobals());
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
 
   it("posts /observe with tool name, callID, args, sanitized output", async () => {
     const { plugin, calls } = await loadPlugin();
@@ -98,7 +109,7 @@ describe("OpenCode plugin behavior: tool.execute.after payload", () => {
 
 describe("OpenCode plugin behavior: permission.asked v2 payload", () => {
   beforeEach(() => vi.unstubAllGlobals());
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
 
   it("captures id, permission, patterns, always, tool.callID per v2 shape", async () => {
     const { plugin, calls } = await loadPlugin();
@@ -129,7 +140,7 @@ describe("OpenCode plugin behavior: permission.asked v2 payload", () => {
 
 describe("OpenCode plugin behavior: permission.v2 events", () => {
   beforeEach(() => vi.unstubAllGlobals());
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
 
   it("captures permission.v2.asked with action + resources", async () => {
     const { plugin, calls } = await loadPlugin();
@@ -169,7 +180,7 @@ describe("OpenCode plugin behavior: permission.v2 events", () => {
 
 describe("OpenCode plugin behavior: message.part.removed", () => {
   beforeEach(() => vi.unstubAllGlobals());
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
 
   it("captures sessionID, messageID, partID", async () => {
     const { plugin, calls } = await loadPlugin();
@@ -188,7 +199,7 @@ describe("OpenCode plugin behavior: message.part.removed", () => {
 
 describe("OpenCode plugin behavior: file.watcher.updated", () => {
   beforeEach(() => vi.unstubAllGlobals());
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
 
   it("captures external fs changes when an active session exists", async () => {
     const { plugin, calls } = await loadPlugin();
@@ -211,7 +222,7 @@ describe("OpenCode plugin behavior: file.watcher.updated", () => {
 
 describe("OpenCode plugin behavior: session.idle separate from session.status", () => {
   beforeEach(() => vi.unstubAllGlobals());
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
 
   it("fires /summarize on bare session.idle event (also debounced)", async () => {
     const { plugin, calls } = await loadPlugin();
@@ -233,7 +244,7 @@ describe("OpenCode plugin behavior: session.idle separate from session.status", 
 
 describe("OpenCode plugin behavior: dispose does NOT end session", () => {
   beforeEach(() => vi.unstubAllGlobals());
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
 
   it("dispose clears maps without posting /session/end", async () => {
     const { plugin, calls } = await loadPlugin();
@@ -249,7 +260,7 @@ describe("OpenCode plugin behavior: dispose does NOT end session", () => {
 
 describe("OpenCode plugin behavior: resumed-session re-injection", () => {
   beforeEach(() => vi.unstubAllGlobals());
-  afterEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
 
   it("session.updated for unseen sid posts /session/start with resumed: true", async () => {
     const { plugin, calls } = await loadPlugin();

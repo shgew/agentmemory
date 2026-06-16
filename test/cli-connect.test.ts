@@ -294,6 +294,28 @@ describe("agentmemory connect — opencode adapter (#872)", () => {
     expect(result.kind).toBe("installed");
     expect(readFileSync(cfgPath(), "utf-8")).toBe(before);
   });
+
+  it("honors OPENCODE_CONFIG_DIR when set, writing config under that dir", async () => {
+    const customDir = mkdtempSync(join(tmpdir(), "am-opencode-custom-"));
+    const originalEnv = process.env["OPENCODE_CONFIG_DIR"];
+    process.env["OPENCODE_CONFIG_DIR"] = customDir;
+    try {
+      const a = await loadOpencode();
+      expect(a.detect()).toBe(true);
+      const result = await a.install({ dryRun: false, force: false });
+      expect(result.kind).toBe("installed");
+      const customCfg = join(customDir, "opencode.json");
+      expect(existsSync(customCfg)).toBe(true);
+      const parsed = JSON.parse(readFileSync(customCfg, "utf-8"));
+      expect(parsed.mcp.agentmemory.command).toContain("@agentmemory/mcp");
+      const defaultCfg = cfgPath();
+      expect(existsSync(defaultCfg)).toBe(false);
+    } finally {
+      if (originalEnv !== undefined) process.env["OPENCODE_CONFIG_DIR"] = originalEnv;
+      else delete process.env["OPENCODE_CONFIG_DIR"];
+      rmSync(customDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("agentmemory connect — copilot-cli adapter (mock filesystem)", () => {
