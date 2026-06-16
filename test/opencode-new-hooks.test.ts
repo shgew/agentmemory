@@ -408,3 +408,84 @@ describe("OpenCode plugin behavior: experimental.compaction.autocontinue", () =>
     expect(observe!.body.data.overflow).toBe(false);
   });
 });
+
+describe("OpenCode plugin behavior: pty.created", () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
+
+  it("captures pty info when an active session exists", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await createActiveSession(plugin, calls, "s_new_pty_created");
+    await plugin.event!({
+      event: {
+        type: "pty.created",
+        properties: {
+          info: {
+            id: "pty-1",
+            title: "build watch",
+            command: "npm",
+            args: ["run", "dev"],
+            cwd: "/repo",
+            status: "running",
+            pid: 4242,
+          },
+        },
+      } as any,
+    });
+    const observe = findObserve(calls, "pty_created");
+    expect(observe).toBeDefined();
+    expect(observe!.body.sessionId).toBe("s_new_pty_created");
+    expect(observe!.body.data.pty_id).toBe("pty-1");
+    expect(observe!.body.data.title).toBe("build watch");
+    expect(observe!.body.data.command).toBe("npm");
+    expect(observe!.body.data.args).toEqual(["run", "dev"]);
+    expect(observe!.body.data.cwd).toBe("/repo");
+    expect(observe!.body.data.status).toBe("running");
+    expect(observe!.body.data.pid).toBe(4242);
+  });
+
+  it("does not observe without an active session", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await plugin.event!({
+      event: {
+        type: "pty.created",
+        properties: {
+          info: { id: "pty-x", title: "x", command: "sh", args: [], cwd: "/", status: "running", pid: 1 },
+        },
+      } as any,
+    });
+    expect(findObserve(calls, "pty_created")).toBeUndefined();
+  });
+});
+
+describe("OpenCode plugin behavior: pty.exited", () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
+
+  it("captures pty id and exit code when an active session exists", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await createActiveSession(plugin, calls, "s_new_pty_exited");
+    await plugin.event!({
+      event: {
+        type: "pty.exited",
+        properties: { id: "pty-1", exitCode: 137 },
+      } as any,
+    });
+    const observe = findObserve(calls, "pty_exited");
+    expect(observe).toBeDefined();
+    expect(observe!.body.sessionId).toBe("s_new_pty_exited");
+    expect(observe!.body.data.pty_id).toBe("pty-1");
+    expect(observe!.body.data.exit_code).toBe(137);
+  });
+
+  it("does not observe without an active session", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await plugin.event!({
+      event: {
+        type: "pty.exited",
+        properties: { id: "pty-x", exitCode: 0 },
+      } as any,
+    });
+    expect(findObserve(calls, "pty_exited")).toBeUndefined();
+  });
+});

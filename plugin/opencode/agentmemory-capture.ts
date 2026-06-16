@@ -847,6 +847,30 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
           server: event.properties.server,
         });
       }
+
+      if (event.type === "pty.created") {
+        const sid = activeSessionId;
+        if (!sid) return;
+        const info = event.properties.info;
+        await observe(sid, "pty_created", {
+          pty_id: info.id,
+          title: info.title,
+          command: info.command,
+          args: info.args,
+          cwd: info.cwd,
+          status: info.status,
+          pid: info.pid,
+        });
+      }
+
+      if (event.type === "pty.exited") {
+        const sid = activeSessionId;
+        if (!sid) return;
+        await observe(sid, "pty_exited", {
+          pty_id: event.properties.id,
+          exit_code: event.properties.exitCode,
+        });
+      }
     },
 
     // ── chat.message ──

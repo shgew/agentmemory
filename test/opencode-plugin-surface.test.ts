@@ -37,6 +37,8 @@ const EVENT_BRANCHES = [
   "question.v2.replied",
   "question.v2.rejected",
   "mcp.tools.changed",
+  "pty.created",
+  "pty.exited",
 ] as const;
 
 const TYPED_HOOKS = [
