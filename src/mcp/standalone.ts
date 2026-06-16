@@ -23,6 +23,32 @@ const IMPLEMENTED_TOOLS = new Set([
   "memory_governance_delete",
 ]);
 
+// MCP tools whose server-side handler can run for minutes, far past the 15s
+// default proxy timeout that otherwise aborts them every time. Two classes:
+// LLM-backed synthesis (provider.summarize / provider.compress, directly or via
+// the session.stopped pipeline that awaits mem::summarize + mem::graph-extract),
+// and peer network fan-out (mesh sync, 30s per peer per direction). These get
+// the longer AGENTMEMORY_MCP_EXTENDED_TIMEOUT_MS budget instead.
+const EXTENDED_TIMEOUT_TOOLS = new Set([
+  "memory_consolidate",
+  "memory_reflect",
+  "memory_crystallize",
+  "memory_compress_file",
+  "memory_session_sweep",
+  "memory_mesh_sync",
+]);
+
+const DEFAULT_EXTENDED_CALL_TIMEOUT_MS = 300_000;
+
+function extendedCallTimeoutMs(): number {
+  const raw = process.env["AGENTMEMORY_MCP_EXTENDED_TIMEOUT_MS"];
+  if (!raw) return DEFAULT_EXTENDED_CALL_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0
+    ? Math.floor(n)
+    : DEFAULT_EXTENDED_CALL_TIMEOUT_MS;
+}
+
 const SERVER_INFO = {
   name: "agentmemory",
   version: VERSION,
@@ -342,10 +368,13 @@ async function handleProxyGeneric(
   // reach all 53 tools (lessons, sentinels, slots, signals, graph, …)
   // instead of being capped at the 7 IMPLEMENTED_TOOLS set baked into
   // this shim. The server validates arguments per tool.
+  const timeoutMs = EXTENDED_TIMEOUT_TOOLS.has(toolName)
+    ? extendedCallTimeoutMs()
+    : undefined;
   const result = (await handle.call("/agentmemory/mcp/call", {
     method: "POST",
     body: JSON.stringify({ name: toolName, arguments: args }),
-  })) as { content?: Array<{ type: string; text: string }> } | null;
+  }, timeoutMs)) as { content?: Array<{ type: string; text: string }> } | null;
   if (result && Array.isArray(result.content)) {
     return { content: result.content };
   }

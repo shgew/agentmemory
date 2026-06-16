@@ -1,5 +1,8 @@
 const DEFAULT_URL = "http://localhost:3111";
 const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 2_000;
+// Default per-call proxy timeout, overridable via AGENTMEMORY_MCP_CALL_TIMEOUT_MS.
+// LLM-heavy tools (consolidate/reflect/crystallize/compress-file) pass a longer
+// explicit timeout to call(...) because their server-side budget is minutes.
 const CALL_TIMEOUT_MS = 15_000;
 const LOCAL_MODE_TTL_MS = 30_000;
 
@@ -10,6 +13,13 @@ function probeTimeoutMs(): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_HEALTH_PROBE_TIMEOUT_MS;
 }
 
+function callTimeoutMs(): number {
+  const raw = process.env["AGENTMEMORY_MCP_CALL_TIMEOUT_MS"];
+  if (!raw) return CALL_TIMEOUT_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : CALL_TIMEOUT_MS;
+}
+
 function forceProxy(): boolean {
   const raw = process.env["AGENTMEMORY_FORCE_PROXY"];
   return raw === "1" || raw === "true";
@@ -18,7 +28,7 @@ function forceProxy(): boolean {
 export interface ProxyHandle {
   mode: "proxy";
   baseUrl: string;
-  call: (path: string, init?: RequestInit) => Promise<unknown>;
+  call: (path: string, init?: RequestInit, timeoutMs?: number) => Promise<unknown>;
 }
 
 export interface LocalHandle {
@@ -136,7 +146,7 @@ export async function resolveHandle(): Promise<Handle> {
       const handle: ProxyHandle = {
         mode: "proxy",
         baseUrl: url,
-        call: async (path, init) => {
+        call: async (path, init, timeoutMs) => {
           const res = await fetch(`${url}${path}`, {
             ...init,
             headers: {
@@ -144,7 +154,7 @@ export async function resolveHandle(): Promise<Handle> {
               ...authHeader(),
               ...(init?.headers as Record<string, string> | undefined),
             },
-            signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
+            signal: AbortSignal.timeout(timeoutMs ?? callTimeoutMs()),
           });
           if (!res.ok) {
             throw new Error(

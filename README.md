@@ -1476,6 +1476,29 @@ Create `~/.agentmemory/.env`:
                                           # first; bump the yaml or use the event-
                                           # driven path (session.stopped pipeline).
 
+# MCP shim (@agentmemory/mcp) proxy call timeouts
+# AGENTMEMORY_MCP_CALL_TIMEOUT_MS=15000   # Default: 15 000 ms (15 s). Caps each
+                                          # HTTP call the standalone MCP shim
+                                          # proxies for non-LLM tools (search,
+                                          # save, sessions, lessons, …). Raise on
+                                          # slow / remote deployments; lower to
+                                          # fail-fast.
+# AGENTMEMORY_MCP_EXTENDED_TIMEOUT_MS=300000  # Default: 300 000 ms (5 min). Caps
+                                          # the proxied call for tools whose
+                                          # server-side handler runs for minutes:
+                                          # LLM synthesis (memory_consolidate,
+                                          # memory_reflect, memory_crystallize,
+                                          # memory_compress_file), the session
+                                          # sweep pipeline (memory_session_sweep
+                                          # awaits summarize + graph-extract), and
+                                          # peer fan-out (memory_mesh_sync). The
+                                          # old hard-coded 15 s aborted these with
+                                          # "operation was aborted due to timeout".
+                                          # Note: the server's own iii-http
+                                          # default_timeout (180 000 ms) may close
+                                          # the connection first; raise it too for
+                                          # budgets above ~180 s.
+
 # Search tuning
 # BM25_WEIGHT=0.4
 # VECTOR_WEIGHT=0.6

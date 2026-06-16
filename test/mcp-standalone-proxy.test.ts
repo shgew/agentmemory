@@ -384,3 +384,100 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     }
   });
 });
+
+describe("@agentmemory/mcp standalone — per-tool proxy call timeouts (LLM-heavy tools)", () => {
+  const originalFetch = globalThis.fetch;
+  let timeoutSpy: ReturnType<typeof vi.spyOn>;
+
+  function installGenericFetch(): void {
+    installFetch((url) => {
+      if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
+      if (url.endsWith("/agentmemory/mcp/call")) {
+        return new Response(
+          JSON.stringify({ content: [{ type: "text", text: "{}" }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (url.includes("/agentmemory/sessions")) {
+        return new Response(JSON.stringify({ sessions: [] }), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    });
+  }
+
+  beforeEach(() => {
+    resetHandleForTests();
+    process.env["AGENTMEMORY_URL"] = BASE;
+    // Skip the livez probe so the ONLY AbortSignal.timeout call is the tool
+    // call itself — keeps the spy assertions unambiguous.
+    process.env["AGENTMEMORY_FORCE_PROXY"] = "1";
+    delete process.env["AGENTMEMORY_SECRET"];
+    delete process.env["AGENTMEMORY_MCP_CALL_TIMEOUT_MS"];
+    delete process.env["AGENTMEMORY_MCP_EXTENDED_TIMEOUT_MS"];
+    timeoutSpy = vi.spyOn(AbortSignal, "timeout");
+  });
+
+  afterEach(() => {
+    resetHandleForTests();
+    globalThis.fetch = originalFetch;
+    timeoutSpy.mockRestore();
+    delete process.env["AGENTMEMORY_URL"];
+    delete process.env["AGENTMEMORY_FORCE_PROXY"];
+    delete process.env["AGENTMEMORY_MCP_CALL_TIMEOUT_MS"];
+    delete process.env["AGENTMEMORY_MCP_EXTENDED_TIMEOUT_MS"];
+  });
+
+  it.each([
+    "memory_consolidate",
+    "memory_reflect",
+    "memory_crystallize",
+    "memory_compress_file",
+    "memory_session_sweep",
+    "memory_mesh_sync",
+  ])(
+    "%s routes through the generic proxy with the 300000ms extended timeout, not 15000ms",
+    async (tool) => {
+      installGenericFetch();
+      await handleToolCall(tool, {});
+      expect(timeoutSpy).toHaveBeenCalledWith(300_000);
+      expect(timeoutSpy).not.toHaveBeenCalledWith(15_000);
+    },
+  );
+
+  it("non-LLM generic tools (memory_lesson_save) keep the 15000ms default call timeout", async () => {
+    installGenericFetch();
+    await handleToolCall("memory_lesson_save", { content: "x" });
+    expect(timeoutSpy).toHaveBeenCalledWith(15_000);
+    expect(timeoutSpy).not.toHaveBeenCalledWith(300_000);
+  });
+
+  it("fast-path tools (memory_sessions) keep the 15000ms default call timeout", async () => {
+    installGenericFetch();
+    await handleToolCall("memory_sessions", { limit: 5 });
+    expect(timeoutSpy).toHaveBeenCalledWith(15_000);
+  });
+
+  it("AGENTMEMORY_MCP_EXTENDED_TIMEOUT_MS overrides the extended-timeout tool budget", async () => {
+    process.env["AGENTMEMORY_MCP_EXTENDED_TIMEOUT_MS"] = "240000";
+    installGenericFetch();
+    await handleToolCall("memory_reflect", {});
+    expect(timeoutSpy).toHaveBeenCalledWith(240_000);
+  });
+
+  it("AGENTMEMORY_MCP_CALL_TIMEOUT_MS overrides the default call timeout for non-LLM tools", async () => {
+    process.env["AGENTMEMORY_MCP_CALL_TIMEOUT_MS"] = "9000";
+    installGenericFetch();
+    await handleToolCall("memory_lesson_save", { content: "x" });
+    expect(timeoutSpy).toHaveBeenCalledWith(9_000);
+  });
+
+  it("AGENTMEMORY_MCP_CALL_TIMEOUT_MS does NOT shrink the extended-timeout budget below its own default", async () => {
+    // A user lowering the general call timeout must not accidentally starve
+    // the extended-timeout tools — they have their own independent knob.
+    process.env["AGENTMEMORY_MCP_CALL_TIMEOUT_MS"] = "9000";
+    installGenericFetch();
+    await handleToolCall("memory_consolidate", { tier: "semantic" });
+    expect(timeoutSpy).toHaveBeenCalledWith(300_000);
+    expect(timeoutSpy).not.toHaveBeenCalledWith(9_000);
+  });
+});
