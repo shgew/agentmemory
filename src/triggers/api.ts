@@ -252,7 +252,7 @@ export function registerApiTriggers(
   });
 
   sdk.registerFunction("api::health", 
-    async (req: ApiRequest): Promise<Response> => {
+    async (): Promise<Response> => {
       const health = await getLatestHealth(kv);
       const functionMetrics = metricsStore ? await metricsStore.getAll() : [];
       const circuitBreaker =
@@ -288,7 +288,7 @@ export function registerApiTriggers(
 
   sdk.registerFunction("api::observe",
     async (req: ApiRequest<HookPayload>): Promise<Response> => {
-      const body = (req.body ?? {}) as Record<string, unknown>;
+      const body = (req.body ?? {}) as unknown as Record<string, unknown>;
       const hookType = asNonEmptyString(body.hookType);
       const sessionId = asNonEmptyString(body.sessionId);
       const project = asNonEmptyString(body.project);
@@ -649,6 +649,32 @@ export function registerApiTriggers(
       http_method: "POST",
       middleware_function_ids: ["middleware::api-auth"],
     },
+  });
+
+  sdk.registerFunction("api::session::checkpoint", async (req: ApiRequest) => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = req.body as Record<string, unknown>;
+    const sessionId = body?.sessionId;
+    if (typeof sessionId !== "string" || sessionId.length === 0) {
+      return { status_code: 400, body: { error: "sessionId is required" } };
+    }
+    const result = await sdk.trigger({
+      function_id: "mem::session::checkpoint",
+      payload: { sessionId },
+    });
+    const r = result as { success?: boolean; error?: string } | undefined;
+    if (r?.success === false) {
+      if (r.error === "session_not_found") return { status_code: 404, body: r };
+      if (r.error === "session_not_active") return { status_code: 409, body: r };
+      return { status_code: 500, body: r };
+    }
+    return { status_code: 200, body: result ?? { success: true } };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::session::checkpoint",
+    config: { api_path: "/agentmemory/session/checkpoint", http_method: "POST" },
   });
 
   sdk.registerFunction("api::session-sweep",
@@ -2465,13 +2491,14 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      if (!req.body?.name || !req.body?.steps) {
+      const body = req.body as Record<string, unknown>;
+      if (!body?.name || !body?.steps) {
         return {
           status_code: 400,
           body: { error: "name and steps are required" },
         };
       }
-      const result = await sdk.trigger({ function_id: "mem::routine-create", payload: req.body });
+      const result = await sdk.trigger({ function_id: "mem::routine-create", payload: body });
       return { status_code: 201, body: result };
     },
   );

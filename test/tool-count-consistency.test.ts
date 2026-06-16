@@ -1,6 +1,9 @@
+// @ts-nocheck
 import { describe, it, expect, vi } from "vitest";
-import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+
+const { readdirSync, readFileSync } = await import("node:fs");
+const { dirname, join } = await import("node:path");
+const { fileURLToPath } = await import("node:url");
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -8,7 +11,7 @@ vi.mock("../src/logger.js", () => ({
 
 import { getAllTools, ESSENTIAL_TOOLS } from "../src/mcp/tools-registry.js";
 
-const ROOT = join(import.meta.dirname, "..");
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const EXPECTED_TOOL_COUNT = 54;
 
 function readText(relativePath: string): string {
@@ -44,7 +47,7 @@ describe("Tool count consistency", () => {
   it("skill count claims match the plugin/skills directory", () => {
     const skillCount = readdirSync(join(ROOT, "plugin", "skills"), {
       withFileTypes: true,
-    }).filter((e) => e.isDirectory() && e.name !== "_shared").length;
+    }).filter((e: { isDirectory(): boolean; name: string }) => e.isDirectory() && e.name !== "_shared").length;
     expect(readText("src/cli/connect/index.ts")).toContain(`${skillCount} skills`);
     expect(readText("README.md")).toContain(`${skillCount} skills`);
     expect(readText("AGENTS.md")).toContain(`12 hooks, ${skillCount} skills`);
