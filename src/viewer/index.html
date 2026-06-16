@@ -1111,6 +1111,41 @@
     var TAB_IDS = ['dashboard', 'graph', 'memories', 'timeline', 'sessions', 'lessons', 'actions', 'crystals', 'audit', 'activity', 'profile', 'replay'];
     var VIEWER_TOKEN_SESSION_STORAGE_KEY = 'agentmemory-viewer-token';
     var VIEWER_TOKEN_LOCAL_STORAGE_KEY = 'agentmemory-viewer-token-local';
+    var VIEWER_CONFIG = window.agentmemoryViewerConfig || window.AGENTMEMORY_VIEWER_CONFIG || {};
+    var DEFAULT_AVG_LATENCY_THRESHOLDS = { warningMs: 200, criticalMs: 1000 };
+    var AVG_LATENCY_LOCAL_STORAGE_KEYS = {
+      warningMs: 'agentmemory-avg-latency-warning-ms',
+      criticalMs: 'agentmemory-avg-latency-critical-ms'
+    };
+
+    function readPositiveNumber(value) {
+      if (value === null || value === undefined || value === '') return null;
+      var number = Number(value);
+      return Number.isFinite(number) && number >= 0 ? number : null;
+    }
+
+    function readLocalStorageNumber(key) {
+      try { return readPositiveNumber(localStorage.getItem(key)); } catch (_) { return null; }
+    }
+
+    function getAvgLatencyThresholds() {
+      var configThresholds = VIEWER_CONFIG.avgLatencyThresholds || {};
+      var warningMs = readPositiveNumber(params.get('avgLatencyWarningMs'));
+      var criticalMs = readPositiveNumber(params.get('avgLatencyCriticalMs'));
+      if (warningMs === null) warningMs = readLocalStorageNumber(AVG_LATENCY_LOCAL_STORAGE_KEYS.warningMs);
+      if (criticalMs === null) criticalMs = readLocalStorageNumber(AVG_LATENCY_LOCAL_STORAGE_KEYS.criticalMs);
+      if (warningMs === null) warningMs = readPositiveNumber(configThresholds.warningMs);
+      if (criticalMs === null) criticalMs = readPositiveNumber(configThresholds.criticalMs);
+      if (warningMs === null) warningMs = DEFAULT_AVG_LATENCY_THRESHOLDS.warningMs;
+      if (criticalMs === null) criticalMs = DEFAULT_AVG_LATENCY_THRESHOLDS.criticalMs;
+      if (criticalMs < warningMs) criticalMs = warningMs;
+      return { warningMs: warningMs, criticalMs: criticalMs };
+    }
+
+    function avgLatencyColor(avgLatencyMs) {
+      var thresholds = getAvgLatencyThresholds();
+      return avgLatencyMs > thresholds.criticalMs ? 'var(--red)' : avgLatencyMs > thresholds.warningMs ? 'var(--yellow)' : 'var(--green)';
+    }
 
     var state = {
       activeTab: 'dashboard',
@@ -1592,7 +1627,7 @@
         sorted.forEach(function(m) {
           var successRate = m.totalCalls > 0 ? Math.round((m.successCount / m.totalCalls) * 100) : 0;
           var rateColor = successRate >= 95 ? 'var(--green)' : successRate >= 80 ? 'var(--yellow)' : 'var(--red)';
-          var latencyColor = m.avgLatencyMs > 1000 ? 'var(--red)' : m.avgLatencyMs > 200 ? 'var(--yellow)' : 'var(--green)';
+          var latencyColor = avgLatencyColor(m.avgLatencyMs);
           html += '<tr>';
           html += '<td class="metric-fn">' + esc(m.functionId) + '</td>';
           html += '<td class="metric-num">' + m.totalCalls + '</td>';

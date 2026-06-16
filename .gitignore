@@ -32,3 +32,6 @@ eval/data/longmemeval/
 
 # Deepwork session state
 .slim/deepwork/
+
+# Worktrees
+.worktrees/
