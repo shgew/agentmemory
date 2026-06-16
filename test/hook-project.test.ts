@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveProject } from "../src/hooks/_project.js";
 
-describe("resolveProject — hook project basename resolver", () => {
+describe("resolveProject - hook project basename resolver", () => {
   const originalEnv = process.env.AGENTMEMORY_PROJECT_NAME;
 
   beforeEach(() => {
@@ -63,4 +64,39 @@ describe("resolveProject — hook project basename resolver", () => {
     expect(resolveProject("")).toBe("agentmemory");
     expect(resolveProject("   ")).toBe("agentmemory");
   });
+
+  it("returns main repo basename from a linked worktree", () => {
+    const parent = mkdtempSync(join(tmpdir(), "amem-worktree-"));
+    const main = join(parent, "main-repo");
+    const worktree = join(parent, "feature-checkout");
+    try {
+      mkdirSync(main);
+      git(main, "init");
+      writeFileSync(join(main, "README.md"), "test\n");
+      git(main, "add", "README.md");
+      git(
+        main,
+        "-c",
+        "user.name=Agentmemory",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-m",
+        "init",
+      );
+      git(main, "worktree", "add", worktree);
+
+      expect(resolveProject(worktree)).toBe("main-repo");
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
 });
+
+function git(cwd: string, ...args: string[]): void {
+  execFileSync("git", args, {
+    cwd,
+    stdio: ["ignore", "ignore", "ignore"],
+    timeout: 5000,
+  });
+}

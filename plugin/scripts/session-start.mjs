@@ -1,24 +1,30 @@
 #!/usr/bin/env node
-import { execSync } from "node:child_process";
-import { basename } from "node:path";
+import { execFileSync } from "node:child_process";
+import { basename, resolve } from "node:path";
 //#region src/hooks/_project.ts
 function resolveProject(cwd) {
 	const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
 	if (explicit && explicit.trim()) return explicit.trim();
 	const dir = cwd && cwd.trim() ? cwd : process.cwd();
 	try {
-		const top = execSync("git rev-parse --show-toplevel", {
-			cwd: dir,
-			stdio: [
-				"ignore",
-				"pipe",
-				"ignore"
-			],
-			timeout: 500
-		}).toString().trim();
-		if (top) return basename(top);
+		const top = gitRevParse(dir, "--show-toplevel");
+		const gitDir = gitRevParse(dir, "--git-dir");
+		const commonDir = gitRevParse(dir, "--git-common-dir");
+		const root = resolve(dir, gitDir) === resolve(dir, commonDir) ? top : resolve(dir, commonDir, "..");
+		if (root) return basename(root);
 	} catch {}
 	return basename(dir);
+}
+function gitRevParse(cwd, arg) {
+	return execFileSync("git", ["rev-parse", arg], {
+		cwd,
+		stdio: [
+			"ignore",
+			"pipe",
+			"ignore"
+		],
+		timeout: 500
+	}).toString().trim();
 }
 //#endregion
 //#region src/hooks/session-start.ts

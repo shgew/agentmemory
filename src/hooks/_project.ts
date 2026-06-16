@@ -1,20 +1,29 @@
-import { execSync } from "node:child_process";
-import { basename } from "node:path";
+import { execFileSync } from "node:child_process";
+import { basename, resolve } from "node:path";
 
-// Resolution order: AGENTMEMORY_PROJECT_NAME env → git toplevel basename → cwd basename.
 export function resolveProject(cwd?: string): string {
   const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
   if (explicit && explicit.trim()) return explicit.trim();
   const dir = cwd && cwd.trim() ? cwd : process.cwd();
   try {
-    const top = execSync("git rev-parse --show-toplevel", {
-      cwd: dir,
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 500,
-    })
-      .toString()
-      .trim();
-    if (top) return basename(top);
+    const top = gitRevParse(dir, "--show-toplevel");
+    const gitDir = gitRevParse(dir, "--git-dir");
+    const commonDir = gitRevParse(dir, "--git-common-dir");
+    const root =
+      resolve(dir, gitDir) === resolve(dir, commonDir)
+        ? top
+        : resolve(dir, commonDir, "..");
+    if (root) return basename(root);
   } catch {}
   return basename(dir);
+}
+
+function gitRevParse(cwd: string, arg: string): string {
+  return execFileSync("git", ["rev-parse", arg], {
+    cwd,
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 500,
+  })
+    .toString()
+    .trim();
 }
