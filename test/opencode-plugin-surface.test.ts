@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 
@@ -58,7 +59,7 @@ describe("OpenCode plugin surface: event branches", () => {
   for (const ev of EVENT_BRANCHES) {
     it(`handles bus event ${ev}`, () => {
       const escaped = ev.replace(/\./g, "\\.");
-      expect(plugin).toMatch(new RegExp(`if\\s*\\(\\s*type\\s*===\\s*["']${escaped}["']\\s*\\)`));
+      expect(plugin).toMatch(new RegExp(`if\\s*\\(\\s*event\\.type\\s*===\\s*["']${escaped}["']\\s*\\)`));
     });
   }
 });

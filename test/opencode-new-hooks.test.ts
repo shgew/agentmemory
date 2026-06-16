@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 
@@ -77,11 +78,11 @@ describe("OpenCode plugin: command.execute.before typed hook", () => {
 
 describe("OpenCode plugin: permission.asked event", () => {
   it("handles permission.asked in the event switch", () => {
-    expect(plugin).toMatch(/if\s*\(\s*type\s*===\s*["']permission\.asked["']\s*\)/);
+    expect(plugin).toMatch(/if\s*\(\s*event\.type\s*===\s*["']permission\.asked["']\s*\)/);
   });
 
   it("emits a permission_asked observation", () => {
-    const idx = plugin.indexOf('if (type === "permission.asked")');
+    const idx = plugin.indexOf('if (event.type === "permission.asked")');
     expect(idx).toBeGreaterThan(-1);
     const block = plugin.slice(idx, idx + 800);
     expect(block).toMatch(/observe\(\s*sid\s*,\s*["']permission_asked["']/);
