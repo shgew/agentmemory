@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/MCP-53_tools-1f6feb?style=flat-square" alt="53 MCP tools" />
-  <img src="https://img.shields.io/badge/Plugin-34_hooks-1f6feb?style=flat-square" alt="34 hooks" />
+  <img src="https://img.shields.io/badge/Plugin-43_hooks-1f6feb?style=flat-square" alt="43 hooks" />
   <img src="https://img.shields.io/badge/Skills-16-1f6feb?style=flat-square" alt="16 skills" />
   <img src="https://img.shields.io/badge/R@5-95.2%25-00875f?style=flat-square" alt="95.2% R@5" />
 </p>
@@ -135,6 +135,36 @@ Restart OpenCode or open a new session. The plugin auto-captures session lifecyc
 | Command (executed) | `command.executed` | POST /observe |
 | Git branch switch | `vcs.branch.updated` | POST /observe (current branch) |
 
+### Code health
+
+| Event | Hook | agentmemory API |
+|---|---|---|
+| LSP diagnostics | `lsp.client.diagnostics` | POST /observe (serverID, path) when an active session is tracked |
+
+### Interactive questions
+
+| Event | Hook | agentmemory API |
+|---|---|---|
+| Question ask (v1 bus) | `question.asked` | POST /observe (question_id, count, first header + prompt, tool.callID, tool.messageID) |
+| Question reply (v1 bus) | `question.replied` | POST /observe (requestID, answer_count, flattened answers) |
+| Question rejected (v1 bus) | `question.rejected` | POST /observe (requestID) |
+| Question ask (v2 bus) | `question.v2.asked` | POST /observe (same shape as v1) |
+| Question reply (v2 bus) | `question.v2.replied` | POST /observe (same shape as v1) |
+| Question rejected (v2 bus) | `question.v2.rejected` | POST /observe (requestID) |
+
+### MCP tools
+
+| Event | Hook | agentmemory API |
+|---|---|---|
+| MCP tool registry changed | `mcp.tools.changed` | POST /observe (server) when an active session is tracked |
+
+### Terminal (PTY) lifecycle
+
+| Event | Hook | agentmemory API |
+|---|---|---|
+| PTY created | `pty.created` | POST /observe (pty_id, title, command, args, cwd, status, pid) when an active session is tracked |
+| PTY exited | `pty.exited` | POST /observe (pty_id, exit_code) when an active session is tracked |
+
 ### Model and config
 
 | Event | Hook | agentmemory API |
@@ -142,6 +172,7 @@ Restart OpenCode or open a new session. The plugin auto-captures session lifecyc
 | LLM parameters | `chat.params` | POST /observe |
 | Config loaded | `config` | POST /observe |
 | Compaction (WIP upstream) | `experimental.session.compacting` | POST /context -> `output.context[]` |
+| Compaction auto-continue | `experimental.compaction.autocontinue` | POST /observe (agent, model_id, overflow, enabled) - observe-only, does NOT modify `output.enabled` |
 | Plugin reload | `dispose` | fires fire-and-forget POST /session/checkpoint for the active session if any, then clears all session-scoped maps in-process. Does NOT post /session/end - the OpenCode session is still alive |
 
 ### File enrichment + memory injection (two-layer pipeline)
@@ -275,5 +306,5 @@ Agentmemory usage instructions are injected into the system prompt on the first 
 | `experimental.session.compacting` | Still experimental upstream. The plugin handles it - if the Go binary wires the dispatch it takes effect automatically. |
 | `SubagentStop` / `task.completed` / `subtask.completed` | OpenCode's `SubtaskPart` type still has no completion / result fields ([packages/core SubtaskPart](https://github.com/anomalyco/opencode/blob/main/packages/core/src/v1/session.ts)). Closest signal is `session.status` (idle), already covered. |
 | Claude `MEMORY.md` bridge | OpenCode-specific - OpenCode uses its own `AGENTS.md` mechanism, not Claude's `MEMORY.md`. |
-| `shell.env`, `chat.headers`, `tool.definition`, `experimental.text.complete`, `experimental.provider.small_model`, `experimental.compaction.autocontinue` typed hooks | Lower-signal hooks; not wired. Open an issue if a use case appears. |
-| `installation.*`, `lsp.*`, `tui.*` bus events | Lower-signal bus events; not wired. Open an issue if a use case appears. |
+| `shell.env`, `chat.headers`, `tool.definition`, `experimental.text.complete`, `experimental.provider.small_model` typed hooks | Lower-signal hooks; not wired. Open an issue if a use case appears. |
+| `installation.*`, `lsp.updated`, `pty.updated`, `pty.deleted`, `tui.*` bus events | Lower-signal bus events; not wired. Open an issue if a use case appears. (Code-health-shaped `lsp.client.diagnostics`, interactive `question.*` / `question.v2.*`, `mcp.tools.changed`, and `pty.created` / `pty.exited` ARE wired - see tables above.) |
