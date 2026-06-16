@@ -432,7 +432,6 @@ describe("@agentmemory/mcp standalone — per-tool proxy call timeouts (LLM-heav
     "memory_reflect",
     "memory_crystallize",
     "memory_compress_file",
-    "memory_session_sweep",
     "memory_mesh_sync",
   ])(
     "%s routes through the generic proxy with the 300000ms extended timeout, not 15000ms",

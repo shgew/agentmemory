@@ -180,7 +180,7 @@ When `OPENCODE_AGENTMEMORY_DEBUG=1` the plugin fires a single `GET /agentmemory/
 
 ### Dispose cleanup
 
-The `dispose` hook fires when OpenCode unloads the plugin (hot reload, host shutdown). It does NOT post `/session/end` - plugin teardown is not session termination, and the OpenCode session may still be alive in the host. `dispose` only clears every module-level map (`stashedFiles`, `seenSubtaskIds`, `seenToolCallIds`, `contextInjectedSessions`, `startContextCache`, `lastSummarizeAt`) and resets `activeSessionId` so a re-instantiated plugin starts clean.
+The `dispose` hook fires when OpenCode unloads the plugin (hot reload, host shutdown). It fires a fire-and-forget POST `/session/checkpoint` for the active session if any, then clears every module-level map (`stashedFiles`, `seenSubtaskIds`, `seenToolCallIds`, `contextInjectedSessions`, `startContextCache`) and resets `activeSessionId` so a re-instantiated plugin starts clean.
 
 Abandoned-session consolidation runs only on `session.deleted` (`/session/end` + `/crystals/auto` + `/consolidate-pipeline`). If a session is closed without an explicit delete in the OpenCode UI, the server-side `session-sweep` cron handles late finalization.
 

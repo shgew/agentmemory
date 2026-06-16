@@ -34,7 +34,6 @@ const EXTENDED_TIMEOUT_TOOLS = new Set([
   "memory_reflect",
   "memory_crystallize",
   "memory_compress_file",
-  "memory_session_sweep",
   "memory_mesh_sync",
 ]);
 
