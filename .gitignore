@@ -35,3 +35,6 @@ eval/data/longmemeval/
 
 # Worktrees
 .worktrees/
+
+# Atlas/OMO orchestration workspace
+.omo/
