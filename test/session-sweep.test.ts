@@ -4,8 +4,20 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
+vi.mock("../src/functions/slots.js", () => ({
+  isReflectEnabled: () => true,
+}));
+
+vi.mock("../src/config.js", () => ({
+  isGraphExtractionEnabled: () => false,
+  getAgentId: () => undefined,
+  getEnvVar: () => undefined,
+  isAutoCompressEnabled: () => false,
+}));
+
 import { registerSessionSweepFunction } from "../src/functions/session-sweep.js";
 import type { Session, AuditEntry } from "../src/types.js";
+import { registerEventTriggers } from "../src/triggers/events.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -493,5 +505,242 @@ describe("Session Sweep - Option K checkpoint path", () => {
     );
     expect(checkpointAudits.length).toBeGreaterThan(0);
     expect(checkpointAudits[0].targetIds).toContain("ses_audit_cp");
+  });
+});
+
+describe("Session Sweep - restart safety", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    registerSessionSweepFunction(sdk as never, kv as never);
+    registerEventTriggers(sdk as never, kv as never);
+  });
+
+  function registerSuccessStubs() {
+    sdk.registerFunction("mem::summarize", async () => ({ success: true }));
+    sdk.registerFunction("mem::slot-reflect", async () => ({ success: true, applied: 0 }));
+    sdk.registerFunction("mem::graph-extract", async () => ({ success: true }));
+  }
+
+  it("active path: event::session::stopped fires BEFORE kv.update mutates session state", async () => {
+    registerSuccessStubs();
+    const stale = makeSession({
+      id: "ses_order",
+      startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(),
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_order", stale);
+
+    const events: string[] = [];
+    const originalUpdate = kv.update;
+    kv.update = (async (
+      scope: string,
+      key: string,
+      ops: Array<{ type: string; path: string; value?: unknown }>,
+    ) => {
+      if (scope === SESSIONS_SCOPE && key === "ses_order") events.push("kv.update");
+      return originalUpdate(scope, key, ops);
+    }) as typeof kv.update;
+
+    const originalTrigger = sdk.trigger;
+    sdk.trigger = (async (input: {
+      function_id: string;
+      payload?: unknown;
+      action?: unknown;
+    }) => {
+      if (input.function_id === "event::session::stopped") events.push("trigger");
+      return originalTrigger(input);
+    }) as typeof sdk.trigger;
+
+    await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_order"] },
+    });
+
+    const triggerIdx = events.indexOf("trigger");
+    const updateIdx = events.indexOf("kv.update");
+    expect(triggerIdx).toBeGreaterThanOrEqual(0);
+    expect(updateIdx).toBeGreaterThanOrEqual(0);
+    expect(triggerIdx).toBeLessThan(updateIdx);
+  });
+
+  it("active sweep: crashing summarize leaves KV untouched and routes session to failed", async () => {
+    sdk.registerFunction("mem::summarize", async () => {
+      throw new Error("simulated pipeline failure");
+    });
+    sdk.registerFunction("mem::slot-reflect", async () => ({ success: true }));
+    sdk.registerFunction("mem::graph-extract", async () => ({ success: true }));
+
+    const stale = makeSession({
+      id: "ses_crash_active",
+      startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(),
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_crash_active", stale);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_crash_active"] },
+    })) as {
+      swept: string[];
+      failed: Array<{ sessionId: string; error: string }>;
+    };
+
+    expect(result.swept).not.toContain("ses_crash_active");
+    expect(result.failed.map((f) => f.sessionId)).toContain("ses_crash_active");
+
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_crash_active");
+    expect(stored?.status).toBe("active");
+    expect(stored?.endedAt).toBeUndefined();
+    expect(stored?.lastCheckpointAt).toBeUndefined();
+  });
+
+  it("active sweep: crashed pipeline is replayed on next sweep after handler is fixed", async () => {
+    let summarizeShouldFail = true;
+    sdk.registerFunction("mem::summarize", async () => {
+      if (summarizeShouldFail) throw new Error("simulated pipeline failure");
+      return { success: true };
+    });
+    sdk.registerFunction("mem::slot-reflect", async () => ({ success: true }));
+    sdk.registerFunction("mem::graph-extract", async () => ({ success: true }));
+
+    const stale = makeSession({
+      id: "ses_replay_active",
+      startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(),
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_replay_active", stale);
+
+    const r1 = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_replay_active"] },
+    })) as { swept: string[]; failed: Array<{ sessionId: string }> };
+    expect(r1.failed.map((f) => f.sessionId)).toContain("ses_replay_active");
+    const stored1 = await kv.get<Session>(SESSIONS_SCOPE, "ses_replay_active");
+    expect(stored1?.status).toBe("active");
+
+    summarizeShouldFail = false;
+
+    const r2 = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_replay_active"] },
+    })) as { swept: string[]; failed: Array<{ sessionId: string }> };
+    expect(r2.swept).toContain("ses_replay_active");
+    expect(r2.failed).toHaveLength(0);
+    const stored2 = await kv.get<Session>(SESSIONS_SCOPE, "ses_replay_active");
+    expect(stored2?.status).toBe("completed");
+    expect(stored2?.endedAt).toBeDefined();
+    expect(stored2?.lastCheckpointAt).toBeDefined();
+  });
+
+  it("checkpoint sweep: crashing summarize leaves lastCheckpointAt unchanged and routes session to failed", async () => {
+    sdk.registerFunction("mem::summarize", async () => {
+      throw new Error("simulated pipeline failure");
+    });
+    sdk.registerFunction("mem::slot-reflect", async () => ({ success: true }));
+    sdk.registerFunction("mem::graph-extract", async () => ({ success: true }));
+
+    const day1Anchor = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const day2Anchor = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+    const originalEndedAt = new Date(Date.now() - 18 * 60 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_crash_cp",
+      startedAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
+      updatedAt: day2Anchor,
+      status: "completed",
+      endedAt: originalEndedAt,
+      lastCheckpointAt: day1Anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_crash_cp", session);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_crash_cp"] },
+    })) as {
+      checkpointed: string[];
+      failed: Array<{ sessionId: string; error: string }>;
+    };
+
+    expect(result.checkpointed).not.toContain("ses_crash_cp");
+    expect(result.failed.map((f) => f.sessionId)).toContain("ses_crash_cp");
+
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_crash_cp");
+    expect(stored?.lastCheckpointAt).toBe(day1Anchor);
+    expect(stored?.endedAt).toBe(originalEndedAt);
+  });
+
+  it("checkpoint sweep: crashed pipeline is replayed on next sweep after handler is fixed", async () => {
+    let summarizeShouldFail = true;
+    sdk.registerFunction("mem::summarize", async () => {
+      if (summarizeShouldFail) throw new Error("simulated pipeline failure");
+      return { success: true };
+    });
+    sdk.registerFunction("mem::slot-reflect", async () => ({ success: true }));
+    sdk.registerFunction("mem::graph-extract", async () => ({ success: true }));
+
+    const day1Anchor = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const day2Anchor = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_replay_cp",
+      startedAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
+      updatedAt: day2Anchor,
+      status: "completed",
+      endedAt: new Date(Date.now() - 18 * 60 * 60 * 1000).toISOString(),
+      lastCheckpointAt: day1Anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_replay_cp", session);
+
+    const r1 = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_replay_cp"] },
+    })) as { checkpointed: string[]; failed: Array<{ sessionId: string }> };
+    expect(r1.failed.map((f) => f.sessionId)).toContain("ses_replay_cp");
+    const stored1 = await kv.get<Session>(SESSIONS_SCOPE, "ses_replay_cp");
+    expect(stored1?.lastCheckpointAt).toBe(day1Anchor);
+
+    summarizeShouldFail = false;
+
+    const r2 = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_replay_cp"] },
+    })) as { checkpointed: string[]; failed: Array<{ sessionId: string }> };
+    expect(r2.checkpointed).toContain("ses_replay_cp");
+    expect(r2.failed).toHaveLength(0);
+    const stored2 = await kv.get<Session>(SESSIONS_SCOPE, "ses_replay_cp");
+    expect(stored2?.lastCheckpointAt).toBe(day2Anchor);
+  });
+
+  it("idempotent: re-running sweep on a freshly swept session is a no-op", async () => {
+    registerSuccessStubs();
+    const stale = makeSession({
+      id: "ses_idempotent",
+      startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(),
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_idempotent", stale);
+
+    const r1 = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_idempotent"] },
+    })) as { swept: string[] };
+    expect(r1.swept).toContain("ses_idempotent");
+    const stoppedAfter1 = sdk.triggerCalls.filter(
+      (c) => c.function_id === "event::session::stopped",
+    ).length;
+    const auditAfter1 = (await kv.list<AuditEntry>(AUDIT_SCOPE)).length;
+
+    const r2 = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_idempotent"] },
+    })) as { swept: string[]; checkpointed: string[]; skipped: string[] };
+    expect(r2.swept).toHaveLength(0);
+    expect(r2.checkpointed).toHaveLength(0);
+    expect(r2.skipped).toContain("ses_idempotent");
+
+    const stoppedAfter2 = sdk.triggerCalls.filter(
+      (c) => c.function_id === "event::session::stopped",
+    ).length;
+    const auditAfter2 = (await kv.list<AuditEntry>(AUDIT_SCOPE)).length;
+    expect(stoppedAfter2).toBe(stoppedAfter1);
+    expect(auditAfter2).toBe(auditAfter1);
   });
 });

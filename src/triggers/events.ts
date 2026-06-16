@@ -42,7 +42,7 @@ function enqueueSessionStopped(
         sessionId,
         error,
       });
-      return { success: false, error };
+      throw err;
     } finally {
       sessionStoppedQueueDepth = Math.max(0, sessionStoppedQueueDepth - 1);
     }
@@ -102,10 +102,9 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     });
     if (isReflectEnabled()) {
       try {
-        sdk.trigger({
+        await sdk.trigger({
           function_id: "mem::slot-reflect",
           payload: { sessionId, ...(since ? { since } : {}), ...(until ? { until } : {}) },
-          action: TriggerAction.Void(),
         });
       } catch (err) {
         logger.warn("slot-reflect trigger failed", { sessionId, error: errorMessage(err) });

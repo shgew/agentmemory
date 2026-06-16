@@ -132,33 +132,35 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
               }
 
               if (current.status === "active") {
+                await sdk.trigger({
+                  function_id: "event::session::stopped",
+                  payload: {
+                    sessionId: session.id,
+                    until: currentAnchor,
+                    waitForCompletion: true,
+                  },
+                });
                 const endedAt = new Date().toISOString();
                 await kv.update<Session>(KV.sessions, session.id, [
                   { type: "set", path: "endedAt", value: endedAt },
                   { type: "set", path: "status", value: "completed" },
                   { type: "set", path: "lastCheckpointAt", value: currentAnchor },
                 ]);
-                await sdk.trigger({
-                  function_id: "event::session::stopped",
-                  payload: {
-                    sessionId: session.id,
-                    until: currentAnchor,
-                  },
-                });
                 return { status: "swept", checkpointAt: currentAnchor };
               }
 
-              await kv.update<Session>(KV.sessions, session.id, [
-                { type: "set", path: "lastCheckpointAt", value: currentAnchor },
-              ]);
               await sdk.trigger({
                 function_id: "event::session::checkpoint",
                 payload: {
                   sessionId: session.id,
                   since: currentWatermark,
                   until: currentAnchor,
+                  waitForCompletion: true,
                 },
               });
+              await kv.update<Session>(KV.sessions, session.id, [
+                { type: "set", path: "lastCheckpointAt", value: currentAnchor },
+              ]);
               return {
                 status: "checkpointed",
                 since: currentWatermark,

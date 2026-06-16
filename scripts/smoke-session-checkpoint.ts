@@ -388,8 +388,232 @@ async function scenarioS3(): Promise<ScenarioReport> {
   return { name, passed: true, details };
 }
 
+async function scenarioS4(): Promise<ScenarioReport> {
+  const name = "S4 crash mid-pipeline then replay";
+  const details: string[] = [];
+  const { sdk, kv } = setupWorld();
+  const now = Date.now();
+  const initialUpdatedAt = new Date(now - EIGHT_HOURS_MS).toISOString();
+  const sessionId = "ses_S4_crash_recovery";
+
+  let summarizeShouldFail = true;
+  sdk.registerFunction("mem::summarize", async () => {
+    if (summarizeShouldFail) throw new Error("simulated pipeline failure");
+    return { success: true };
+  });
+
+  await kv.set("mem:sessions", sessionId, {
+    id: sessionId,
+    project: "smoke",
+    cwd: "/tmp",
+    startedAt: initialUpdatedAt,
+    updatedAt: initialUpdatedAt,
+    status: "active",
+    observationCount: 1,
+  } satisfies Session);
+
+  const sweep1 = (await sdk.trigger({
+    function_id: "mem::session-sweep",
+    payload: { sessionIds: [sessionId] },
+  })) as {
+    swept: string[];
+    checkpointed: string[];
+    skipped: string[];
+    failed: Array<{ sessionId: string; error: string }>;
+  };
+
+  const sessionAfter1 = await getSession(kv, sessionId);
+  if (!sessionAfter1) {
+    details.push("FAIL: session missing after sweep1");
+    return { name, passed: false, details };
+  }
+  if (sessionAfter1.status !== "active") {
+    details.push(
+      `FAIL: status after failed sweep expected active, got ${sessionAfter1.status}`,
+    );
+    return { name, passed: false, details };
+  }
+  if (sessionAfter1.endedAt !== undefined) {
+    details.push(
+      `FAIL: endedAt expected undefined after failed sweep, got ${sessionAfter1.endedAt}`,
+    );
+    return { name, passed: false, details };
+  }
+  if (sessionAfter1.lastCheckpointAt !== undefined) {
+    details.push(
+      `FAIL: lastCheckpointAt expected undefined after failed sweep, got ${sessionAfter1.lastCheckpointAt}`,
+    );
+    return { name, passed: false, details };
+  }
+  if (!sweep1.failed.some((f) => f.sessionId === sessionId)) {
+    details.push(
+      `FAIL: sweep1.failed expected ${sessionId}, got ${JSON.stringify(sweep1.failed)}`,
+    );
+    return { name, passed: false, details };
+  }
+  if (sweep1.swept.includes(sessionId)) {
+    details.push(
+      `FAIL: sweep1.swept should not include ${sessionId}, got ${JSON.stringify(sweep1.swept)}`,
+    );
+    return { name, passed: false, details };
+  }
+
+  summarizeShouldFail = false;
+
+  const sweep2 = (await sdk.trigger({
+    function_id: "mem::session-sweep",
+    payload: { sessionIds: [sessionId] },
+  })) as {
+    swept: string[];
+    checkpointed: string[];
+    failed: Array<{ sessionId: string; error: string }>;
+  };
+
+  const sessionAfter2 = await getSession(kv, sessionId);
+  if (!sessionAfter2) {
+    details.push("FAIL: session missing after sweep2");
+    return { name, passed: false, details };
+  }
+  if (!sweep2.swept.includes(sessionId)) {
+    details.push(
+      `FAIL: sweep2.swept expected ${sessionId}, got ${JSON.stringify(sweep2.swept)}`,
+    );
+    return { name, passed: false, details };
+  }
+  if (sweep2.failed.length !== 0) {
+    details.push(`FAIL: sweep2.failed expected empty, got ${JSON.stringify(sweep2.failed)}`);
+    return { name, passed: false, details };
+  }
+  if (sessionAfter2.status !== "completed") {
+    details.push(
+      `FAIL: status after successful replay expected completed, got ${sessionAfter2.status}`,
+    );
+    return { name, passed: false, details };
+  }
+  if (!sessionAfter2.lastCheckpointAt) {
+    details.push("FAIL: lastCheckpointAt expected to be set after successful replay");
+    return { name, passed: false, details };
+  }
+  if (!sessionAfter2.endedAt) {
+    details.push("FAIL: endedAt expected to be set after successful replay");
+    return { name, passed: false, details };
+  }
+
+  const stoppedTriggers = sdk.triggerCalls.filter((c) => c.function_id === "event::session::stopped");
+  if (stoppedTriggers.length !== 2) {
+    details.push(
+      `FAIL: expected 2 stopped triggers (1 failed + 1 replay), got ${stoppedTriggers.length}`,
+    );
+    return { name, passed: false, details };
+  }
+
+  details.push(`pass: first sweep failed, KV stayed at status=active, no watermark advance`);
+  details.push(
+    `pass: second sweep replayed after pipeline healed, session=completed, lastCheckpointAt=${sessionAfter2.lastCheckpointAt}`,
+  );
+  details.push(`pass: 2 stopped triggers fired (1 crash + 1 successful replay)`);
+  return { name, passed: true, details };
+}
+
+async function scenarioS5(): Promise<ScenarioReport> {
+  const name = "S5 idempotent re-sweep on freshly closed session";
+  const details: string[] = [];
+  const { sdk, kv } = setupWorld();
+  const now = Date.now();
+  const initialUpdatedAt = new Date(now - EIGHT_HOURS_MS).toISOString();
+  const sessionId = "ses_S5_idempotent";
+
+  await kv.set("mem:sessions", sessionId, {
+    id: sessionId,
+    project: "smoke",
+    cwd: "/tmp",
+    startedAt: initialUpdatedAt,
+    updatedAt: initialUpdatedAt,
+    status: "active",
+    observationCount: 1,
+  } satisfies Session);
+
+  const sweep1 = (await sdk.trigger({
+    function_id: "mem::session-sweep",
+    payload: { sessionIds: [sessionId] },
+  })) as { swept: string[]; checkpointed: string[]; skipped: string[] };
+  if (!sweep1.swept.includes(sessionId)) {
+    details.push(`FAIL: sweep1.swept expected ${sessionId}, got ${JSON.stringify(sweep1.swept)}`);
+    return { name, passed: false, details };
+  }
+
+  const stoppedAfter1 = sdk.triggerCalls.filter(
+    (c) => c.function_id === "event::session::stopped",
+  ).length;
+  const checkpointAfter1 = sdk.triggerCalls.filter(
+    (c) => c.function_id === "event::session::checkpoint",
+  ).length;
+  const sweepAudits1 = (await kv.list<AuditEntry>("mem:audit")).filter(
+    (e) => e.functionId === "mem::session-sweep",
+  ).length;
+
+  const sweep2 = (await sdk.trigger({
+    function_id: "mem::session-sweep",
+    payload: { sessionIds: [sessionId] },
+  })) as { swept: string[]; checkpointed: string[]; skipped: string[] };
+  if (sweep2.swept.length !== 0 || sweep2.checkpointed.length !== 0) {
+    details.push(
+      `FAIL: sweep2 expected empty swept and checkpointed, got swept=${JSON.stringify(sweep2.swept)} checkpointed=${JSON.stringify(sweep2.checkpointed)}`,
+    );
+    return { name, passed: false, details };
+  }
+  if (!sweep2.skipped.includes(sessionId)) {
+    details.push(`FAIL: sweep2.skipped expected ${sessionId}, got ${JSON.stringify(sweep2.skipped)}`);
+    return { name, passed: false, details };
+  }
+
+  const sweep3 = (await sdk.trigger({
+    function_id: "mem::session-sweep",
+    payload: { sessionIds: [sessionId] },
+  })) as { swept: string[]; checkpointed: string[]; skipped: string[] };
+  if (sweep3.swept.length !== 0 || sweep3.checkpointed.length !== 0) {
+    details.push(
+      `FAIL: sweep3 expected empty swept and checkpointed, got swept=${JSON.stringify(sweep3.swept)} checkpointed=${JSON.stringify(sweep3.checkpointed)}`,
+    );
+    return { name, passed: false, details };
+  }
+
+  const stoppedAfter3 = sdk.triggerCalls.filter(
+    (c) => c.function_id === "event::session::stopped",
+  ).length;
+  const checkpointAfter3 = sdk.triggerCalls.filter(
+    (c) => c.function_id === "event::session::checkpoint",
+  ).length;
+  const sweepAudits3 = (await kv.list<AuditEntry>("mem:audit")).filter(
+    (e) => e.functionId === "mem::session-sweep",
+  ).length;
+
+  if (stoppedAfter3 !== stoppedAfter1) {
+    details.push(
+      `FAIL: stopped trigger count should stay at ${stoppedAfter1}, got ${stoppedAfter3}`,
+    );
+    return { name, passed: false, details };
+  }
+  if (checkpointAfter3 !== checkpointAfter1) {
+    details.push(
+      `FAIL: checkpoint trigger count should stay at ${checkpointAfter1}, got ${checkpointAfter3}`,
+    );
+    return { name, passed: false, details };
+  }
+  if (sweepAudits3 !== sweepAudits1) {
+    details.push(
+      `FAIL: sweep audit count should stay at ${sweepAudits1}, got ${sweepAudits3}`,
+    );
+    return { name, passed: false, details };
+  }
+
+  details.push(`pass: first sweep closed the session, ${stoppedAfter1} stopped trigger, ${sweepAudits1} audit row`);
+  details.push(`pass: sweeps 2 and 3 skipped the closed session, no new triggers, no new audit rows`);
+  return { name, passed: true, details };
+}
+
 async function main() {
-  const scenarios = [scenarioS1, scenarioS2, scenarioS3];
+  const scenarios = [scenarioS1, scenarioS2, scenarioS3, scenarioS4, scenarioS5];
   let allPassed = true;
   for (const run of scenarios) {
     const report = await run();
