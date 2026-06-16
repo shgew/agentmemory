@@ -14,9 +14,21 @@ interface SessionCheckpointResult {
   success: boolean;
   queued?: boolean;
   noOp?: boolean;
+  throttled?: boolean;
+  retryAfterMs?: number;
   error?: "session_not_found" | "session_not_active" | "session_has_no_activity";
   queueDepth?: number | null;
   lastCheckpointAt?: string;
+}
+
+const CHECKPOINT_DEBOUNCE_MS_DEFAULT = 600_000;
+
+function getCheckpointDebounceMs(): number {
+  const raw = process.env.AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS;
+  if (raw === undefined || raw === "") return CHECKPOINT_DEBOUNCE_MS_DEFAULT;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) return CHECKPOINT_DEBOUNCE_MS_DEFAULT;
+  return n;
 }
 
 export function registerSessionCheckpoint(sdk: ISdk, kv: StateKV): void {
@@ -45,6 +57,21 @@ export function registerSessionCheckpoint(sdk: ISdk, kv: StateKV): void {
         const watermark = session.lastCheckpointAt ?? session.endedAt;
         if (watermark !== undefined && !isAfter(anchor, watermark)) {
           return { success: true, noOp: true };
+        }
+
+        const debounceMs = getCheckpointDebounceMs();
+        if (debounceMs > 0 && session.lastCheckpointAt) {
+          const lastMs = new Date(session.lastCheckpointAt).getTime();
+          if (Number.isFinite(lastMs)) {
+            const elapsedMs = Date.now() - lastMs;
+            if (elapsedMs < debounceMs) {
+              return {
+                success: true,
+                throttled: true,
+                retryAfterMs: debounceMs - elapsedMs,
+              };
+            }
+          }
         }
 
         const result = await sdk.trigger({

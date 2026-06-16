@@ -162,9 +162,14 @@ System prompt = [OpenCode instructions] + [memory context] + [file enrichment] +
 
 The plugin is built to survive busy sessions, slow networks, and unattended shutdowns.
 
-### Server-side deduplication
+### Server-side deduplication and debounce
 
-`/session/checkpoint` is idempotent on the server. When there is no new activity since `lastCheckpointAt`, the server returns `{ noOp: true }` and skips consolidation. The plugin posts unconditionally on idle, compaction, and dispose, and the server remains the source of truth for deduplication.
+`/session/checkpoint` is idempotent on the server with two gates in order:
+
+1. **Watermark no-op**: when nothing has been observed since `lastCheckpointAt`, the server returns `{ noOp: true }` and skips consolidation.
+2. **Time debounce**: when there IS new activity but the previous consolidation fired less than `AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS` ago (default 10 min), the server returns `{ throttled: true, retryAfterMs }` without firing summarize + graph-extract and without advancing `lastCheckpointAt`. Set the env var to `0` to disable and restore the pre-debounce behavior where every activity-bearing POST consolidates.
+
+The plugin posts unconditionally on idle, compaction, and dispose. The server remains the single source of truth - the throttle protects busy sessions (e.g. waiting on background agents) from re-summarizing every few seconds while still consolidating on the next eligible POST or via the session-sweep cron.
 
 ### HTTPS guard
 

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -161,7 +161,7 @@ describe("Session Checkpoint Function", () => {
   });
 
   it("queues a checkpoint after new activity advances updatedAt past the prior checkpoint", async () => {
-    const older = new Date(Date.now() - 60_000).toISOString();
+    const older = new Date(Date.now() - 700_000).toISOString();
     const newer = new Date(Date.now()).toISOString();
     const session = makeSession({
       id: "ses_new",
@@ -255,5 +255,128 @@ describe("Session Checkpoint Function", () => {
     expect([first, second].some((result) => (result as { queued?: boolean }).queued)).toBe(true);
     expect([first, second].some((result) => (result as { noOp?: boolean }).noOp)).toBe(true);
     expect(sdk.triggerCalls.filter((c) => c.function_id === "event::session::checkpoint")).toHaveLength(1);
+  });
+
+  describe("AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS", () => {
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it("throttles a checkpoint when called within the debounce window", async () => {
+      vi.stubEnv("AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS", "600000");
+      const now = Date.now();
+      const lastCheckpointAt = new Date(now - 60_000).toISOString();
+      const updatedAt = new Date(now).toISOString();
+      const session = makeSession({
+        id: "ses_throttle",
+        updatedAt,
+        lastCheckpointAt,
+      });
+      await kv.set(SESSIONS_SCOPE, "ses_throttle", session);
+
+      const result = (await sdk.trigger({
+        function_id: "mem::session::checkpoint",
+        payload: { sessionId: "ses_throttle" },
+      })) as { success: boolean; throttled?: boolean; retryAfterMs?: number };
+
+      expect(result.success).toBe(true);
+      expect(result.throttled).toBe(true);
+      expect(result.retryAfterMs).toBeGreaterThan(0);
+      expect(result.retryAfterMs).toBeLessThanOrEqual(600_000);
+
+      expect(
+        sdk.triggerCalls.filter((c) => c.function_id === "event::session::checkpoint"),
+      ).toHaveLength(0);
+
+      const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_throttle");
+      expect(stored?.lastCheckpointAt).toBe(lastCheckpointAt);
+
+      expect(await kv.list<AuditEntry>(AUDIT_SCOPE)).toHaveLength(0);
+    });
+
+    it("fires the checkpoint when the debounce window has elapsed", async () => {
+      vi.stubEnv("AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS", "600000");
+      const now = Date.now();
+      const lastCheckpointAt = new Date(now - 700_000).toISOString();
+      const updatedAt = new Date(now).toISOString();
+      const session = makeSession({
+        id: "ses_window_elapsed",
+        updatedAt,
+        lastCheckpointAt,
+      });
+      await kv.set(SESSIONS_SCOPE, "ses_window_elapsed", session);
+
+      const result = (await sdk.trigger({
+        function_id: "mem::session::checkpoint",
+        payload: { sessionId: "ses_window_elapsed" },
+      })) as { success: boolean; queued?: boolean; throttled?: boolean };
+
+      expect(result.success).toBe(true);
+      expect(result.queued).toBe(true);
+      expect(result.throttled).toBeUndefined();
+      expect(
+        sdk.triggerCalls.filter((c) => c.function_id === "event::session::checkpoint"),
+      ).toHaveLength(1);
+    });
+
+    it("does NOT throttle on first checkpoint when no prior lastCheckpointAt exists", async () => {
+      vi.stubEnv("AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS", "600000");
+      const session = makeSession({ id: "ses_first_with_debounce" });
+      await kv.set(SESSIONS_SCOPE, "ses_first_with_debounce", session);
+
+      const result = (await sdk.trigger({
+        function_id: "mem::session::checkpoint",
+        payload: { sessionId: "ses_first_with_debounce" },
+      })) as { success: boolean; queued?: boolean; throttled?: boolean };
+
+      expect(result.success).toBe(true);
+      expect(result.queued).toBe(true);
+      expect(result.throttled).toBeUndefined();
+    });
+
+    it("disables the debounce when AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS=0", async () => {
+      vi.stubEnv("AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS", "0");
+      const now = Date.now();
+      const lastCheckpointAt = new Date(now - 1_000).toISOString();
+      const updatedAt = new Date(now).toISOString();
+      const session = makeSession({
+        id: "ses_debounce_disabled",
+        updatedAt,
+        lastCheckpointAt,
+      });
+      await kv.set(SESSIONS_SCOPE, "ses_debounce_disabled", session);
+
+      const result = (await sdk.trigger({
+        function_id: "mem::session::checkpoint",
+        payload: { sessionId: "ses_debounce_disabled" },
+      })) as { success: boolean; queued?: boolean; throttled?: boolean };
+
+      expect(result.success).toBe(true);
+      expect(result.queued).toBe(true);
+      expect(result.throttled).toBeUndefined();
+      expect(
+        sdk.triggerCalls.filter((c) => c.function_id === "event::session::checkpoint"),
+      ).toHaveLength(1);
+    });
+
+    it("prefers noOp over throttled when anchor equals watermark", async () => {
+      vi.stubEnv("AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS", "600000");
+      const ts = new Date(Date.now() - 60_000).toISOString();
+      const session = makeSession({
+        id: "ses_noop_over_throttle",
+        updatedAt: ts,
+        lastCheckpointAt: ts,
+      });
+      await kv.set(SESSIONS_SCOPE, "ses_noop_over_throttle", session);
+
+      const result = (await sdk.trigger({
+        function_id: "mem::session::checkpoint",
+        payload: { sessionId: "ses_noop_over_throttle" },
+      })) as { success: boolean; noOp?: boolean; throttled?: boolean };
+
+      expect(result.success).toBe(true);
+      expect(result.noOp).toBe(true);
+      expect(result.throttled).toBeUndefined();
+    });
   });
 });

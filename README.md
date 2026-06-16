@@ -1476,6 +1476,34 @@ Create `~/.agentmemory/.env`:
                                           # first; bump the yaml or use the event-
                                           # driven path (session.stopped pipeline).
 
+# Session-checkpoint debounce
+# AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS=600000  # Default: 600 000 ms (10 min). Minimum
+                                          # wall-clock interval between two
+                                          # consolidations of the SAME active
+                                          # session. When a client POSTs
+                                          # /agentmemory/session/checkpoint within
+                                          # this window of the prior checkpoint,
+                                          # mem::session::checkpoint returns
+                                          # `{ success: true, throttled: true,
+                                          # retryAfterMs }` without firing
+                                          # event::session::checkpoint or advancing
+                                          # lastCheckpointAt. The watermark no-op
+                                          # guard (skip when nothing changed since
+                                          # last checkpoint) still runs first;
+                                          # debounce only gates calls where there
+                                          # IS new activity but the previous
+                                          # consolidation is too recent. Set 0 to
+                                          # disable (legacy pre-debounce behavior:
+                                          # every activity-bearing POST fires a
+                                          # full summarize + graph-extract chain).
+                                          # Designed for clients like OpenCode that
+                                          # fire `session.idle` between background
+                                          # agent waves; the throttle keeps a live
+                                          # session from re-summarizing every few
+                                          # seconds while still consolidating
+                                          # eventually via the next eligible POST
+                                          # or the session-sweep cron.
+
 # MCP shim (@agentmemory/mcp) proxy call timeouts
 # AGENTMEMORY_MCP_CALL_TIMEOUT_MS=15000   # Default: 15 000 ms (15 s). Caps each
                                           # HTTP call the standalone MCP shim
