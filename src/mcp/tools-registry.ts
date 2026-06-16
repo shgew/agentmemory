@@ -356,26 +356,9 @@ export const V040_TOOLS: McpToolDef[] = [
     },
   },
   {
-    name: "memory_session_sweep",
-    description:
-      "Checkpoint consolidation on stale sessions. Active sessions with no recent activity transition to status=completed exactly once, firing event::session::stopped. Completed sessions with post-close activity (status stays completed) get re-checkpointed via event::session::checkpoint - graph-extract and slot-reflect re-run only over observations after the prior watermark. Default staleness 6h via SESSION_SWEEP_MAX_AGE_MS. Use dryRun=true to preview without changes. Optional sessionIds CSV scopes the sweep.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        dryRun: {
-          type: "boolean",
-          description: "Preview which sessions would be swept without writing",
-        },
-        maxAgeMs: {
-          type: "number",
-          description: "Override staleness threshold in milliseconds (default 6h, env SESSION_SWEEP_MAX_AGE_MS)",
-        },
-        sessionIds: {
-          type: "string",
-          description: "Comma-separated session IDs to restrict the sweep to",
-        },
-      },
-    },
+    name: "internal_v040_placeholder",
+    description: "Reserved internal registry placeholder.",
+    inputSchema: { type: "object", properties: {} },
   },
 ];
 
