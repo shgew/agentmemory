@@ -71,7 +71,7 @@ Restart OpenCode or open a new session. The plugin auto-captures session lifecyc
 | Event | Hook | agentmemory API |
 |---|---|---|
 | Session start | `session.created` | POST /session/start |
-| Idle | `session.idle` + `session.status` (idle) | POST /session/checkpoint |
+| Idle | `session.status` (idle) | POST /session/checkpoint |
 | Status transitions | `session.status` (idle/busy/retry) | POST /observe |
 | Compaction | `session.compacted` | POST /session/checkpoint + POST /observe |
 | Metadata updates / resume | `session.updated` | POST /observe; first sighting of a sid without a prior session.created treats it as a resume - re-fires POST /session/start to repopulate context cache and clear context-injected flag |
@@ -273,7 +273,7 @@ Agentmemory usage instructions are injected into the system prompt on the first 
 |---|---|
 | `permission.ask` typed hook | Declared in `@opencode-ai/plugin@1.17.7` types but the runtime never invokes it (regression from the Effect refactor, tracked in [opencode-ai/opencode#28066](https://github.com/anomalyco/opencode/issues/28066) / [#7006](https://github.com/anomalyco/opencode/issues/7006)). We capture the equivalent lifecycle via the `permission.asked` bus event instead. |
 | `experimental.session.compacting` | Still experimental upstream. The plugin handles it - if the Go binary wires the dispatch it takes effect automatically. |
-| `SubagentStop` / `task.completed` / `subtask.completed` | OpenCode's `SubtaskPart` type still has no completion / result fields ([packages/core SubtaskPart](https://github.com/anomalyco/opencode/blob/main/packages/core/src/v1/session.ts)). Closest signal is `session.idle`, already covered. |
+| `SubagentStop` / `task.completed` / `subtask.completed` | OpenCode's `SubtaskPart` type still has no completion / result fields ([packages/core SubtaskPart](https://github.com/anomalyco/opencode/blob/main/packages/core/src/v1/session.ts)). Closest signal is `session.status` (idle), already covered. |
 | Claude `MEMORY.md` bridge | OpenCode-specific - OpenCode uses its own `AGENTS.md` mechanism, not Claude's `MEMORY.md`. |
 | `shell.env`, `chat.headers`, `tool.definition`, `experimental.text.complete`, `experimental.provider.small_model`, `experimental.compaction.autocontinue` typed hooks | Lower-signal hooks; not wired. Open an issue if a use case appears. |
 | `installation.*`, `lsp.*`, `tui.*` bus events | Lower-signal bus events; not wired. Open an issue if a use case appears. |

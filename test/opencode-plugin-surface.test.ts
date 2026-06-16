@@ -8,7 +8,6 @@ const plugin = readFileSync(
 
 const EVENT_BRANCHES = [
   "session.created",
-  "session.idle",
   "session.status",
   "session.compacted",
   "session.updated",

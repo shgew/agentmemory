@@ -7,12 +7,8 @@ const plugin = readFileSync(
 );
 
 describe("OpenCode plugin: session/checkpoint replaces summarize debounce", () => {
-  it("posts /session/checkpoint on session.idle", () => {
-    const idleBlock = plugin.slice(
-      plugin.indexOf('if (type === "session.idle")'),
-      plugin.indexOf('// \u2500\u2500 session.status \u2500\u2500'),
-    );
-    expect(idleBlock).toMatch(/post\(["']\/session\/checkpoint["']/);
+  it("does not handle deprecated session.idle (canonical signal is session.status idle)", () => {
+    expect(plugin).not.toMatch(/if\s*\(\s*type\s*===\s*["']session\.idle["']\s*\)/);
   });
 
   it("posts /session/checkpoint on session.status idle", () => {

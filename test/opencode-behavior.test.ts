@@ -220,23 +220,53 @@ describe("OpenCode plugin behavior: file.watcher.updated", () => {
   });
 });
 
-describe("OpenCode plugin behavior: session.idle separate from session.status", () => {
+describe("OpenCode plugin behavior: session.status is the canonical idle signal", () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(async () => { await teardownPlugin(); });
 
-  it("fires /session/checkpoint on bare session.idle event", async () => {
+  it("fires /session/checkpoint on session.status with type=idle", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
-      event: { type: "session.idle", properties: { sessionID: "s8" } } as any,
+      event: {
+        type: "session.status",
+        properties: { sessionID: "s8", status: { type: "idle" } },
+      } as any,
     });
     const checkpoint = calls.find((c) => c.url.endsWith("/agentmemory/session/checkpoint"));
     expect(checkpoint).toBeDefined();
   });
 
-  it("fires /session/checkpoint on every session.idle (no debounce)", async () => {
+  it("does NOT fire /session/checkpoint on session.status with type=busy", async () => {
     const { plugin, calls } = await loadPlugin();
-    await plugin.event!({ event: { type: "session.idle", properties: { sessionID: "s9" } } as any });
-    await plugin.event!({ event: { type: "session.idle", properties: { sessionID: "s9" } } as any });
+    await plugin.event!({
+      event: {
+        type: "session.status",
+        properties: { sessionID: "s8b", status: { type: "busy" } },
+      } as any,
+    });
+    const checkpoint = calls.find((c) => c.url.endsWith("/agentmemory/session/checkpoint"));
+    expect(checkpoint).toBeUndefined();
+  });
+
+  it("ignores the deprecated session.idle event (server-side debounce handles late v1 emissions)", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await plugin.event!({
+      event: { type: "session.idle", properties: { sessionID: "s9" } } as any,
+    });
+    const checkpoints = calls.filter((c) => c.url.endsWith("/agentmemory/session/checkpoint"));
+    expect(checkpoints.length).toBe(0);
+  });
+
+  it("fires /session/checkpoint on every session.status idle (server applies the 10-min debounce)", async () => {
+    const { plugin, calls } = await loadPlugin();
+    const evt = {
+      event: {
+        type: "session.status",
+        properties: { sessionID: "s9b", status: { type: "idle" } },
+      } as any,
+    };
+    await plugin.event!(evt);
+    await plugin.event!(evt);
     const checkpoints = calls.filter((c) => c.url.endsWith("/agentmemory/session/checkpoint"));
     expect(checkpoints.length).toBe(2);
   });

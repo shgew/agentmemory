@@ -256,14 +256,11 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         }
       }
 
-      // ── session.idle ── (distinct v1 bus event; also debounced for safety)
-      if (type === "session.idle") {
-        const sid = props.sessionID || activeSessionId;
-        if (sid) {
-          await post("/session/checkpoint", { sessionId: sid });
-        }
-      }
-
+      // session.idle (the deprecated v1 bus event) intentionally not handled.
+      // SessionStatus.set() publishes session.status first, then session.idle;
+      // both fire on the same idle transition. session.status is the typed v2
+      // superset (idle/busy/retry). We listen only to session.status to avoid
+      // duplicate /session/checkpoint POSTs.
       // ── session.status ──
       if (type === "session.status") {
         const status = props.status as Record<string, unknown> | undefined;
