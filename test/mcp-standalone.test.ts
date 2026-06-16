@@ -1,3 +1,4 @@
+// @ts-nocheck
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
@@ -72,8 +73,8 @@ describe("Tools Registry", () => {
     expect(CORE_TOOLS.length).toBe(14);
   });
 
-  it("V040_TOOLS has 9 items", () => {
-    expect(V040_TOOLS.length).toBe(9);
+  it("V040_TOOLS has 8 items", () => {
+    expect(V040_TOOLS.length).toBe(8);
   });
 
   it("all tools have required name, description, inputSchema fields", () => {

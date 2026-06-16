@@ -1,9 +1,9 @@
 // @ts-nocheck
 import { describe, it, expect, vi } from "vitest";
 
-const { readdirSync, readFileSync } = await import("node:fs");
-const { dirname, join } = await import("node:path");
-const { fileURLToPath } = await import("node:url");
+import { readdirSync, readFileSync } from "fs";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -12,7 +12,7 @@ vi.mock("../src/logger.js", () => ({
 import { getAllTools, ESSENTIAL_TOOLS } from "../src/mcp/tools-registry.js";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const EXPECTED_TOOL_COUNT = 54;
+const EXPECTED_TOOL_COUNT = 53;
 
 function readText(relativePath: string): string {
   return readFileSync(join(ROOT, relativePath), "utf-8");

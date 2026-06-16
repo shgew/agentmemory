@@ -355,11 +355,6 @@ export const V040_TOOLS: McpToolDef[] = [
       },
     },
   },
-  {
-    name: "internal_v040_placeholder",
-    description: "Reserved internal registry placeholder.",
-    inputSchema: { type: "object", properties: {} },
-  },
 ];
 
 export const V050_TOOLS: McpToolDef[] = [
