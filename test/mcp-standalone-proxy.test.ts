@@ -167,6 +167,51 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     ]);
   });
 
+  it("forwards project to POST /agentmemory/remember on memory_save (project-drop fix)", async () => {
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    installFetch((url, init) => {
+      if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
+      const body = init?.body ? JSON.parse(init.body as string) : undefined;
+      calls.push({ url, body });
+      if (url.endsWith("/agentmemory/remember")) {
+        return new Response(
+          JSON.stringify({ id: "m-1", project: (body as Record<string, unknown>)?.["project"] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    });
+    await handleToolCall("memory_save", {
+      content: "decision X",
+      type: "architecture",
+      concepts: "a,b",
+      project: "agentmemory",
+    });
+    const rememberCall = calls.find((c) => c.url.endsWith("/agentmemory/remember"));
+    expect(rememberCall).toBeDefined();
+    expect((rememberCall?.body as Record<string, unknown>)?.["project"]).toBe("agentmemory");
+  });
+
+  it("omits project from the remember body when not provided", async () => {
+    const calls: Array<{ url: string; body?: unknown }> = [];
+    installFetch((url, init) => {
+      if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
+      const body = init?.body ? JSON.parse(init.body as string) : undefined;
+      calls.push({ url, body });
+      if (url.endsWith("/agentmemory/remember")) {
+        return new Response(JSON.stringify({ id: "m-2" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      return new Response("not found", { status: 404 });
+    });
+    await handleToolCall("memory_save", { content: "no project here" });
+    const rememberCall = calls.find((c) => c.url.endsWith("/agentmemory/remember"));
+    expect(rememberCall).toBeDefined();
+    expect(rememberCall?.body).not.toHaveProperty("project");
+  });
+
   it("local fallback returns the same shape as proxy for memory_smart_search", async () => {
     installFetch(() => {
       throw new Error("ECONNREFUSED");
