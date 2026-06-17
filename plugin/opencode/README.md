@@ -157,6 +157,7 @@ Restart OpenCode or open a new session. The plugin auto-captures session lifecyc
 | Event | Hook | agentmemory API |
 |---|---|---|
 | MCP tool registry changed | `mcp.tools.changed` | POST /observe (server) when an active session is tracked |
+| MCP browser open failed | `mcp.browser.open.failed` | POST /observe (mcp_name, url) when an active session is tracked |
 
 ### Terminal (PTY) lifecycle
 
@@ -164,6 +165,12 @@ Restart OpenCode or open a new session. The plugin auto-captures session lifecyc
 |---|---|---|
 | PTY created | `pty.created` | POST /observe (pty_id, title, command, args, cwd, status, pid) when an active session is tracked |
 | PTY exited | `pty.exited` | POST /observe (pty_id, exit_code) when an active session is tracked |
+
+### Installation lifecycle
+
+| Event | Hook | agentmemory API |
+|---|---|---|
+| Update available | `installation.update-available` | POST /observe (version) when an active session is tracked |
 
 ### Model and config
 
