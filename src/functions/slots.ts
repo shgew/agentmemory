@@ -160,7 +160,16 @@ async function seedDefaults(kv: StateKV): Promise<void> {
   for (const tmpl of DEFAULT_SLOTS) {
     const target = scopeKv(tmpl.scope);
     const existing = await kv.get<MemorySlot>(target, tmpl.label);
-    if (existing) continue;
+    if (existing) {
+      if (existing.pinned !== tmpl.pinned) {
+        await kv.set(target, tmpl.label, {
+          ...existing,
+          pinned: tmpl.pinned,
+          updatedAt: ts,
+        });
+      }
+      continue;
+    }
     const slot: MemorySlot = {
       ...tmpl,
       createdAt: ts,
