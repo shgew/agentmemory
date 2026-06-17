@@ -678,9 +678,9 @@ export function registerApiTriggers(
   });
 
   sdk.registerFunction("api::session-sweep",
-    async (req: ApiRequest<{ dryRun?: boolean; maxAgeMs?: number; sessionIds?: string[] }>): Promise<Response> => {
+    async (req: ApiRequest<{ dryRun?: boolean; maxAgeMs?: number; sessionIds?: string[]; mode?: "finalize" | "idle-checkpoint" }>): Promise<Response> => {
       const body = (req.body ?? {}) as Record<string, unknown>;
-      const payload: { dryRun?: boolean; maxAgeMs?: number; sessionIds?: string[] } = {};
+      const payload: { dryRun?: boolean; maxAgeMs?: number; sessionIds?: string[]; mode?: "finalize" | "idle-checkpoint" } = {};
       if (body.dryRun !== undefined) {
         if (typeof body.dryRun !== "boolean") {
           return { status_code: 400, body: { error: "dryRun must be a boolean" } };
@@ -701,6 +701,12 @@ export function registerApiTriggers(
           return { status_code: 400, body: { error: "sessionIds must be an array of non-empty strings" } };
         }
         payload.sessionIds = body.sessionIds as string[];
+      }
+      if (body.mode !== undefined) {
+        if (body.mode !== "finalize" && body.mode !== "idle-checkpoint") {
+          return { status_code: 400, body: { error: "mode must be 'finalize' or 'idle-checkpoint'" } };
+        }
+        payload.mode = body.mode;
       }
       const result = await sdk.trigger({
         function_id: "mem::session-sweep",

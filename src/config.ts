@@ -350,6 +350,21 @@ export function getFollowupWindowSeconds(): number {
   );
 }
 
+const IDLE_CHECKPOINT_MS_DEFAULT = 600_000;
+
+export function getIdleCheckpointMs(): number {
+  const env = getMergedEnv();
+  const idle = env["AGENTMEMORY_IDLE_CHECKPOINT_MS"];
+  const raw =
+    idle !== undefined && idle.trim() !== ""
+      ? idle
+      : env["AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS"];
+  if (raw === undefined || raw.trim() === "") return IDLE_CHECKPOINT_MS_DEFAULT;
+  const parsed = parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return IDLE_CHECKPOINT_MS_DEFAULT;
+  return parsed;
+}
+
 export function isConsolidationEnabled(): boolean {
   const env = getMergedEnv();
   const explicit = env["CONSOLIDATION_ENABLED"];

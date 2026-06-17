@@ -1476,36 +1476,46 @@ Create `~/.agentmemory/.env`:
                                           # first; bump the yaml or use the event-
                                           # driven path (session.stopped pipeline).
 
-# Session-checkpoint debounce
-# AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS=600000  # Default: 600 000 ms (10 min). Minimum
-                                          # wall-clock interval between two
-                                          # consolidations of the SAME active
-                                          # session. When a client POSTs
-                                          # /agentmemory/session/checkpoint within
-                                          # this window of the prior checkpoint,
-                                          # mem::session::checkpoint returns
-                                          # `{ success: true, throttled: true,
-                                          # retryAfterMs }` without firing
-                                          # event::session::checkpoint or advancing
-                                          # lastCheckpointAt. The watermark no-op
-                                          # guard (skip when nothing changed since
-                                          # last checkpoint) still runs first;
-                                          # debounce only gates calls where there
-                                          # IS new activity but the previous
-                                          # consolidation is too recent. Set 0 to
-                                          # disable (legacy pre-debounce behavior:
-                                          # every activity-bearing POST fires a
-                                          # full summarize + graph-extract chain).
-                                          # Designed for OpenCode-shaped clients where
-                                          # the plugin posts /session/checkpoint on every
-                                          # `session.status` (idle) transition (canonical
-                                          # v2 signal; the deprecated `session.idle` v1
-                                          # event is intentionally not handled). The
-                                          # throttle keeps a live session from
-                                          # re-summarizing every few seconds between
-                                          # background agent waves while still
-                                          # consolidating eventually via the next eligible
-                                          # POST or the session-sweep cron.
+# Session-checkpoint idle window + poll
+# AGENTMEMORY_IDLE_CHECKPOINT_MS=600000   # Default: 600 000 ms (10 min). Trailing-edge
+                                          # idle threshold. A session is consolidated
+                                          # only after it has had NO new activity for
+                                          # this long; any new observation resets the
+                                          # countdown (measured from session.updatedAt,
+                                          # which mem::observe bumps on every captured
+                                          # event). The reactive
+                                          # /agentmemory/session/checkpoint POST fires
+                                          # event::session::checkpoint only when
+                                          # now - updatedAt >= this window; since an idle
+                                          # POST lands right after activity it almost
+                                          # never fires reactively, so the background
+                                          # idle-checkpoint poll (below) is the de-facto
+                                          # trigger. Set 0 to disable the gate (eager:
+                                          # every activity-bearing POST consolidates, a
+                                          # load footgun on weak LLMs). The watermark
+                                          # no-op guard (skip when nothing changed since
+                                          # lastCheckpointAt) still runs first.
+                                          # Per-session and server-side only; the plugin
+                                          # never debounces client-side.
+# AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS=600000  # Back-compat alias for
+                                          # AGENTMEMORY_IDLE_CHECKPOINT_MS. Honored only
+                                          # when AGENTMEMORY_IDLE_CHECKPOINT_MS is unset,
+                                          # and now carries the same trailing-edge
+                                          # semantics (NOT the old leading-edge minimum
+                                          # interval between consolidations). =0 opts
+                                          # back into eager firing.
+# AGENTMEMORY_IDLE_CHECKPOINT_POLL_MS=180000  # Default: 180 000 ms (3 min). Interval of
+                                          # the background poll that scans active
+                                          # sessions and fires a checkpoint-only
+                                          # consolidation for any idle past the
+                                          # threshold (keeps status=active, never marks
+                                          # done). Resuming work bumps updatedAt so the
+                                          # next poll skips the session.
+# AGENTMEMORY_IDLE_CHECKPOINT_ENABLED=true  # Default on. Set "false" to disable the
+                                          # background idle-checkpoint poll. The 6h
+                                          # session-sweep (SESSION_SWEEP_*) still
+                                          # finalizes truly-abandoned sessions
+                                          # (status=completed) regardless of this flag.
 
 # MCP shim (@agentmemory/mcp) proxy call timeouts
 # AGENTMEMORY_MCP_CALL_TIMEOUT_MS=15000   # Default: 15 000 ms (15 s). Caps each

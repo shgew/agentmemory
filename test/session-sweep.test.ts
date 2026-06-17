@@ -845,3 +845,241 @@ describe("Session Sweep - summarize success:false handling", () => {
     expect(stored?.status).toBe("completed");
   });
 });
+
+
+describe("Session Sweep - idle-checkpoint mode + finalize decouple", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    registerSessionSweepFunction(sdk as never, kv as never);
+    registerEventTriggers(sdk as never, kv as never);
+    sdk.registerFunction("mem::summarize", async () => ({ success: true }));
+    sdk.registerFunction("mem::slot-reflect", async () => ({ success: true }));
+    sdk.registerFunction("mem::graph-extract", async () => ({ success: true }));
+  });
+
+  it("finalize marks an idle-checkpointed-then-abandoned active session done WITHOUT firing stopped", async () => {
+    const anchor = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_decouple_noop",
+      startedAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+      updatedAt: anchor,
+      lastCheckpointAt: anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_decouple_noop", session);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    })) as { swept: string[]; skipped: string[] };
+
+    expect(result.swept).toContain("ses_decouple_noop");
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_decouple_noop");
+    expect(stored?.status).toBe("completed");
+    expect(stored?.endedAt).toBeDefined();
+    const stopped = sdk.triggerCalls.filter(
+      (c) => c.function_id === "event::session::stopped",
+    );
+    expect(stopped).toHaveLength(0);
+  });
+
+  it("finalize consolidates AND marks done when an active session has new activity since last checkpoint", async () => {
+    const t1 = new Date(Date.now() - 9 * 60 * 60 * 1000).toISOString();
+    const t2 = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_decouple_delta",
+      startedAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+      updatedAt: t2,
+      lastCheckpointAt: t1,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_decouple_delta", session);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    })) as { swept: string[] };
+
+    expect(result.swept).toContain("ses_decouple_delta");
+    const stopped = sdk.triggerCalls.filter(
+      (c) => c.function_id === "event::session::stopped",
+    );
+    expect(stopped).toHaveLength(1);
+    expect((stopped[0].payload as { sessionId: string }).sessionId).toBe("ses_decouple_delta");
+    expect((stopped[0].payload as { until: string }).until).toBe(t2);
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_decouple_delta");
+    expect(stored?.status).toBe("completed");
+    expect(stored?.lastCheckpointAt).toBe(t2);
+  });
+
+  it("idle-checkpoint mode fires event::session::checkpoint and KEEPS the session active", async () => {
+    const anchor = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_idle",
+      startedAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+      updatedAt: anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_idle", session);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { mode: "idle-checkpoint", maxAgeMs: 600000 },
+    })) as { swept: string[]; checkpointed: string[] };
+
+    expect(result.checkpointed).toContain("ses_idle");
+    expect(result.swept).not.toContain("ses_idle");
+    const checkpoint = sdk.triggerCalls.filter(
+      (c) => c.function_id === "event::session::checkpoint",
+    );
+    expect(checkpoint).toHaveLength(1);
+    expect((checkpoint[0].payload as { reason: string }).reason).toBe("idle-checkpoint");
+    expect((checkpoint[0].payload as { until: string }).until).toBe(anchor);
+    const stopped = sdk.triggerCalls.filter(
+      (c) => c.function_id === "event::session::stopped",
+    );
+    expect(stopped).toHaveLength(0);
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_idle");
+    expect(stored?.status).toBe("active");
+    expect(stored?.endedAt).toBeUndefined();
+    expect(stored?.lastCheckpointAt).toBe(anchor);
+  });
+
+  it("idle-checkpoint mode is idempotent: a freshly idle-checkpointed session is skipped", async () => {
+    const anchor = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_idle_idem",
+      startedAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+      updatedAt: anchor,
+      lastCheckpointAt: anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_idle_idem", session);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { mode: "idle-checkpoint", maxAgeMs: 600000 },
+    })) as { checkpointed: string[]; skipped: string[] };
+
+    expect(result.checkpointed).not.toContain("ses_idle_idem");
+    expect(result.skipped).toContain("ses_idle_idem");
+    const checkpoint = sdk.triggerCalls.filter(
+      (c) => c.function_id === "event::session::checkpoint",
+    );
+    expect(checkpoint).toHaveLength(0);
+  });
+
+  it("idle-checkpoint mode skips sessions younger than the idle threshold", async () => {
+    const anchor = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_idle_young",
+      startedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
+      updatedAt: anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_idle_young", session);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { mode: "idle-checkpoint", maxAgeMs: 600000 },
+    })) as { checkpointed: string[]; skipped: string[] };
+
+    expect(result.checkpointed).not.toContain("ses_idle_young");
+    expect(result.skipped).toContain("ses_idle_young");
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_idle_young");
+    expect(stored?.status).toBe("active");
+  });
+
+  it("idle-checkpoint mode ignores completed sessions (active-only)", async () => {
+    const anchor = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_idle_completed",
+      startedAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+      updatedAt: anchor,
+      status: "completed",
+      endedAt: new Date(Date.now() - 20 * 60 * 1000).toISOString(),
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_idle_completed", session);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { mode: "idle-checkpoint", maxAgeMs: 600000 },
+    })) as { swept: string[]; checkpointed: string[] };
+
+    expect(result.checkpointed).not.toContain("ses_idle_completed");
+    expect(result.swept).not.toContain("ses_idle_completed");
+    const checkpoint = sdk.triggerCalls.filter(
+      (c) => c.function_id === "event::session::checkpoint",
+    );
+    expect(checkpoint).toHaveLength(0);
+  });
+
+  it("idle-checkpoint mode records a session_checkpoint audit", async () => {
+    const anchor = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_idle_audit",
+      startedAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+      updatedAt: anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_idle_audit", session);
+
+    await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { mode: "idle-checkpoint", maxAgeMs: 600000 },
+    });
+
+    const audits = await kv.list<AuditEntry>(AUDIT_SCOPE);
+    const cp = audits.filter((e) => e.operation === "session_checkpoint");
+    expect(cp.length).toBeGreaterThan(0);
+    expect(cp.some((e) => e.targetIds.includes("ses_idle_audit"))).toBe(true);
+  });
+
+  it("idle-checkpoint dryRun reports checkpointed without writing KV or firing triggers", async () => {
+    const anchor = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_idle_dry",
+      startedAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+      updatedAt: anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_idle_dry", session);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { mode: "idle-checkpoint", maxAgeMs: 600000, dryRun: true },
+    })) as { swept: string[]; checkpointed: string[]; dryRun: boolean };
+
+    expect(result.checkpointed).toContain("ses_idle_dry");
+    expect(result.swept).not.toContain("ses_idle_dry");
+    expect(result.dryRun).toBe(true);
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_idle_dry");
+    expect(stored?.status).toBe("active");
+    expect(stored?.lastCheckpointAt).toBeUndefined();
+    const checkpoint = sdk.triggerCalls.filter(
+      (c) => c.function_id === "event::session::checkpoint",
+    );
+    expect(checkpoint).toHaveLength(0);
+  });
+
+  it("idle-checkpoint sweep: crashing summarize leaves lastCheckpointAt unchanged and routes session to failed", async () => {
+    sdk.registerFunction("mem::summarize", async () => {
+      throw new Error("simulated pipeline failure");
+    });
+    const anchor = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+    const session = makeSession({
+      id: "ses_idle_crash",
+      startedAt: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
+      updatedAt: anchor,
+    });
+    await kv.set(SESSIONS_SCOPE, "ses_idle_crash", session);
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { mode: "idle-checkpoint", maxAgeMs: 600000, sessionIds: ["ses_idle_crash"] },
+    })) as { checkpointed: string[]; failed: Array<{ sessionId: string; error: string }> };
+
+    expect(result.checkpointed).not.toContain("ses_idle_crash");
+    expect(result.failed.map((f) => f.sessionId)).toContain("ses_idle_crash");
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_idle_crash");
+    expect(stored?.status).toBe("active");
+    expect(stored?.lastCheckpointAt).toBeUndefined();
+  });
+});

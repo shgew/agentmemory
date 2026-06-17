@@ -200,14 +200,14 @@ System prompt = [OpenCode instructions] + [memory context] + [file enrichment] +
 
 The plugin is built to survive busy sessions, slow networks, and unattended shutdowns.
 
-### Server-side deduplication and debounce
+### Server-side deduplication and trailing-edge idle checkpoint
 
-`/session/checkpoint` is idempotent on the server with two gates in order:
+`/session/checkpoint` is idempotent on the server. Consolidation timing is trailing-edge and lives entirely server-side - the plugin posts unconditionally on idle, compaction, and dispose, and never debounces client-side (a client can close mid-window and lose the work to the daily sweep).
 
 1. **Watermark no-op**: when nothing has been observed since `lastCheckpointAt`, the server returns `{ noOp: true }` and skips consolidation.
-2. **Time debounce**: when there IS new activity but the previous consolidation fired less than `AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS` ago (default 10 min), the server returns `{ throttled: true, retryAfterMs }` without firing summarize + graph-extract and without advancing `lastCheckpointAt`. Set the env var to `0` to disable and restore the pre-debounce behavior where every activity-bearing POST consolidates.
+2. **Trailing-edge idle gate**: the reactive POST fires `event::session::checkpoint` only when `now - updatedAt >= AGENTMEMORY_IDLE_CHECKPOINT_MS` (default 10 min; `AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS` is honored as a back-compat alias). Because an idle POST lands right after activity, `updatedAt` is fresh and the reactive path almost always returns `{ throttled: true, retryAfterMs }` without consolidating. Any new observation bumps `updatedAt` and resets the countdown. Set the threshold to `0` to disable the gate (eager: every activity-bearing POST consolidates).
 
-The plugin posts unconditionally on idle, compaction, and dispose. The server remains the single source of truth - the throttle protects busy sessions (e.g. waiting on background agents) from re-summarizing every few seconds while still consolidating on the next eligible POST or via the session-sweep cron.
+The de-facto trigger is a server-side **idle-checkpoint poll** (every `AGENTMEMORY_IDLE_CHECKPOINT_POLL_MS`, default 3 min, gated by `AGENTMEMORY_IDLE_CHECKPOINT_ENABLED`): it consolidates each active session idle past the threshold and keeps it `active`. Marking a session done is reserved for the 6h `session-sweep` (truly abandoned sessions) and explicit `session.deleted` -> `/session/end`. This keeps a weak single-slot LLM from re-summarizing on every idle while still consolidating once per genuine quiet period, per session.
 
 ### HTTPS guard
 

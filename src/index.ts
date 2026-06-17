@@ -12,6 +12,7 @@ import {
   isConsolidationEnabled,
   isContextInjectionEnabled,
   isDropStaleIndexEnabled,
+  getIdleCheckpointMs,
 } from "./config.js";
 import {
   createProvider,
@@ -650,6 +651,33 @@ async function main() {
         `Session sweep: enabled (cron "${sessionSweepCronExpr}", first run at ${firstSessionSweepAt.toLocaleString()}, threshold ${sessionSweepMaxAgeMs / 3600000}h)`,
       );
     }
+  }
+
+  const idleThresholdMs = getIdleCheckpointMs();
+  if (
+    process.env.AGENTMEMORY_IDLE_CHECKPOINT_ENABLED !== "false" &&
+    idleThresholdMs > 0
+  ) {
+    const idleCheckpointPollParsed = parseInt(
+      process.env.AGENTMEMORY_IDLE_CHECKPOINT_POLL_MS || "",
+      10,
+    );
+    const idleCheckpointPollMs =
+      Number.isFinite(idleCheckpointPollParsed) && idleCheckpointPollParsed > 0
+        ? idleCheckpointPollParsed
+        : 180_000;
+    const idleCheckpointTimer = setInterval(async () => {
+      try {
+        await sdk.trigger({
+          function_id: "mem::session-sweep",
+          payload: { mode: "idle-checkpoint", maxAgeMs: idleThresholdMs },
+        });
+      } catch {}
+    }, idleCheckpointPollMs);
+    idleCheckpointTimer.unref();
+    bootLog(
+      `Idle-checkpoint poll: enabled (every ${idleCheckpointPollMs / 60000}m, idle threshold ${idleThresholdMs / 60000}m)`,
+    );
   }
 
   const shutdown = async () => {
