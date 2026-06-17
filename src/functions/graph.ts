@@ -441,19 +441,23 @@ function parseGraphXml(
     addEntity(match[1], match[2]);
   }
 
-  const relRegex = /<relationship\b([^>]*?)\/>/g;
-  while ((match = relRegex.exec(xml)) !== null) {
-    const attrs = parseAttrs(match[1]);
+  const nodeByNormName = new Map<string, GraphNode>();
+  for (const n of nodes) {
+    const key = n.name.trim().toLowerCase();
+    if (!nodeByNormName.has(key)) nodeByNormName.set(key, n);
+  }
+
+  const addRelationship = (rawAttrs: string): void => {
+    const attrs = parseAttrs(rawAttrs);
     const type = attrs["type"] as GraphEdge["type"] | undefined;
     const sourceName = attrs["source"];
     const targetName = attrs["target"];
-    if (!type || !sourceName || !targetName) continue;
+    if (!type || !sourceName || !targetName) return;
+    const sourceNode = nodeByNormName.get(sourceName.trim().toLowerCase());
+    const targetNode = nodeByNormName.get(targetName.trim().toLowerCase());
+    if (!sourceNode || !targetNode) return;
     const parsedWeight = parseFloat(attrs["weight"] ?? "");
     const weight = Number.isFinite(parsedWeight) ? parsedWeight : 0.5;
-
-    const sourceNode = nodes.find((n) => n.name === sourceName);
-    const targetNode = nodes.find((n) => n.name === targetName);
-    if (!sourceNode || !targetNode) continue;
     edges.push({
       id: generateId("ge"),
       type,
@@ -463,6 +467,15 @@ function parseGraphXml(
       sourceObservationIds: observationIds,
       createdAt: now,
     });
+  };
+
+  const relSelfClose = /<relationship\b([^>]*?)\/>/g;
+  while ((match = relSelfClose.exec(xml)) !== null) {
+    addRelationship(match[1]);
+  }
+  const relWithBody = /<relationship\b([^>]*[^/])>[\s\S]*?<\/relationship>/g;
+  while ((match = relWithBody.exec(xml)) !== null) {
+    addRelationship(match[1]);
   }
 
   return { nodes, edges };
