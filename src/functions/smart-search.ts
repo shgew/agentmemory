@@ -5,6 +5,8 @@ import type {
   CompressedObservation,
   HybridSearchResult,
   Lesson,
+  Memory,
+  Session,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -192,9 +194,12 @@ export function registerSmartSearchFunction(
       // is a defensible middle ground: enough headroom for a small
       // workload, capped at 300 so a 100-limit request never asks for
       // thousands of hits.
-      const overFetchLimit = filterAgentId
-        ? Math.min(limit * 3, 300)
-        : limit;
+      const projectFilter =
+        typeof data.project === "string" && data.project.trim().length > 0
+          ? data.project.trim()
+          : undefined;
+      const overFetchLimit =
+        filterAgentId || projectFilter ? Math.min(limit * 3, 300) : limit;
 
       const [hybridResults, lessons] = await Promise.all([
         searchFn(data.query, overFetchLimit),
@@ -203,11 +208,42 @@ export function registerSmartSearchFunction(
           : Promise.resolve([]),
       ]);
 
-      const filteredHybrid = filterAgentId
-        ? hybridResults
-            .filter((r) => r.observation.agentId === filterAgentId)
-            .slice(0, limit)
-        : hybridResults.slice(0, limit);
+      const agentScoped = filterAgentId
+        ? hybridResults.filter((r) => r.observation.agentId === filterAgentId)
+        : hybridResults;
+
+      let projectScoped = agentScoped;
+      if (projectFilter) {
+        const uniqueSessionIds = [
+          ...new Set(agentScoped.map((r) => r.sessionId)),
+        ];
+        const sessionProjects = new Map<string, string | null>();
+        await Promise.all(
+          uniqueSessionIds.map(async (sid) => {
+            const s = await kv
+              .get<Session>(KV.sessions, sid)
+              .catch(() => null);
+            sessionProjects.set(sid, s?.project ?? null);
+          }),
+        );
+        const resolved = await Promise.all(
+          agentScoped.map(async (r) => {
+            const sessionProject = sessionProjects.get(r.sessionId) ?? null;
+            if (sessionProject !== null) return { r, project: sessionProject };
+            const mem = await kv
+              .get<Memory>(KV.memories, r.observation.id)
+              .catch(() => null);
+            return { r, project: mem?.project ?? null };
+          }),
+        );
+        projectScoped = resolved
+          .filter(
+            ({ project }) => project === null || project === projectFilter,
+          )
+          .map(({ r }) => r);
+      }
+
+      const filteredHybrid = projectScoped.slice(0, limit);
 
       const compact: CompactSearchResult[] = filteredHybrid.map((r) => ({
         obsId: r.observation.id,
