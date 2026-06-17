@@ -350,3 +350,63 @@ describe("OpenCode plugin behavior: resumed-session re-injection", () => {
     expect(resumeStart).toBeUndefined();
   });
 });
+
+describe("OpenCode plugin behavior: injected instructions document slot tooling (P1)", () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
+
+  it("first system.transform injection lists slot tools and the pending_items loop", async () => {
+    const { plugin } = await loadPlugin();
+    await plugin.event!({
+      event: { type: "session.created", properties: { info: { id: "s-p1" } } } as any,
+    });
+    const out = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!(
+      { sessionID: "s-p1" } as any,
+      out as any,
+    );
+    const injected = out.system.join("\n");
+    expect(injected).toMatch(/memory_slot_list/);
+    expect(injected).toMatch(/memory_slot_get/);
+    expect(injected).toMatch(/memory_slot_append/);
+    expect(injected).toMatch(/memory_slot_replace/);
+    expect(injected).toMatch(/pending_items/);
+  });
+});
+
+describe("OpenCode plugin behavior: re-injects memory context after compaction (P4)", () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
+
+  it("session.compacted clears the injected flag so the next transform re-injects", async () => {
+    const { plugin } = await loadPlugin();
+    await plugin.event!({
+      event: { type: "session.created", properties: { info: { id: "s-p4" } } } as any,
+    });
+
+    const out1 = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!(
+      { sessionID: "s-p4" } as any,
+      out1 as any,
+    );
+    expect(out1.system.length).toBeGreaterThan(0);
+
+    const out2 = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!(
+      { sessionID: "s-p4" } as any,
+      out2 as any,
+    );
+    expect(out2.system.length).toBe(0);
+
+    await plugin.event!({
+      event: { type: "session.compacted", properties: { sessionID: "s-p4" } } as any,
+    });
+
+    const out3 = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!(
+      { sessionID: "s-p4" } as any,
+      out3 as any,
+    );
+    expect(out3.system.length).toBeGreaterThan(0);
+  });
+});
