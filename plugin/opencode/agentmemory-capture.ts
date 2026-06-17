@@ -127,6 +127,17 @@ function stashFor(sid: string): Set<string> {
   return s;
 }
 
+function addToStash(sid: string, file: string | null | undefined): void {
+  if (typeof file !== "string" || file.length === 0) return;
+  const stash = stashFor(sid);
+  stash.add(file);
+  if (stash.size > MAX_STASHED_FILES) {
+    const keep = [...stash].slice(-MAX_STASHED_FILES);
+    stash.clear();
+    for (const f of keep) stash.add(f);
+  }
+}
+
 function subtaskSetFor(sid: string): Set<string> {
   let s = seenSubtaskIds.get(sid);
   if (!s) { s = new Set<string>(); seenSubtaskIds.set(sid, s); }
@@ -615,7 +626,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
 
         if (part.type === "file") {
           const filename = part.filename || part.url || null;
-          if (filename) stashFor(sid).add(filename);
+          addToStash(sid, filename);
           return;
         }
 
@@ -658,13 +669,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
       if (event.type === "file.edited") {
         const sid = (event.properties as SessionIdPayload).sessionID ?? activeSessionId;
         if (sid && typeof event.properties.file === "string" && event.properties.file.length > 0) {
-          const stash = stashFor(sid);
-          stash.add(event.properties.file);
-          if (stash.size > MAX_STASHED_FILES) {
-            const keep = [...stash].slice(-MAX_STASHED_FILES);
-            stash.clear();
-            for (const f of keep) stash.add(f);
-          }
+          addToStash(sid, event.properties.file);
         }
       }
 
@@ -879,6 +884,23 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
           exit_code: event.properties.exitCode,
         });
       }
+
+      if (event.type === "mcp.browser.open.failed") {
+        const sid = activeSessionId;
+        if (!sid) return;
+        await observe(sid, "mcp_browser_open_failed", {
+          mcp_name: event.properties.mcpName,
+          url: safeSlice(event.properties.url, 2000),
+        });
+      }
+
+      if (event.type === "installation.update-available") {
+        const sid = activeSessionId;
+        if (!sid) return;
+        await observe(sid, "installation_update_available", {
+          version: event.properties.version,
+        });
+      }
     },
 
     // ── chat.message ──
@@ -891,13 +913,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         .map((p) => p.filename || p.url)
         .filter((file): file is string => typeof file === "string" && file.length > 0);
       for (const f of files) {
-        const stash = stashFor(sid);
-        stash.add(f);
-        if (stash.size > MAX_STASHED_FILES) {
-          const keep = [...stash].slice(-MAX_STASHED_FILES);
-          stash.clear();
-          for (const k of keep) stash.add(k);
-        }
+        addToStash(sid, f);
       }
 
       const textParts = parts.filter((p): p is Extract<Part, { type: "text" }> => p.type === "text" && !p.synthetic && !p.ignored);
@@ -938,14 +954,8 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
       if (!sid) return;
       const args = output.args as Record<string, unknown> | undefined;
       if (!args) return;
-      const stash = stashFor(sid);
       for (const fp of extractFilePaths(args)) {
-        stash.add(fp);
-      }
-      if (stash.size > MAX_STASHED_FILES) {
-        const keep = [...stash].slice(-MAX_STASHED_FILES);
-        stash.clear();
-        for (const f of keep) stash.add(f);
+        addToStash(sid, fp);
       }
     },
 

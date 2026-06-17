@@ -508,6 +508,69 @@ describe("OpenCode plugin behavior: pty.exited", () => {
   });
 });
 
+describe("OpenCode plugin behavior: mcp.browser.open.failed", () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
+
+  it("captures mcp_name and url when an active session exists", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await createActiveSession(plugin, calls, "s_new_mcp_browser");
+    await plugin.event!({
+      event: {
+        type: "mcp.browser.open.failed",
+        properties: { mcpName: "playwright", url: "https://example.com/oauth" },
+      } as any,
+    });
+    const observe = findObserve(calls, "mcp_browser_open_failed");
+    expect(observe).toBeDefined();
+    expect(observe!.body.sessionId).toBe("s_new_mcp_browser");
+    expect(observe!.body.data.mcp_name).toBe("playwright");
+    expect(observe!.body.data.url).toBe("https://example.com/oauth");
+  });
+
+  it("does not observe without an active session", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await plugin.event!({
+      event: {
+        type: "mcp.browser.open.failed",
+        properties: { mcpName: "playwright", url: "https://example.com" },
+      } as any,
+    });
+    expect(findObserve(calls, "mcp_browser_open_failed")).toBeUndefined();
+  });
+});
+
+describe("OpenCode plugin behavior: installation.update-available", () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
+
+  it("captures version when an active session exists", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await createActiveSession(plugin, calls, "s_new_install_update");
+    await plugin.event!({
+      event: {
+        type: "installation.update-available",
+        properties: { version: "1.18.0" },
+      } as any,
+    });
+    const observe = findObserve(calls, "installation_update_available");
+    expect(observe).toBeDefined();
+    expect(observe!.body.sessionId).toBe("s_new_install_update");
+    expect(observe!.body.data.version).toBe("1.18.0");
+  });
+
+  it("does not observe without an active session", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await plugin.event!({
+      event: {
+        type: "installation.update-available",
+        properties: { version: "1.18.0" },
+      } as any,
+    });
+    expect(findObserve(calls, "installation_update_available")).toBeUndefined();
+  });
+});
+
 describe("OpenCode plugin behavior: file stash invariants", () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(async () => { await teardownPlugin(); });

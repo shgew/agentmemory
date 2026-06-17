@@ -39,6 +39,8 @@ const EVENT_BRANCHES = [
   "mcp.tools.changed",
   "pty.created",
   "pty.exited",
+  "mcp.browser.open.failed",
+  "installation.update-available",
 ] as const;
 
 const TYPED_HOOKS = [
