@@ -4,7 +4,7 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { registerGraphFunction, getGraphExtractTimeoutMs } from "../src/functions/graph.js";
+import { registerGraphFunction, getGraphExtractTimeoutMs, getGraphChunkSize, getGraphChunkConcurrency } from "../src/functions/graph.js";
 import type {
   CompressedObservation,
   GraphNode,
@@ -890,5 +890,133 @@ describe("parseGraphXml relation resolution", () => {
 
     const edges = await kv.list<GraphEdge>("mem:graph:edges");
     expect(edges).toHaveLength(0);
+  });
+});
+
+describe("mem::graph-extract chunking", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+  const ORIGINAL_ENV = { ...process.env };
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    vi.clearAllMocks();
+    delete process.env.GRAPH_CHUNK_SIZE;
+    delete process.env.GRAPH_CHUNK_CONCURRENCY;
+    registerGraphFunction(sdk as never, kv as never, mockProvider as never);
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  function obs(id: string): CompressedObservation {
+    return { ...testObs, id, title: `obs ${id}` };
+  }
+
+  it("splits a large observation set into ceil(N / chunkSize) compress calls", async () => {
+    process.env.GRAPH_CHUNK_SIZE = "2";
+    mockProvider.compress.mockResolvedValue(
+      `<entities><entity type="concept" name="C"/></entities><relationships></relationships>`,
+    );
+
+    const observations = ["a", "b", "c", "d", "e"].map(obs);
+    const result = (await sdk.trigger("mem::graph-extract", { observations })) as {
+      success: boolean;
+    };
+
+    expect(result.success).toBe(true);
+    expect(mockProvider.compress).toHaveBeenCalledTimes(3);
+  });
+
+  it("accumulates nodes across chunks with chunk-accurate attribution", async () => {
+    process.env.GRAPH_CHUNK_SIZE = "1";
+    process.env.GRAPH_CHUNK_CONCURRENCY = "1";
+    mockProvider.compress
+      .mockResolvedValueOnce(
+        `<entities><entity type="concept" name="Alpha"/></entities><relationships></relationships>`,
+      )
+      .mockResolvedValueOnce(
+        `<entities><entity type="concept" name="Beta"/></entities><relationships></relationships>`,
+      );
+
+    await sdk.trigger("mem::graph-extract", {
+      observations: [obs("obs_a"), obs("obs_b")],
+    });
+
+    const nodes = await kv.list<GraphNode>("mem:graph:nodes");
+    const alpha = nodes.find((n) => n.name === "Alpha");
+    const beta = nodes.find((n) => n.name === "Beta");
+    expect(alpha?.sourceObservationIds).toEqual(["obs_a"]);
+    expect(beta?.sourceObservationIds).toEqual(["obs_b"]);
+  });
+
+  it("skips a chunk that throws on both attempts and keeps the other chunk's graph", async () => {
+    process.env.GRAPH_CHUNK_SIZE = "1";
+    process.env.GRAPH_CHUNK_CONCURRENCY = "1";
+    mockProvider.compress
+      .mockRejectedValueOnce(new Error("boom"))
+      .mockRejectedValueOnce(new Error("boom"))
+      .mockResolvedValueOnce(
+        `<entities><entity type="concept" name="Survivor"/></entities><relationships></relationships>`,
+      );
+
+    const result = (await sdk.trigger("mem::graph-extract", {
+      observations: [obs("obs_x"), obs("obs_y")],
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    const nodes = await kv.list<GraphNode>("mem:graph:nodes");
+    expect(nodes.some((n) => n.name === "Survivor")).toBe(true);
+  });
+
+  it("returns all_chunks_failed when every chunk throws", async () => {
+    process.env.GRAPH_CHUNK_SIZE = "1";
+    process.env.GRAPH_CHUNK_CONCURRENCY = "1";
+    mockProvider.compress.mockRejectedValue(new Error("provider down"));
+
+    const result = (await sdk.trigger("mem::graph-extract", {
+      observations: [obs("o1"), obs("o2"), obs("o3")],
+    })) as { success: boolean; error?: string };
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("all_chunks_failed");
+  });
+});
+
+describe("getGraphChunkSize / getGraphChunkConcurrency", () => {
+  const ORIGINAL_ENV = { ...process.env };
+  beforeEach(() => {
+    delete process.env.GRAPH_CHUNK_SIZE;
+    delete process.env.GRAPH_CHUNK_CONCURRENCY;
+  });
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  it("getGraphChunkSize defaults to 150 when unset", () => {
+    expect(getGraphChunkSize()).toBe(150);
+  });
+  it("getGraphChunkSize parses a positive override", () => {
+    process.env.GRAPH_CHUNK_SIZE = "60";
+    expect(getGraphChunkSize()).toBe(60);
+  });
+  it("getGraphChunkSize falls back on malformed, zero, or negative", () => {
+    process.env.GRAPH_CHUNK_SIZE = "abc";
+    expect(getGraphChunkSize()).toBe(150);
+    process.env.GRAPH_CHUNK_SIZE = "0";
+    expect(getGraphChunkSize()).toBe(150);
+    process.env.GRAPH_CHUNK_SIZE = "-5";
+    expect(getGraphChunkSize()).toBe(150);
+  });
+  it("getGraphChunkConcurrency defaults to 6 when unset", () => {
+    expect(getGraphChunkConcurrency()).toBe(6);
+  });
+  it("getGraphChunkConcurrency parses an override and falls back otherwise", () => {
+    process.env.GRAPH_CHUNK_CONCURRENCY = "3";
+    expect(getGraphChunkConcurrency()).toBe(3);
+    process.env.GRAPH_CHUNK_CONCURRENCY = "nope";
+    expect(getGraphChunkConcurrency()).toBe(6);
   });
 });

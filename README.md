@@ -1476,6 +1476,21 @@ Create `~/.agentmemory/.env`:
                                           # first; bump the yaml or use the event-
                                           # driven path (session.stopped pipeline).
 
+# Graph-extract chunking
+# GRAPH_CHUNK_SIZE=150                    # Default: 150. When mem::graph-extract
+                                          # sees more observations than this it
+                                          # splits them into chunks, extracts each
+                                          # separately, then merges. A single shot
+                                          # over a ~330-obs session fills a 32K
+                                          # window and yields zero graph; chunking
+                                          # fixes that. Lower to ~60 for 8K-context
+                                          # models.
+# GRAPH_CHUNK_CONCURRENCY=6               # Default: 6. Parallel chunk LLM calls
+                                          # during chunked graph-extract. Actual
+                                          # outbound concurrency is still bounded
+                                          # by AGENTMEMORY_LLM_CONCURRENCY (each
+                                          # task uses its own ResilientProvider).
+
 # Session-checkpoint idle window + poll
 # AGENTMEMORY_IDLE_CHECKPOINT_MS=600000   # Default: 600 000 ms (10 min). Trailing-edge
                                           # idle threshold. A session is consolidated

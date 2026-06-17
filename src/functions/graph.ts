@@ -58,6 +58,28 @@ export function getGraphExtractTimeoutMs(): number {
   return Number.isFinite(n) && n > 0 ? n : GRAPH_EXTRACT_TIMEOUT_MS_DEFAULT;
 }
 
+// Per-chunk observation budget for mem::graph-extract. The graph prompt is
+// denser than summarize (~95 tokens/obs), so a single-shot extract over a
+// large session fills the model window and yields zero output. 150 keeps a
+// chunk well under a 32K window while staying single-call for typical
+// sessions; lower it (e.g. 60) for smaller context windows.
+const GRAPH_CHUNK_SIZE_DEFAULT = 150;
+const GRAPH_CHUNK_CONCURRENCY_DEFAULT = 6;
+
+export function getGraphChunkSize(): number {
+  const raw = process.env.GRAPH_CHUNK_SIZE;
+  if (!raw) return GRAPH_CHUNK_SIZE_DEFAULT;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : GRAPH_CHUNK_SIZE_DEFAULT;
+}
+
+export function getGraphChunkConcurrency(): number {
+  const raw = process.env.GRAPH_CHUNK_CONCURRENCY;
+  if (!raw) return GRAPH_CHUNK_CONCURRENCY_DEFAULT;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : GRAPH_CHUNK_CONCURRENCY_DEFAULT;
+}
+
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const t = setTimeout(
@@ -481,6 +503,34 @@ function parseGraphXml(
   return { nodes, edges };
 }
 
+async function extractChunkWithRetry(
+  provider: MemoryProvider,
+  chunk: CompressedObservation[],
+): Promise<{ nodes: GraphNode[]; edges: GraphEdge[] } | null> {
+  const prompt = buildGraphExtractionPrompt(
+    chunk.map((o) => ({
+      title: o.title,
+      narrative: o.narrative,
+      concepts: o.concepts,
+      files: o.files,
+      type: o.type,
+    })),
+  );
+  const chunkObsIds = chunk.map((o) => o.id);
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const response = await provider.compress(GRAPH_EXTRACTION_SYSTEM, prompt);
+      return parseGraphXml(response, chunkObsIds);
+    } catch (err) {
+      logger.warn("Graph extract chunk failed", {
+        attempt,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return null;
+}
+
 export function registerGraphFunction(
   sdk: ISdk,
   kv: StateKV,
@@ -504,24 +554,76 @@ export function registerGraphFunction(
         return { success: false, error: "No observations in window" };
       }
 
-      const prompt = buildGraphExtractionPrompt(
-        filtered.map((o) => ({
-          title: o.title,
-          narrative: o.narrative,
-          concepts: o.concepts,
-          files: o.files,
-          type: o.type,
-        })),
-      );
-
       try {
-        const response = await provider.compress(
-          GRAPH_EXTRACTION_SYSTEM,
-          prompt,
-        );
-
+        const chunkSize = getGraphChunkSize();
         const obsIds = filtered.map((o) => o.id);
-        const { nodes, edges } = parseGraphXml(response, obsIds);
+        let nodes: GraphNode[] = [];
+        let edges: GraphEdge[] = [];
+
+        if (filtered.length <= chunkSize) {
+          const response = await provider.compress(
+            GRAPH_EXTRACTION_SYSTEM,
+            buildGraphExtractionPrompt(
+              filtered.map((o) => ({
+                title: o.title,
+                narrative: o.narrative,
+                concepts: o.concepts,
+                files: o.files,
+                type: o.type,
+              })),
+            ),
+          );
+          const parsed = parseGraphXml(response, obsIds);
+          nodes = parsed.nodes;
+          edges = parsed.edges;
+        } else {
+          const chunks: CompressedObservation[][] = [];
+          for (let i = 0; i < filtered.length; i += chunkSize) {
+            chunks.push(filtered.slice(i, i + chunkSize));
+          }
+          const concurrency = getGraphChunkConcurrency();
+          logger.info("Graph extract chunking session", {
+            chunks: chunks.length,
+            chunkSize,
+            concurrency,
+            totalObservations: filtered.length,
+          });
+          const resultByIdx: Array<{
+            nodes: GraphNode[];
+            edges: GraphEdge[];
+          } | null> = new Array(chunks.length).fill(null);
+          for (
+            let batchStart = 0;
+            batchStart < chunks.length;
+            batchStart += concurrency
+          ) {
+            const batch = chunks.slice(batchStart, batchStart + concurrency);
+            await Promise.all(
+              batch.map(async (chunk, j) => {
+                resultByIdx[batchStart + j] = await extractChunkWithRetry(
+                  provider,
+                  chunk,
+                );
+              }),
+            );
+          }
+          const skipped = resultByIdx.filter((r) => r === null).length;
+          if (skipped === chunks.length) {
+            return { success: false, error: "all_chunks_failed" };
+          }
+          if (skipped > 0) {
+            logger.warn("Graph extract chunks partially skipped", {
+              skipped,
+              total: chunks.length,
+            });
+          }
+          for (const r of resultByIdx) {
+            if (r) {
+              nodes.push(...r.nodes);
+              edges.push(...r.edges);
+            }
+          }
+        }
 
         // #814 v2: targeted name-index lookups replace the O(n) scan
         // over `kv.list<GraphNode>(KV.graphNodes)`. At 75K nodes the
@@ -560,7 +662,7 @@ export function registerGraphFunction(
           }
 
           if (existing) {
-            const merged = mergeNode(existing, node, obsIds, capturedAt);
+            const merged = mergeNode(existing, node, node.sourceObservationIds, capturedAt);
             await kv.set(KV.graphNodes, existing.id, merged);
             // Update topNodes entry if present so a stale clone isn't
             // returned from the snapshot fast path.
@@ -608,7 +710,7 @@ export function registerGraphFunction(
           }
 
           if (existing) {
-            const merged = mergeEdge(existing, obsIds);
+            const merged = mergeEdge(existing, edge.sourceObservationIds);
             await kv.set(KV.graphEdges, existing.id, merged);
             // Replace cached topEdges entry too if present.
             const topIdx = snap.topEdges.findIndex(
