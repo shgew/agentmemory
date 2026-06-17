@@ -1491,6 +1491,18 @@ Create `~/.agentmemory/.env`:
                                           # by AGENTMEMORY_LLM_CONCURRENCY (each
                                           # task uses its own ResilientProvider).
 
+# Graph-extract model routing
+# AGENTMEMORY_GRAPH_MODEL=                # Optional. Route mem::graph-extract to
+                                          # a different model than summarize (e.g.
+                                          # a relation-native model). Defaults to
+                                          # the active provider's model
+                                          # (OPENAI_MODEL, etc.) when unset. Graph
+                                          # extraction uses its own
+                                          # ResilientProvider instance, so once
+                                          # set, graph and summarize run on
+                                          # separate concurrency limiters and can
+                                          # issue outbound calls in parallel.
+
 # Session-checkpoint idle window + poll
 # AGENTMEMORY_IDLE_CHECKPOINT_MS=600000   # Default: 600 000 ms (10 min). Trailing-edge
                                           # idle threshold. A session is consolidated

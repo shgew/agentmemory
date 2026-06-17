@@ -17,6 +17,7 @@ import {
 import {
   createProvider,
   createFallbackProvider,
+  resolveGraphProviderConfig,
   createEmbeddingProvider,
   createImageEmbeddingProvider,
 } from "./providers/index.js";
@@ -273,8 +274,17 @@ async function main() {
   }
 
   if (isGraphExtractionEnabled()) {
-    registerGraphFunction(sdk, kv, provider);
-    bootLog(`Knowledge graph: extraction enabled`);
+    const graphProviderConfig = resolveGraphProviderConfig(config.provider);
+    const graphProvider =
+      fallbackConfig.providers.length > 0
+        ? createFallbackProvider(graphProviderConfig, fallbackConfig)
+        : createProvider(graphProviderConfig);
+    registerGraphFunction(sdk, kv, graphProvider);
+    bootLog(
+      graphProviderConfig.model === config.provider.model
+        ? `Knowledge graph: extraction enabled`
+        : `Knowledge graph: extraction enabled (graph model ${graphProviderConfig.model})`,
+    );
   }
 
   registerConsolidationPipelineFunction(sdk, kv, provider);
