@@ -294,6 +294,22 @@ memory_patterns — Detect recurring patterns across sessions.
 memory_consolidate — Run the 4-tier memory consolidation pipeline.
   Use when: you want to compress and organize accumulated session observations.
 
+SLOTS (durable cross-session notes):
+
+memory_slot_list: List all memory slots (pinned, project, and global).
+  Use when: resuming work, to see what stable context already exists.
+
+memory_slot_get: Read a single slot by label (pending_items, project_context, user_preferences, ...).
+  Use when: resuming a session. Read pending_items first to recover unfinished work.
+
+memory_slot_append: Append one line to an existing slot.
+  Use when: stopping mid-task. Append a concise line to pending_items describing the unfinished state. Returns 413 if it would exceed the slot size limit; compact via memory_slot_replace first.
+
+memory_slot_replace: Replace a slot's full content in place.
+  Use when: compacting a slot that hit its size limit, or rewriting stale content.
+
+Operating loop: on resume, read pending_items to recover unfinished work; when stopping midstream with real unfinished state, append one concise line to pending_items. Slots are stable anchors, not scratchpads; session-local detail belongs in memory_save or memory_lesson_save.
+
 All memory tools start with \`agentmemory_memory_\`. Use the exact names as they appear in your tool list. Tool results are JSON. Always check what was returned before presenting to the user.
 </agentmemory-instructions>`;
 
@@ -395,6 +411,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
         if (sid) {
           await post("/session/checkpoint", { sessionId: sid });
           await observe(sid, "session_compacted", {});
+          contextInjectedSessions.delete(sid);
         }
       }
 
