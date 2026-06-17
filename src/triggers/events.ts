@@ -97,57 +97,84 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     until?: string;
   }): Promise<unknown> => {
     const { sessionId, since, until } = params;
-    const summary = await sdk.trigger({
-      function_id: "mem::summarize",
-      payload: { sessionId, ...(until ? { until } : {}) },
-      timeoutMs: getSummarizeTimeoutMs(),
-    });
-    if (
-      summary &&
-      typeof summary === "object" &&
-      (summary as { success?: boolean }).success === false
-    ) {
-      const error = (summary as { error?: string }).error ?? "unknown";
-      if (error === "no_provider" || error === "no_observations") {
-        logger.info("Summarize skipped as no-op, pipeline continues", {
-          sessionId,
-          error,
-        });
-      } else {
-        throw new Error(`mem::summarize returned failure: ${error}`);
+    const graphPromise: Promise<void> = isGraphExtractionEnabled()
+      ? (async () => {
+          try {
+            const observations = await kv.list<CompressedObservation>(
+              KV.observations(sessionId),
+            );
+            const compressed = observations.filter((o) => o.title);
+            if (compressed.length > 0) {
+              await sdk.trigger({
+                function_id: "mem::graph-extract",
+                payload: {
+                  observations: compressed,
+                  ...(since ? { since } : {}),
+                  ...(until ? { until } : {}),
+                },
+                timeoutMs: getGraphExtractTimeoutMs(),
+              });
+            }
+          } catch (err) {
+            logger.warn("graph-extract trigger failed", {
+              sessionId,
+              error: errorMessage(err),
+            });
+          }
+        })()
+      : Promise.resolve();
+
+    let summarizeError: Error | null = null;
+    let summary: unknown;
+    try {
+      summary = await sdk.trigger({
+        function_id: "mem::summarize",
+        payload: { sessionId, ...(until ? { until } : {}) },
+        timeoutMs: getSummarizeTimeoutMs(),
+      });
+      if (
+        summary &&
+        typeof summary === "object" &&
+        (summary as { success?: boolean }).success === false
+      ) {
+        const error = (summary as { error?: string }).error ?? "unknown";
+        if (error === "no_provider" || error === "no_observations") {
+          logger.info("Summarize skipped as no-op, pipeline continues", {
+            sessionId,
+            error,
+          });
+        } else {
+          summarizeError = new Error(
+            `mem::summarize returned failure: ${error}`,
+          );
+        }
       }
+    } catch (err) {
+      summarizeError =
+        err instanceof Error ? err : new Error(errorMessage(err));
     }
-    if (isReflectEnabled()) {
+
+    if (!summarizeError && isReflectEnabled()) {
       try {
         await sdk.trigger({
           function_id: "mem::slot-reflect",
-          payload: { sessionId, ...(since ? { since } : {}), ...(until ? { until } : {}) },
+          payload: {
+            sessionId,
+            ...(since ? { since } : {}),
+            ...(until ? { until } : {}),
+          },
         });
       } catch (err) {
-        logger.warn("slot-reflect trigger failed", { sessionId, error: errorMessage(err) });
+        logger.warn("slot-reflect trigger failed", {
+          sessionId,
+          error: errorMessage(err),
+        });
       }
     }
-    if (isGraphExtractionEnabled()) {
-      try {
-        const observations = await kv.list<CompressedObservation>(
-          KV.observations(sessionId),
-        );
-        const compressed = observations.filter((o) => o.title);
-        if (compressed.length > 0) {
-          await sdk.trigger({
-            function_id: "mem::graph-extract",
-            payload: {
-              observations: compressed,
-              ...(since ? { since } : {}),
-              ...(until ? { until } : {}),
-            },
-            timeoutMs: getGraphExtractTimeoutMs(),
-          });
-        }
-      } catch (err) {
-        logger.warn("graph-extract trigger failed", { sessionId, error: errorMessage(err) });
-      }
-    }
+
+    await graphPromise;
+
+    if (summarizeError) throw summarizeError;
     return summary;
   };
 

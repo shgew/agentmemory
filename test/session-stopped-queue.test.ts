@@ -116,10 +116,27 @@ describe("event::session::stopped queue", () => {
     expect(calls.map((call) => call.function_id)).toEqual(
       expect.arrayContaining(["mem::summarize", "mem::graph-extract"]),
     );
-    expect(
-      calls.findIndex((call) => call.function_id === "mem::summarize"),
-    ).toBeLessThan(
-      calls.findIndex((call) => call.function_id === "mem::graph-extract"),
-    );
+  });
+
+  it("runs graph-extract even when summarize hard-fails", async () => {
+    const { registerEventTriggers } = await import("../src/triggers/events.js");
+    const { sdk, calls } = mockSdk();
+    const sessionId = "ses_failfast";
+
+    registerEventTriggers(sdk as never, mockKV(sessionId) as never);
+    sdk.registerFunction("mem::summarize", async () => ({
+      success: false,
+      error: "parse_failed",
+    }));
+    sdk.registerFunction("mem::graph-extract", async () => ({ success: true }));
+
+    await expect(
+      sdk.trigger({
+        function_id: "event::session::stopped",
+        payload: { sessionId, waitForCompletion: true },
+      }),
+    ).rejects.toThrow(/parse_failed/);
+
+    expect(calls.map((c) => c.function_id)).toContain("mem::graph-extract");
   });
 });
