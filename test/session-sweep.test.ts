@@ -285,6 +285,7 @@ describe("Session Sweep Function", () => {
       .map((c) => (c.payload as { sessionId: string }).sessionId)
       .sort();
     expect(ids).toEqual(["ses_a", "ses_b"]);
+    expect(stoppedTriggers.every((c) => (c.payload as { reason?: string }).reason === "sweep-stale")).toBe(true);
 
   });
 
@@ -460,6 +461,7 @@ describe("Session Sweep - Option K checkpoint path", () => {
     expect(checkpointTriggers).toHaveLength(1);
     expect((checkpointTriggers[0].payload as any).since).toBe(day1Anchor);
     expect((checkpointTriggers[0].payload as any).until).toBe(day2Anchor);
+    expect((checkpointTriggers[0].payload as any).reason).toBe("sweep-catchup");
   });
 
   it("S1 - second sweep skips completed session whose activity anchor <= lastCheckpointAt", async () => {

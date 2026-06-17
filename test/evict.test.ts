@@ -144,7 +144,7 @@ describe("mem::evict stale sessions", () => {
 
     registerEvictFunction(sdk as never, kv as never);
     sdk.registerFunction("event::session::stopped", async (payload) => {
-      expect(payload).toEqual({ sessionId, waitForCompletion: true });
+      expect(payload).toEqual({ sessionId, reason: "evict", waitForCompletion: true });
       expect(await kv.get(KV.sessions, sessionId)).toMatchObject({
         id: sessionId,
       });

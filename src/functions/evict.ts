@@ -60,7 +60,7 @@ async function recoverStaleSession(
   try {
     const result = await sdk.trigger({
       function_id: "event::session::stopped",
-      payload: { sessionId, waitForCompletion: true },
+      payload: { sessionId, reason: "evict", waitForCompletion: true },
     });
     if (!isValidRecoveryResult(result)) {
       logger.warn("Stale session recovery failed", {

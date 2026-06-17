@@ -5,6 +5,7 @@ import type { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { isAfter } from "../state/timestamp-compare.js";
 import { recordAudit } from "./audit.js";
+import { logger } from "../logger.js";
 
 interface SessionCheckpointPayload {
   sessionId?: string;
@@ -56,6 +57,7 @@ export function registerSessionCheckpoint(sdk: ISdk, kv: StateKV): void {
 
         const watermark = session.lastCheckpointAt ?? session.endedAt;
         if (watermark !== undefined && !isAfter(anchor, watermark)) {
+          logger.info("Session checkpoint skipped, no new activity since last checkpoint", { sessionId, anchor, watermark });
           return { success: true, noOp: true };
         }
 
@@ -65,15 +67,18 @@ export function registerSessionCheckpoint(sdk: ISdk, kv: StateKV): void {
           if (Number.isFinite(lastMs)) {
             const elapsedMs = Date.now() - lastMs;
             if (elapsedMs < debounceMs) {
+              const retryAfterMs = debounceMs - elapsedMs;
+              logger.info("Session checkpoint throttled by debounce window", { sessionId, retryAfterMs, debounceMs });
               return {
                 success: true,
                 throttled: true,
-                retryAfterMs: debounceMs - elapsedMs,
+                retryAfterMs,
               };
             }
           }
         }
 
+        logger.info("Session checkpoint fired consolidation", { sessionId, since: watermark, until: anchor });
         const result = await sdk.trigger({
           function_id: "event::session::checkpoint",
           payload: {

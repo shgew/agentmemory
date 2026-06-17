@@ -12,7 +12,7 @@ import { getGraphExtractTimeoutMs } from "../functions/graph.js";
 let sessionStoppedQueue: Promise<void> = Promise.resolve();
 let sessionStoppedQueueDepth = 0;
 
-type SessionStoppedPayload = { sessionId: string; since?: string; until?: string; waitForCompletion?: boolean };
+type SessionStoppedPayload = { sessionId: string; since?: string; until?: string; waitForCompletion?: boolean; reason?: string };
 type SessionStoppedQueued = { queued: true; sessionId: string; queueDepth: number };
 type QueuedSessionStopped = SessionStoppedQueued & { done: Promise<unknown> };
 
@@ -22,24 +22,26 @@ function errorMessage(err: unknown): string {
 
 function enqueueSessionStopped(
   sessionId: string,
+  reason: string,
   run: () => Promise<unknown>,
 ): QueuedSessionStopped {
   const queueDepth = ++sessionStoppedQueueDepth;
   const previous = sessionStoppedQueue.catch((err) => {
-    logger.error("Previous session stopped pipeline failed", {
+    logger.error("Previous session consolidation pipeline failed", {
       error: errorMessage(err),
     });
   });
   const done = previous.then(async () => {
-    logger.info("Session stopped pipeline started", { sessionId, queueDepth });
+    logger.info("Session consolidation pipeline started", { sessionId, reason, queueDepth });
     try {
       const result = await run();
-      logger.info("Session stopped pipeline complete", { sessionId });
+      logger.info("Session consolidation pipeline complete", { sessionId, reason });
       return result;
     } catch (err) {
       const error = errorMessage(err);
-      logger.error("Session stopped pipeline failed", {
+      logger.error("Session consolidation pipeline failed", {
         sessionId,
+        reason,
         error,
       });
       throw err;
@@ -150,7 +152,8 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
   };
 
   sdk.registerFunction("event::session::stopped", async (data: SessionStoppedPayload) => {
-    const queued = enqueueSessionStopped(data.sessionId, async () =>
+    const reason = data.reason ?? "stopped";
+    const queued = enqueueSessionStopped(data.sessionId, reason, async () =>
       runSessionConsolidation({ sessionId: data.sessionId, since: data.since, until: data.until }),
     );
     return data.waitForCompletion ? queued.done : {
@@ -166,7 +169,8 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
   });
 
   sdk.registerFunction("event::session::checkpoint", async (data: SessionStoppedPayload) => {
-    const queued = enqueueSessionStopped(data.sessionId, async () =>
+    const reason = data.reason ?? "checkpoint";
+    const queued = enqueueSessionStopped(data.sessionId, reason, async () =>
       runSessionConsolidation({ sessionId: data.sessionId, since: data.since, until: data.until }),
     );
     return data.waitForCompletion ? queued.done : {
@@ -195,6 +199,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
             function_id: "event::session::checkpoint",
             payload: {
               sessionId: data.sessionId,
+              reason: "ended",
               since: watermark,
               until: anchor,
               waitForCompletion: true,
@@ -213,6 +218,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
         function_id: "event::session::stopped",
         payload: {
           sessionId: data.sessionId,
+          reason: "ended",
           until: effectiveAnchor,
           waitForCompletion: true,
         },

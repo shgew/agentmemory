@@ -136,6 +136,7 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
                   function_id: "event::session::stopped",
                   payload: {
                     sessionId: session.id,
+                    reason: "sweep-stale",
                     until: currentAnchor,
                     waitForCompletion: true,
                   },
@@ -153,6 +154,7 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
                 function_id: "event::session::checkpoint",
                 payload: {
                   sessionId: session.id,
+                  reason: "sweep-catchup",
                   since: currentWatermark,
                   until: currentAnchor,
                   waitForCompletion: true,

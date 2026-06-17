@@ -7,6 +7,7 @@ vi.mock("../src/logger.js", () => ({
 import { registerSessionCheckpoint } from "../src/functions/session-checkpoint.js";
 import { KV } from "../src/state/schema.js";
 import type { Session, AuditEntry } from "../src/types.js";
+import { logger } from "../src/logger.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -95,6 +96,7 @@ describe("Session Checkpoint Function", () => {
   let kv: ReturnType<typeof mockKV>;
 
   beforeEach(() => {
+    vi.clearAllMocks();
     sdk = mockSdk();
     kv = mockKV();
     registerSessionCheckpoint(sdk as never, kv as never);
@@ -151,6 +153,10 @@ describe("Session Checkpoint Function", () => {
 
     expect(result.success).toBe(true);
     expect(result.noOp).toBe(true);
+    expect(logger.info).toHaveBeenCalledWith(
+      "Session checkpoint skipped, no new activity since last checkpoint",
+      expect.objectContaining({ sessionId: "ses_noop", anchor: ts, watermark: ts }),
+    );
     expect(sdk.triggerCalls.filter((c) => c.function_id === "event::session::checkpoint")).toHaveLength(0);
 
     const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_noop");
@@ -178,6 +184,10 @@ describe("Session Checkpoint Function", () => {
     expect(result.success).toBe(true);
     expect(result.queued).toBe(true);
     expect(result.lastCheckpointAt).toBe(newer);
+    expect(logger.info).toHaveBeenCalledWith(
+      "Session checkpoint fired consolidation",
+      expect.objectContaining({ sessionId: "ses_new", since: older, until: newer }),
+    );
 
     const checkpointCall = sdk.triggerCalls.find((c) => c.function_id === "event::session::checkpoint");
     expect(checkpointCall?.payload).toMatchObject({
@@ -283,6 +293,10 @@ describe("Session Checkpoint Function", () => {
       expect(result.throttled).toBe(true);
       expect(result.retryAfterMs).toBeGreaterThan(0);
       expect(result.retryAfterMs).toBeLessThanOrEqual(600_000);
+      expect(logger.info).toHaveBeenCalledWith(
+        "Session checkpoint throttled by debounce window",
+        expect.objectContaining({ sessionId: "ses_throttle", retryAfterMs: result.retryAfterMs, debounceMs: 600_000 }),
+      );
 
       expect(
         sdk.triggerCalls.filter((c) => c.function_id === "event::session::checkpoint"),
