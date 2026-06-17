@@ -292,3 +292,77 @@ describe("Smart Search Function", () => {
     });
   });
 });
+
+describe("Smart Search project scoping", () => {
+  function makeResult(obsId: string, sessionId: string, score: number): HybridSearchResult {
+    return {
+      observation: makeObs({ id: obsId, sessionId, title: obsId }),
+      bm25Score: score,
+      vectorScore: 0,
+      graphScore: 0,
+      combinedScore: score,
+      sessionId,
+    };
+  }
+
+  function wire(results: HybridSearchResult[]) {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const searchFn = async () => results;
+    registerSmartSearchFunction(sdk as never, kv as never, searchFn);
+    return { sdk, kv };
+  }
+
+  it("drops memory hits from a different project, keeps matching and unscoped ones", async () => {
+    const { sdk, kv } = wire([
+      makeResult("mem_a", "memory", 0.9),
+      makeResult("mem_b", "memory", 0.8),
+      makeResult("mem_unscoped", "memory", 0.7),
+    ]);
+    await kv.set("mem:memories", "mem_a", { id: "mem_a", project: "proj-A" });
+    await kv.set("mem:memories", "mem_b", { id: "mem_b", project: "proj-B" });
+    await kv.set("mem:memories", "mem_unscoped", { id: "mem_unscoped" });
+
+    const res = (await sdk.trigger("mem::smart-search", {
+      query: "anything",
+      project: "proj-A",
+      includeLessons: false,
+    })) as { results: CompactSearchResult[] };
+
+    expect(res.results.map((r) => r.obsId).sort()).toEqual(["mem_a", "mem_unscoped"]);
+  });
+
+  it("drops observation hits whose session belongs to a different project", async () => {
+    const { sdk, kv } = wire([
+      makeResult("obs_a", "ses_A", 0.9),
+      makeResult("obs_b", "ses_B", 0.8),
+    ]);
+    const baseSession = { cwd: "/x", startedAt: "", status: "completed" as const, observationCount: 1 };
+    await kv.set("mem:sessions", "ses_A", { id: "ses_A", project: "proj-A", ...baseSession });
+    await kv.set("mem:sessions", "ses_B", { id: "ses_B", project: "proj-B", ...baseSession });
+
+    const res = (await sdk.trigger("mem::smart-search", {
+      query: "anything",
+      project: "proj-A",
+      includeLessons: false,
+    })) as { results: CompactSearchResult[] };
+
+    expect(res.results.map((r) => r.obsId)).toEqual(["obs_a"]);
+  });
+
+  it("no project filter returns all hits unchanged", async () => {
+    const { sdk, kv } = wire([
+      makeResult("mem_a", "memory", 0.9),
+      makeResult("mem_b", "memory", 0.8),
+    ]);
+    await kv.set("mem:memories", "mem_a", { id: "mem_a", project: "proj-A" });
+    await kv.set("mem:memories", "mem_b", { id: "mem_b", project: "proj-B" });
+
+    const res = (await sdk.trigger("mem::smart-search", {
+      query: "anything",
+      includeLessons: false,
+    })) as { results: CompactSearchResult[] };
+
+    expect(res.results.map((r) => r.obsId).sort()).toEqual(["mem_a", "mem_b"]);
+  });
+});

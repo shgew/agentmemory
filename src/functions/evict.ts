@@ -11,6 +11,7 @@ import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { logger } from "../logger.js";
+import { getSearchIndex, vectorIndexRemove, flushIndexSave } from "./search.js";
 
 interface EvictionConfig {
   staleSessionDays: number;
@@ -220,6 +221,8 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 sessionId: session.id,
                 dryRun,
               });
+              getSearchIndex().remove(o.id);
+              vectorIndexRemove(o.id);
             }
           }
         }
@@ -263,6 +266,8 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 sessionId: o.sessionId,
                 dryRun,
               });
+              getSearchIndex().remove(o.id);
+              vectorIndexRemove(o.id);
             }
           }
         }
@@ -300,6 +305,8 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 dryRun,
               });
               await deleteAccessLog(kv, mem.id);
+              getSearchIndex().remove(mem.id);
+              vectorIndexRemove(mem.id);
             }
           }
         }
@@ -335,11 +342,23 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 dryRun,
               });
               await deleteAccessLog(kv, mem.id);
+              getSearchIndex().remove(mem.id);
+              vectorIndexRemove(mem.id);
             }
           }
         }
       }
 
+      if (
+        !dryRun &&
+        stats.lowImportanceObs +
+          stats.capEvictions +
+          stats.expiredMemories +
+          stats.nonLatestMemories >
+          0
+      ) {
+        await flushIndexSave();
+      }
       logger.info("Eviction complete", { stats });
       return stats;
     },

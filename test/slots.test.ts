@@ -301,3 +301,58 @@ describe("slots — reflect windowing", () => {
     expect(patterns.slot.content).toMatch(/errors: 1/);
   });
 });
+
+describe("slots — seedDefaults reconciles pinned on existing default-label slots", () => {
+  function wireWith(kv: ReturnType<typeof mockKV>) {
+    const handlers: Record<string, (d: Record<string, unknown>) => Promise<Record<string, unknown>>> = {};
+    const sdk = {
+      registerFunction: vi.fn((id: string, cb) => {
+        handlers[id] = cb;
+      }),
+    } as unknown as import("iii-sdk").ISdk;
+    registerSlotsFunctions(sdk, kv as never);
+    return handlers;
+  }
+
+  it("re-pins a default-label slot that was stored with pinned:false, preserving content", async () => {
+    const kv = mockKV();
+    await kv.set(KV.globalSlots, "persona", {
+      label: "persona",
+      content: "senior engineer persona",
+      sizeLimit: 1000,
+      description: "old description",
+      pinned: false,
+      readOnly: false,
+      scope: "global",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    wireWith(kv);
+    await waitForSeed(kv);
+    const persona = (await kv.get(KV.globalSlots, "persona")) as {
+      pinned: boolean;
+      content: string;
+    };
+    expect(persona.pinned).toBe(true);
+    expect(persona.content).toBe("senior engineer persona");
+  });
+
+  it("leaves a non-default custom slot untouched", async () => {
+    const kv = mockKV();
+    await kv.set(KV.slots, "my_custom", {
+      label: "my_custom",
+      content: "custom",
+      sizeLimit: 2000,
+      description: "",
+      pinned: false,
+      readOnly: false,
+      scope: "project",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    wireWith(kv);
+    await waitForSeed(kv);
+    const custom = (await kv.get(KV.slots, "my_custom")) as { pinned: boolean };
+    expect(custom.pinned).toBe(false);
+  });
+});
