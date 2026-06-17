@@ -881,6 +881,8 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const rawLimit = parseOptionalInt(req.query_params?.["limit"]);
+      const limit = Math.max(1, Math.min(200, rawLimit ?? 20));
       const sessions = await kv.list<Session>(KV.sessions);
       const normalizedAgentId =
         typeof req.query_params?.["agentId"] === "string"
@@ -896,12 +898,20 @@ export function registerApiTriggers(
       const filtered = filterAgentId
         ? sessions.filter((s) => s.agentId === filterAgentId)
         : sessions;
+      const recencyKey = (s: Session): string =>
+        [s.updatedAt, s.endedAt, s.lastCheckpointAt, s.startedAt].reduce(
+          (acc: string, t) => (typeof t === "string" && t > acc ? t : acc),
+          "",
+        );
+      const recent = filtered
+        .sort((a, b) => (recencyKey(a) < recencyKey(b) ? 1 : -1))
+        .slice(0, limit);
       const summaries = await Promise.all(
-        filtered.map((s) =>
+        recent.map((s) =>
           kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
         ),
       );
-      const withSummary = filtered.map((s, i) =>
+      const withSummary = recent.map((s, i) =>
         summaries[i] ? { ...s, summary: summaries[i] } : s,
       );
       return { status_code: 200, body: { sessions: withSummary } };
