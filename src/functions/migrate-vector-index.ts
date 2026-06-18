@@ -10,6 +10,7 @@ export interface MigrateVectorIndexResult {
   failed: number;
   vectorSize: number;
   failedSessions: string[];
+  index: VectorIndex;
 }
 
 // Validate one embedding's shape against the provider's declared dimensions
@@ -111,7 +112,7 @@ export async function migrateVectorIndex(
     // failedSessions list and can't tell apart "0 sessions, all OK"
     // from "kv.list itself blew up".
     failedSessions.push("<sessions-list-failed>");
-    return { success: false, totalProcessed: processed, failed, vectorSize: newIndex.size, failedSessions };
+    return { success: false, totalProcessed: processed, failed, vectorSize: newIndex.size, failedSessions, index: newIndex };
   }
 
   for (const session of sessions) {
@@ -148,5 +149,6 @@ export async function migrateVectorIndex(
     failed,
     vectorSize: newIndex.size,
     failedSessions,
+    index: newIndex,
   };
 }

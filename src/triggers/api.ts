@@ -1190,6 +1190,23 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/migrate", http_method: "POST" },
   });
 
+  sdk.registerFunction("api::reindex-vectors",
+    async (req: ApiRequest<Record<string, unknown>>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const result = await sdk.trigger({
+        function_id: "mem::reindex-vectors",
+        payload: {},
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::reindex-vectors",
+    config: { api_path: "/agentmemory/reindex-vectors", http_method: "POST" },
+  });
+
   sdk.registerFunction("api::evict", 
     async (req: ApiRequest<{ dryRun?: boolean }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);

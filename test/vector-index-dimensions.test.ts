@@ -129,4 +129,26 @@ describe("migrateVectorIndex", () => {
     expect(result.vectorSize).toBe(0);
     expect(result.failed).toBe(0);
   });
+
+  it("returns the rebuilt index so callers can swap it into the live index", async () => {
+    const kv = mockKV();
+    await kv.set("mem:sessions", "ses_1", { id: "ses_1" });
+    await kv.set("mem:obs:ses_1", "obs_1", {
+      id: "obs_1",
+      sessionId: "ses_1",
+      timestamp: new Date().toISOString(),
+      type: "decision",
+      title: "swap test",
+      facts: ["x"],
+      narrative: "to be re-embedded",
+      concepts: [],
+      files: [],
+      importance: 5,
+    });
+
+    const result = await migrateVectorIndex(kv as never, newProvider);
+    expect(result.index).toBeInstanceOf(VectorIndex);
+    expect(result.index.size).toBe(result.vectorSize);
+    expect(result.index.size).toBe(1);
+  });
 });
