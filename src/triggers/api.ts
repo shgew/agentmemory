@@ -882,7 +882,6 @@ export function registerApiTriggers(
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       const rawLimit = parseOptionalInt(req.query_params?.["limit"]);
-      const limit = Math.max(1, Math.min(200, rawLimit ?? 20));
       const sessions = await kv.list<Session>(KV.sessions);
       const normalizedAgentId =
         typeof req.query_params?.["agentId"] === "string"
@@ -903,9 +902,13 @@ export function registerApiTriggers(
           (acc: string, t) => (typeof t === "string" && t > acc ? t : acc),
           "",
         );
-      const recent = filtered
-        .sort((a, b) => (recencyKey(a) < recencyKey(b) ? 1 : -1))
-        .slice(0, limit);
+      const sorted = filtered.sort((a, b) =>
+        recencyKey(a) < recencyKey(b) ? 1 : -1,
+      );
+      const recent =
+        rawLimit === undefined
+          ? sorted
+          : sorted.slice(0, Math.max(1, Math.min(200, rawLimit)));
       const summaries = await Promise.all(
         recent.map((s) =>
           kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
