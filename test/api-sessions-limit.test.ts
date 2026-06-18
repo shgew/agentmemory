@@ -86,17 +86,17 @@ describe("api::sessions limit + recency", () => {
     registerApiTriggers(sdk as never, kv as never);
   });
 
-  it("defaults to 20 and returns the most-recent first", async () => {
+  it("defaults to all sessions, most-recent first", async () => {
     await seed(25);
     const fn = sdk.getFunction("api::sessions")!;
     const res = (await fn(reqWithLimit())) as SessionsResponse;
 
     expect(res.status_code).toBe(200);
-    expect(res.body.sessions).toHaveLength(20);
+    expect(res.body.sessions).toHaveLength(25);
     expect(res.body.sessions[0].id).toBe("s24");
-    const ids = res.body.sessions.map((s) => s.id);
+    const ids = new Set(res.body.sessions.map((s) => s.id));
     for (const old of ["s0", "s1", "s2", "s3", "s4"]) {
-      expect(ids).not.toContain(old);
+      expect(ids.has(old)).toBe(true);
     }
   });
 
