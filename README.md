@@ -1426,6 +1426,7 @@ Create `~/.agentmemory/.env`:
 # OPENAI_BASE_URL=https://api.openai.com   # Override for Azure / vLLM / LM Studio / proxies
 # OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 # OPENAI_EMBEDDING_DIMENSIONS=1536        # Required when the model is not in the known-models table
+# OPENAI_EMBEDDING_MAX_BATCH=256         # Max inputs per /embeddings request before splitting into sequential sub-batches. Lower this when self-hosted runners (e.g. Ollama) crash on large batches
 
 # Outbound LLM / embedding timeout
 # AGENTMEMORY_LLM_TIMEOUT_MS=60000       # Default: 60 000 ms (60 s). Applies to every

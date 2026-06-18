@@ -62,6 +62,7 @@ describe("OpenAIEmbeddingProvider", () => {
     delete process.env["OPENAI_EMBEDDING_API_KEY"];
     delete process.env["OPENAI_EMBEDDING_MODEL"];
     delete process.env["OPENAI_EMBEDDING_DIMENSIONS"];
+    delete process.env["OPENAI_EMBEDDING_MAX_BATCH"];
   });
 
   afterEach(() => {
@@ -153,6 +154,182 @@ describe("OpenAIEmbeddingProvider", () => {
     process.env["OPENAI_EMBEDDING_DIMENSIONS"] = "0";
     expect(() => new OpenAIEmbeddingProvider("test-key")).toThrow(
       /OPENAI_EMBEDDING_DIMENSIONS must be a positive integer/,
+    );
+  });
+
+  it("performs a single POST when input count is at or below the default max (256)", async () => {
+    const provider = new OpenAIEmbeddingProvider("test-key");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          data: Array.from({ length: 256 }, () => ({ embedding: [0.1, 0.2, 0.3] })),
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const texts = Array.from({ length: 256 }, (_, i) => `text-${i}`);
+    await provider.embedBatch(texts);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const body = JSON.parse((fetchSpy.mock.calls[0][1] as RequestInit).body as string);
+    expect(body.input).toHaveLength(256);
+
+    fetchSpy.mockRestore();
+  });
+
+  it("splits into sequential sub-batches when input count exceeds the max", async () => {
+    const provider = new OpenAIEmbeddingProvider("test-key");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (_url, init) => {
+        const body = JSON.parse((init as RequestInit).body as string);
+        const len = (body.input as string[]).length;
+        return new Response(
+          JSON.stringify({
+            data: Array.from({ length: len }, () => ({ embedding: [0.1, 0.2, 0.3] })),
+          }),
+          { status: 200 },
+        );
+      },
+    );
+
+    const texts = Array.from({ length: 600 }, (_, i) => `text-${i}`);
+    const result = await provider.embedBatch(texts);
+
+    expect(result).toHaveLength(600);
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    const sizes = fetchSpy.mock.calls.map(
+      (c) => (JSON.parse((c[1] as RequestInit).body as string).input as string[]).length,
+    );
+    expect(sizes).toEqual([256, 256, 88]);
+
+    fetchSpy.mockRestore();
+  });
+
+  it("respects OPENAI_EMBEDDING_MAX_BATCH override", async () => {
+    process.env["OPENAI_EMBEDDING_MAX_BATCH"] = "100";
+    const provider = new OpenAIEmbeddingProvider("test-key");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (_url, init) => {
+        const body = JSON.parse((init as RequestInit).body as string);
+        const len = (body.input as string[]).length;
+        return new Response(
+          JSON.stringify({
+            data: Array.from({ length: len }, () => ({ embedding: [0.1, 0.2, 0.3] })),
+          }),
+          { status: 200 },
+        );
+      },
+    );
+
+    const texts = Array.from({ length: 250 }, (_, i) => `text-${i}`);
+    await provider.embedBatch(texts);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    const sizes = fetchSpy.mock.calls.map(
+      (c) => (JSON.parse((c[1] as RequestInit).body as string).input as string[]).length,
+    );
+    expect(sizes).toEqual([100, 100, 50]);
+
+    fetchSpy.mockRestore();
+  });
+
+  it("preserves input order across chunked sub-batches", async () => {
+    process.env["OPENAI_EMBEDDING_MAX_BATCH"] = "2";
+    const provider = new OpenAIEmbeddingProvider("test-key");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (_url, init) => {
+        const body = JSON.parse((init as RequestInit).body as string);
+        const inputs = body.input as string[];
+        return new Response(
+          JSON.stringify({
+            data: inputs.map((t) => ({ embedding: [parseFloat(t)] })),
+          }),
+          { status: 200 },
+        );
+      },
+    );
+
+    const texts = ["0", "1", "2", "3", "4"];
+    const result = await provider.embedBatch(texts);
+
+    expect(result.map((e) => e[0])).toEqual([0, 1, 2, 3, 4]);
+
+    fetchSpy.mockRestore();
+  });
+
+  it("issues chunked sub-batches sequentially, not in parallel", async () => {
+    process.env["OPENAI_EMBEDDING_MAX_BATCH"] = "2";
+    const provider = new OpenAIEmbeddingProvider("test-key");
+    let inFlight = 0;
+    let maxConcurrent = 0;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (_url, init) => {
+        inFlight++;
+        maxConcurrent = Math.max(maxConcurrent, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight--;
+        const body = JSON.parse((init as RequestInit).body as string);
+        const len = (body.input as string[]).length;
+        return new Response(
+          JSON.stringify({
+            data: Array.from({ length: len }, () => ({ embedding: [0.1] })),
+          }),
+          { status: 200 },
+        );
+      },
+    );
+
+    await provider.embedBatch(["a", "b", "c", "d", "e", "f"]);
+
+    expect(maxConcurrent).toBe(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+
+    fetchSpy.mockRestore();
+  });
+
+  it("propagates errors from a failing sub-batch", async () => {
+    process.env["OPENAI_EMBEDDING_MAX_BATCH"] = "2";
+    const provider = new OpenAIEmbeddingProvider("test-key");
+    let call = 0;
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (_url, init) => {
+        call++;
+        if (call === 2) {
+          return new Response("upstream tokenize EOF", { status: 400 });
+        }
+        const body = JSON.parse((init as RequestInit).body as string);
+        const len = (body.input as string[]).length;
+        return new Response(
+          JSON.stringify({
+            data: Array.from({ length: len }, () => ({ embedding: [0.1] })),
+          }),
+          { status: 200 },
+        );
+      },
+    );
+
+    await expect(provider.embedBatch(["a", "b", "c", "d"])).rejects.toThrow(
+      /OpenAI embedding failed \(400\)/,
+    );
+
+    fetchSpy.mockRestore();
+  });
+
+  it("rejects invalid OPENAI_EMBEDDING_MAX_BATCH values", () => {
+    process.env["OPENAI_EMBEDDING_MAX_BATCH"] = "not-a-number";
+    expect(() => new OpenAIEmbeddingProvider("test-key")).toThrow(
+      /OPENAI_EMBEDDING_MAX_BATCH must be a positive integer/,
+    );
+
+    process.env["OPENAI_EMBEDDING_MAX_BATCH"] = "-5";
+    expect(() => new OpenAIEmbeddingProvider("test-key")).toThrow(
+      /OPENAI_EMBEDDING_MAX_BATCH must be a positive integer/,
+    );
+
+    process.env["OPENAI_EMBEDDING_MAX_BATCH"] = "0";
+    expect(() => new OpenAIEmbeddingProvider("test-key")).toThrow(
+      /OPENAI_EMBEDDING_MAX_BATCH must be a positive integer/,
     );
   });
 });
