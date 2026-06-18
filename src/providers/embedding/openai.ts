@@ -37,6 +37,25 @@ function resolveDimensions(model: string, override: string | undefined): number 
   return MODEL_DIMENSIONS[model] ?? DEFAULT_DIMENSIONS;
 }
 
+const DEFAULT_MAX_BATCH = 256;
+
+// Some self-hosted OpenAI-compatible runners (e.g. Ollama) crash the model
+// subprocess when one /embeddings request carries too many inputs (observed:
+// ~600 inputs -> HTTP 400 "tokenize: EOF"), regardless of total token volume.
+// embedBatch splits into sequential sub-batches of this size to stay under it.
+function resolveMaxBatch(override: string | undefined): number {
+  if (override !== undefined && override.trim().length > 0) {
+    const parsed = parseInt(override, 10);
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      throw new Error(
+        `OPENAI_EMBEDDING_MAX_BATCH must be a positive integer, got: ${override}`,
+      );
+    }
+    return parsed;
+  }
+  return DEFAULT_MAX_BATCH;
+}
+
 /**
  * OpenAI-compatible embedding provider.
  *
@@ -72,6 +91,9 @@ function resolveDimensions(model: string, override: string | undefined): number 
  *   OPENAI_EMBEDDING_DIMENSIONS  — override reported dimensions (required for
  *                                  custom / self-hosted models not in the
  *                                  MODEL_DIMENSIONS table above)
+ *   OPENAI_EMBEDDING_MAX_BATCH   - max inputs per /embeddings request before
+ *                                  splitting into sequential sub-batches
+ *                                  (default: 256)
  */
 export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   readonly name = "openai";
@@ -81,6 +103,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private model: string;
   private isAzure: boolean;
   private azureApiVersion: string;
+  private maxBatch: number;
 
   constructor(apiKey?: string) {
     // Separate API key path: caller-passed wins, then OPENAI_EMBEDDING_API_KEY,
@@ -111,6 +134,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     this.isAzure = detectAzure(this.baseUrl);
     this.azureApiVersion =
       getEnvVar("OPENAI_API_VERSION") || DEFAULT_AZURE_API_VERSION;
+    this.maxBatch = resolveMaxBatch(getEnvVar("OPENAI_EMBEDDING_MAX_BATCH"));
   }
 
   async embed(text: string): Promise<Float32Array> {
@@ -119,6 +143,18 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   }
 
   async embedBatch(texts: string[]): Promise<Float32Array[]> {
+    if (texts.length <= this.maxBatch) {
+      return this.embedChunk(texts);
+    }
+    const out: Float32Array[] = [];
+    for (let i = 0; i < texts.length; i += this.maxBatch) {
+      const chunk = await this.embedChunk(texts.slice(i, i + this.maxBatch));
+      for (const e of chunk) out.push(e);
+    }
+    return out;
+  }
+
+  private async embedChunk(texts: string[]): Promise<Float32Array[]> {
     const url = buildEmbeddingUrl(
       this.baseUrl,
       this.isAzure,
