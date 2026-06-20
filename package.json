@@ -29,7 +29,8 @@
     "skills:check": "tsx scripts/skills/generate.ts --check && tsx scripts/skills/check.ts",
     "bench:load": "node --import tsx benchmark/load-100k.ts",
     "eval:longmemeval": "tsx eval/runner/longmemeval.ts",
-    "eval:coding-life": "tsx eval/runner/coding-life.ts"
+    "eval:coding-life": "tsx eval/runner/coding-life.ts",
+    "typecheck:plugin": "tsc -p tsconfig.plugin.json --noEmit"
   },
   "keywords": [
     "ai",
@@ -75,6 +76,8 @@
     "tiny-segmenter": "^0.2.0"
   },
   "devDependencies": {
+    "@opencode-ai/plugin": "1.17.7",
+    "@opencode-ai/sdk": "1.17.7",
     "@types/node": "^25.9.1",
     "tsdown": "^0.21.10",
     "tsx": "^4.19.0",
