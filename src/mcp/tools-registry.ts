@@ -962,8 +962,28 @@ export function getAllTools(): McpToolDef[] {
 // advertised 53 tools "in proxy mode"; the old default left OpenCode /
 // Claude Code users seeing 8 with no indication the other tools existed.
 // Users who want the lean essentials can still set AGENTMEMORY_TOOLS=core.
+//
+// AGENTMEMORY_TOOLS_DISABLE (comma- or whitespace-separated tool names)
+// drops tools from the surface AFTER the mode filter. Use it to remove
+// definitively-non-functional tools (server-disabled features, no-peer
+// fan-out, sandboxed exports) without rebuilding the registry. Unknown
+// names are silently ignored so the env is forward-compatible.
+export function parseToolDisableList(raw: string | undefined | null): Set<string> {
+  if (!raw) return new Set();
+  return new Set(
+    raw
+      .split(/[\s,]+/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0),
+  );
+}
+
 export function getVisibleTools(): McpToolDef[] {
   const mode = process.env["AGENTMEMORY_TOOLS"] || "all";
-  if (mode === "core") return getAllTools().filter((t) => ESSENTIAL_TOOLS.has(t.name));
-  return getAllTools();
+  const base = mode === "core"
+    ? getAllTools().filter((t) => ESSENTIAL_TOOLS.has(t.name))
+    : getAllTools();
+  const disable = parseToolDisableList(process.env["AGENTMEMORY_TOOLS_DISABLE"]);
+  if (disable.size === 0) return base;
+  return base.filter((t) => !disable.has(t.name));
 }

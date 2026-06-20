@@ -2,7 +2,7 @@
 
 import { InMemoryKV } from "./in-memory-kv.js";
 import { createStdioTransport } from "./transport.js";
-import { getAllTools } from "./tools-registry.js";
+import { getAllTools, parseToolDisableList } from "./tools-registry.js";
 import { getStandalonePersistPath } from "../config.js";
 import { VERSION } from "../version.js";
 import { generateId } from "../state/schema.js";
@@ -435,6 +435,15 @@ export async function handleToolCall(
   return handleLocal(validated, kvInstance);
 }
 
+function applyToolDisable<T>(tools: T[], nameOf: (t: T) => string | undefined): T[] {
+  const disable = parseToolDisableList(process.env["AGENTMEMORY_TOOLS_DISABLE"]);
+  if (disable.size === 0) return tools;
+  return tools.filter((t) => {
+    const name = nameOf(t);
+    return name === undefined || !disable.has(name);
+  });
+}
+
 export async function handleToolsList(): Promise<{ tools: unknown[] }> {
   const debug = process.env["AGENTMEMORY_DEBUG"] === "1" || process.env["AGENTMEMORY_DEBUG"] === "true";
   const handle = await resolveHandle();
@@ -460,12 +469,18 @@ export async function handleToolsList(): Promise<{ tools: unknown[] }> {
         );
       }
       if (remote && Array.isArray(remote.tools)) {
+        const filtered = applyToolDisable(remote.tools, (t) =>
+          typeof t === "object" && t !== null && typeof (t as { name?: unknown }).name === "string"
+            ? ((t as { name: string }).name)
+            : undefined,
+        );
         if (debug) {
+          const dropped = remote.tools.length - filtered.length;
           process.stderr.write(
-            `[@agentmemory/mcp] tools/list: returning ${remote.tools.length} tools from server\n`,
+            `[@agentmemory/mcp] tools/list: returning ${filtered.length} tools from server${dropped > 0 ? ` (${dropped} dropped via AGENTMEMORY_TOOLS_DISABLE)` : ""}\n`,
           );
         }
-        return { tools: remote.tools };
+        return { tools: filtered };
       }
       process.stderr.write(
         `[@agentmemory/mcp] tools/list: server returned unexpected shape (no .tools array); falling back to local IMPLEMENTED_TOOLS list. Set AGENTMEMORY_DEBUG=1 to inspect response.\n`,
@@ -477,7 +492,10 @@ export async function handleToolsList(): Promise<{ tools: unknown[] }> {
       invalidateHandle();
     }
   }
-  const fallback = getAllTools().filter((t) => IMPLEMENTED_TOOLS.has(t.name));
+  const fallback = applyToolDisable(
+    getAllTools().filter((t) => IMPLEMENTED_TOOLS.has(t.name)),
+    (t) => t.name,
+  );
   if (debug) {
     process.stderr.write(
       `[@agentmemory/mcp] tools/list: returning ${fallback.length} local fallback tools (${fallback.map((t) => t.name).join(",")})\n`,
