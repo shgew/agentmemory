@@ -611,6 +611,7 @@ export interface AuditEntry {
     | "slot_create"
     | "slot_delete"
     | "slot_reflect"
+    | "canonicalize_projects"
     | "session_sweep"
     | "session_checkpoint";
   userId?: string;

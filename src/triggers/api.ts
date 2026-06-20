@@ -25,6 +25,7 @@ import {
 } from "../config.js";
 import { getSummarizeTimeoutMs } from "../functions/summarize.js";
 import { getGraphExtractTimeoutMs } from "../functions/graph.js";
+import { validateMapping } from "../functions/migrate.js";
 
 type Response = {
   status_code: number;
@@ -1159,7 +1160,7 @@ export function registerApiTriggers(
 
   sdk.registerFunction("api::migrate",
     async (
-      req: ApiRequest<{ dbPath?: string; step?: string; dryRun?: boolean }>,
+      req: ApiRequest<{ dbPath?: string; step?: string; dryRun?: boolean; mapping?: Record<string, string> }>,
     ): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
@@ -1173,12 +1174,19 @@ export function registerApiTriggers(
           body: { error: "Either step (string) or dbPath (string) is required" },
         };
       }
+      if (req.body.mapping !== undefined) {
+        const validation = validateMapping(req.body.mapping);
+        if (!validation.ok) {
+          return { status_code: 400, body: { error: validation.error } };
+        }
+      }
       const result = await sdk.trigger({
         function_id: "mem::migrate",
         payload: {
           ...(req.body.step !== undefined && { step: req.body.step }),
           ...(req.body.dbPath !== undefined && { dbPath: req.body.dbPath }),
           ...(req.body.dryRun !== undefined && { dryRun: req.body.dryRun }),
+          ...(req.body.mapping !== undefined && { mapping: req.body.mapping }),
         },
       });
       return { status_code: 200, body: result };

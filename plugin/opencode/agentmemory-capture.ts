@@ -1,5 +1,7 @@
 /// <reference types="node" />
-import { cwd, env } from "node:process";
+import { execFileSync } from "node:child_process";
+import { basename, resolve } from "node:path";
+import { env } from "node:process";
 import type { Plugin } from "@opencode-ai/plugin";
 import type { Event as EventV1, Part } from "@opencode-ai/sdk";
 import type { Event as EventV2 } from "@opencode-ai/sdk/v2";
@@ -62,6 +64,34 @@ const LOOPBACK_HOSTS = new Set([
   "0.0.0.0",
   "[::1]",
 ]);
+
+// Resolver intentionally duplicated from src/hooks/_project.ts. The plugin file is copied standalone into ~/.config/opencode/plugins/ by 'agentmemory connect opencode --with-plugin' and cannot import from src/. Keep both copies behaviorally identical; parity enforced by test/_fixtures/project-resolver-scenarios.ts.
+function resolveProject(cwd?: string): string {
+  const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
+  if (explicit && explicit.trim()) return explicit.trim();
+  const dir = cwd && cwd.trim() ? cwd : process.cwd();
+  try {
+    const top = gitRevParse(dir, "--show-toplevel");
+    const gitDir = gitRevParse(dir, "--git-dir");
+    const commonDir = gitRevParse(dir, "--git-common-dir");
+    const root =
+      resolve(dir, gitDir) === resolve(dir, commonDir)
+        ? top
+        : resolve(dir, commonDir, "..");
+    if (root) return basename(root);
+  } catch {}
+  return basename(dir);
+}
+
+function gitRevParse(cwd: string, arg: string): string {
+  return execFileSync("git", ["rev-parse", arg], {
+    cwd,
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 500,
+  })
+    .toString()
+    .trim();
+}
 
 function authHeaders(): Record<string, string> {
   const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -348,8 +378,8 @@ function extractErrorMessage(err: unknown): string {
   return String(err ?? "");
 }
 
-export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
-  projectPath = ctx.worktree || ctx.project?.id || cwd();
+export const AgentmemoryCapturePlugin: Plugin = async () => {
+  projectPath = resolveProject();
 
   assertHttpsOrLoopback();
 

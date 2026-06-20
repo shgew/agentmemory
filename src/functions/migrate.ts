@@ -1,15 +1,72 @@
 import type { ISdk } from "iii-sdk";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
+import { createHash } from "node:crypto";
 import { KV, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import type {
   Memory,
+  ProjectProfile,
   Session,
   CompressedObservation,
   SessionSummary,
 } from "../types.js";
 import { logger } from "../logger.js";
+import { recordAudit } from "./audit.js";
+
+export const DEFAULT_CANONICAL_PROJECT_MAP: Readonly<Record<string, string>> = {};
+
+// Canonical slugs are determined by the values of the effective mapping. Callers
+// supply that mapping at call time via `payload.mapping`; this module ships no
+// site-specific defaults.
+
+type CanonicalizeProjectPayload = {
+  step: "canonicalize-projects";
+  dryRun?: boolean;
+  mapping?: Record<string, string>;
+};
+
+type ProjectRow = {
+  id?: string;
+  sessionId?: string;
+  project?: string | null;
+  updatedAt?: string;
+};
+
+type ScopeReport = {
+  wouldUpdate: number;
+  alreadyCanonical: number;
+  noMatch: number;
+  unscoped: number;
+  deleted?: number;
+  notes?: string;
+};
+
+type CanonicalizeProjectSuccess = {
+  success: true;
+  step: "canonicalize-projects";
+  dryRun: boolean;
+  perScope: Record<string, ScopeReport>;
+  totalUpdated: number;
+  totalDeleted: number;
+  totalNoMatch: number;
+  totalUnscoped: number;
+};
+
+type CanonicalizeProjectFailure = {
+  success: false;
+  step: "canonicalize-projects";
+  error: string;
+};
+
+type CanonicalizeProjectResult =
+  | CanonicalizeProjectSuccess
+  | CanonicalizeProjectFailure;
+
+type ProjectScope<Row extends ProjectRow> = {
+  scope: string;
+  keyOf: (row: Row) => string;
+};
 
 const ALLOWED_DIRS = [resolve(homedir(), ".agentmemory")];
 
@@ -85,15 +142,247 @@ export async function inferMemoryProjects(
   return { updated, skipped, ambiguous };
 }
 
+function emptyScopeReport(): ScopeReport {
+  return { wouldUpdate: 0, alreadyCanonical: 0, noMatch: 0, unscoped: 0 };
+}
+
+export type MappingValidation =
+  | { ok: true; value: Record<string, string> }
+  | { ok: false; error: string };
+
+export function validateMapping(mapping: unknown): MappingValidation {
+  if (mapping === null || typeof mapping !== "object" || Array.isArray(mapping)) {
+    return {
+      ok: false,
+      error: "mapping must be a plain object of string keys to string values",
+    };
+  }
+  const obj = mapping as Record<string, unknown>;
+  for (const [k, v] of Object.entries(obj)) {
+    if (k.trim().length === 0) {
+      return { ok: false, error: "mapping keys must be non-empty strings" };
+    }
+    if (typeof v !== "string" || v.trim().length === 0) {
+      return {
+        ok: false,
+        error: `mapping value for "${k}" must be a non-empty string`,
+      };
+    }
+  }
+  return { ok: true, value: obj as Record<string, string> };
+}
+
+function canonicalProjectSet(mapping: Record<string, string>): ReadonlySet<string> {
+  return new Set(Object.values(mapping));
+}
+
+function updateProject<Row extends ProjectRow>(row: Row, project: string, updatedAt: string): Row {
+  if ("updatedAt" in row) {
+    return { ...row, project, updatedAt };
+  }
+  return { ...row, project };
+}
+
+function projectRowKey(row: ProjectRow): string {
+  return row.id ?? row.sessionId ?? row.project ?? "";
+}
+
+function stripWorktreeSegment(project: string): string {
+  const idx = project.indexOf("/.worktrees/");
+  return idx >= 0 ? project.slice(0, idx) : project;
+}
+
+function redactProfileKey(key: string): string {
+  const hash = createHash("sha256").update(key).digest("hex").slice(0, 16);
+  return `profile-key:${hash}`;
+}
+
+async function migrateProjectScope<Row extends ProjectRow>(
+  kv: StateKV,
+  projectScope: ProjectScope<Row>,
+  mapping: Record<string, string>,
+  canonicalProjects: ReadonlySet<string>,
+  dryRun: boolean,
+  touchedIds: string[],
+): Promise<ScopeReport> {
+  const report = emptyScopeReport();
+  const rows = await kv.list<Row>(projectScope.scope);
+
+  for (const row of rows) {
+    const project = row.project;
+    if (!project) {
+      report.unscoped++;
+      continue;
+    }
+
+    const lookupKey = stripWorktreeSegment(project);
+    const mapped = mapping[lookupKey] ?? mapping[project];
+    if (mapped !== undefined) {
+      if (mapped === project) {
+        report.alreadyCanonical++;
+        continue;
+      }
+
+      report.wouldUpdate++;
+      if (!dryRun) {
+        const key = projectScope.keyOf(row);
+        const updatedAt = new Date().toISOString();
+        await kv.set(projectScope.scope, key, updateProject(row, mapped, updatedAt));
+        touchedIds.push(key);
+      }
+      continue;
+    }
+
+    if (canonicalProjects.has(project)) {
+      report.alreadyCanonical++;
+      continue;
+    }
+
+    report.noMatch++;
+  }
+
+  return report;
+}
+
+async function migrateProfiles(
+  kv: StateKV,
+  canonicalProjects: ReadonlySet<string>,
+  dryRun: boolean,
+  touchedIds: string[],
+): Promise<ScopeReport> {
+  const report: ScopeReport = { ...emptyScopeReport(), deleted: 0 };
+  const rows = await kv.list<ProjectProfile>(KV.profiles);
+
+  for (const row of rows) {
+    const key = row.project;
+    if (!key) {
+      report.unscoped++;
+      continue;
+    }
+    if (key.startsWith("/")) {
+      report.deleted = (report.deleted ?? 0) + 1;
+      if (!dryRun) {
+        await kv.delete(KV.profiles, key);
+        touchedIds.push(redactProfileKey(key));
+      }
+      continue;
+    }
+    if (canonicalProjects.has(key)) {
+      report.alreadyCanonical++;
+      continue;
+    }
+    report.noMatch++;
+  }
+
+  return report;
+}
+
+export async function canonicalizeProjects(
+  kv: StateKV,
+  payload: CanonicalizeProjectPayload,
+): Promise<CanonicalizeProjectResult> {
+  const dryRun = payload.dryRun ?? false;
+  let effectiveMap: Record<string, string>;
+  if (payload.mapping !== undefined) {
+    const validation = validateMapping(payload.mapping);
+    if (!validation.ok) {
+      return {
+        success: false,
+        step: "canonicalize-projects",
+        error: validation.error,
+      };
+    }
+    effectiveMap = validation.value;
+  } else {
+    effectiveMap = DEFAULT_CANONICAL_PROJECT_MAP;
+  }
+  const canonicalProjects = canonicalProjectSet(effectiveMap);
+  const touchedIds: string[] = [];
+  const perScope: Record<string, ScopeReport> = {};
+
+  const projectScopes: Array<ProjectScope<ProjectRow>> = [
+    { scope: KV.sessions, keyOf: projectRowKey },
+    { scope: KV.memories, keyOf: projectRowKey },
+    { scope: KV.summaries, keyOf: projectRowKey },
+    { scope: KV.actions, keyOf: projectRowKey },
+    { scope: KV.sketches, keyOf: projectRowKey },
+    { scope: KV.crystals, keyOf: projectRowKey },
+    { scope: KV.lessons, keyOf: projectRowKey },
+    { scope: KV.insights, keyOf: projectRowKey },
+  ];
+
+  for (const projectScope of projectScopes) {
+    perScope[projectScope.scope] = await migrateProjectScope(
+      kv,
+      projectScope,
+      effectiveMap,
+      canonicalProjects,
+      dryRun,
+      touchedIds,
+    );
+  }
+
+  perScope["mem:team:*:shared"] = {
+    ...emptyScopeReport(),
+    notes: "team scopes skipped: no enumerator",
+  };
+  perScope[KV.profiles] = await migrateProfiles(kv, canonicalProjects, dryRun, touchedIds);
+
+  let totalUpdated = 0;
+  let totalDeleted = 0;
+  let totalNoMatch = 0;
+  let totalUnscoped = 0;
+  for (const report of Object.values(perScope)) {
+    totalUpdated += dryRun ? 0 : report.wouldUpdate;
+    totalDeleted += dryRun ? 0 : report.deleted ?? 0;
+    totalNoMatch += report.noMatch;
+    totalUnscoped += report.unscoped;
+  }
+
+  if (!dryRun) {
+    await recordAudit(kv, "canonicalize_projects", "mem::migrate", touchedIds, {
+      perScope,
+      totalUpdated,
+      totalDeleted,
+      totalNoMatch,
+      totalUnscoped,
+      dryRun: false,
+      mappingEntryCount: Object.keys(effectiveMap).length,
+      canonicalProjectCount: canonicalProjects.size,
+    });
+  }
+
+  return {
+    success: true,
+    step: "canonicalize-projects",
+    dryRun,
+    perScope,
+    totalUpdated,
+    totalDeleted,
+    totalNoMatch,
+    totalUnscoped,
+  };
+}
+
 export function registerMigrateFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::migrate",
-    async (data: { dbPath?: string; step?: string; dryRun?: boolean }) => {
+    async (data: { dbPath?: string; step?: string; dryRun?: boolean; mapping?: Record<string, string> }) => {
       // In-place KV migration steps (no SQLite dependency).
       if (data.step === "infer-memory-projects") {
         const dryRun = data.dryRun ?? false;
         logger.info("Migration step: infer-memory-projects", { dryRun });
         const result = await inferMemoryProjects(kv, dryRun);
         return { success: true, step: "infer-memory-projects", ...result };
+      }
+
+      if (data.step === "canonicalize-projects") {
+        const dryRun = data.dryRun ?? false;
+        logger.info("Migration step: canonicalize-projects", { dryRun });
+        return canonicalizeProjects(kv, {
+          step: "canonicalize-projects",
+          dryRun,
+          mapping: data.mapping,
+        });
       }
 
       if (!data.dbPath) {
