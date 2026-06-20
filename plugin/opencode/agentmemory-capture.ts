@@ -218,9 +218,11 @@ function questionRepliedData(requestID: string, answers: readonly (readonly stri
 
 function sanitizeOutput(v: unknown): unknown {
   const BASE64_PREFIX_RE = /^(?:iVBORw0KGgo|\/9j\/|R0lGOD|UklGR|PHN2Z|JVBERi0)/;
+  const MAX_DEPTH = 6;
+  const MAX_NODES = 5000;
   const stripBlob = (s: string): string => {
     if (s.length <= 100) return s;
-  if (s.startsWith("data:image/") || s.startsWith("data:application/") || s.startsWith("data:audio/") || s.startsWith("data:video/")) {
+    if (s.startsWith("data:image/") || s.startsWith("data:application/") || s.startsWith("data:audio/") || s.startsWith("data:video/")) {
       return `<blob:stripped:${s.length}b>`;
     }
     if (BASE64_PREFIX_RE.test(s)) {
@@ -228,19 +230,26 @@ function sanitizeOutput(v: unknown): unknown {
     }
     return s;
   };
-  if (typeof v === "string") return stripBlob(v);
-  if (v == null) return v;
-  if (Array.isArray(v)) {
-    return v.map((item) => (typeof item === "string" ? stripBlob(item) : item));
-  }
-  if (typeof v === "object") {
+  const seen = new WeakSet<object>();
+  let nodes = 0;
+  const walk = (value: unknown, depth: number): unknown => {
+    if (++nodes > MAX_NODES) return value;
+    if (typeof value === "string") return stripBlob(value);
+    if (value == null) return value;
+    if (typeof value !== "object") return value;
+    if (depth >= MAX_DEPTH) return value;
+    if (seen.has(value as object)) return "<circular>";
+    seen.add(value as object);
+    if (Array.isArray(value)) {
+      return value.map((item) => walk(item, depth + 1));
+    }
     const out: Record<string, unknown> = {};
-    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-      out[k] = typeof val === "string" ? stripBlob(val) : val;
+    for (const [k, val] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = walk(val, depth + 1);
     }
     return out;
-  }
-  return v;
+  };
+  return walk(v, 0);
 }
 
 function assertHttpsOrLoopback(): void {
@@ -469,8 +478,8 @@ export const AgentmemoryCapturePlugin: Plugin = async (ctx) => {
           return;
         }
         await post("/session/end", { sessionId: sid });
-        post("/crystals/auto", { olderThanDays: 7 }, HEAVY_TIMEOUT_MS);
-        post("/consolidate-pipeline", { tier: "all", force: true }, HEAVY_TIMEOUT_MS);
+        void post("/crystals/auto", { olderThanDays: 7 }, HEAVY_TIMEOUT_MS);
+        void post("/consolidate-pipeline", { tier: "all", force: true }, HEAVY_TIMEOUT_MS);
         if (sid === activeSessionId) activeSessionId = null;
         stashedFiles.delete(sid);
         startContextCache.delete(sid);

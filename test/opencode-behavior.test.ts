@@ -107,6 +107,74 @@ describe("OpenCode plugin behavior: tool.execute.after payload", () => {
   });
 });
 
+describe("OpenCode plugin behavior: sanitizeOutput recurses into nested structures", () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
+
+  it("strips base64 nested inside an object property", async () => {
+    const { plugin, calls } = await loadPlugin();
+    const longBase64 = "iVBORw0KGgo" + "A".repeat(500);
+    await plugin["tool.execute.after"]!(
+      { tool: "Screenshot", sessionID: "s-nested-1", callID: "n1", args: {} } as any,
+      { output: { image: { data: longBase64, mime: "image/png" } }, title: "shot", metadata: {} } as any,
+    );
+    const observe = calls.find((c) => c.url.endsWith("/agentmemory/observe") && c.body.data?.call_id === "n1");
+    expect(observe).toBeDefined();
+    expect(observe!.body.data.tool_output).toMatch(/<base64:stripped:/);
+    expect(observe!.body.data.tool_output).not.toMatch(/iVBORw0KGgoAAAAA/);
+  });
+
+  it("strips base64 inside an array of objects", async () => {
+    const { plugin, calls } = await loadPlugin();
+    const longBase64 = "/9j/" + "B".repeat(500);
+    await plugin["tool.execute.after"]!(
+      { tool: "MultiScreenshot", sessionID: "s-nested-2", callID: "n2", args: {} } as any,
+      { output: { images: [{ data: longBase64 }, { data: longBase64 }] }, title: "shot", metadata: {} } as any,
+    );
+    const observe = calls.find((c) => c.url.endsWith("/agentmemory/observe") && c.body.data?.call_id === "n2");
+    expect(observe).toBeDefined();
+    const matches = observe!.body.data.tool_output.match(/<base64:stripped:\d+b>/g);
+    expect(matches?.length ?? 0).toBeGreaterThanOrEqual(2);
+  });
+
+  it("strips base64 at depth 4", async () => {
+    const { plugin, calls } = await loadPlugin();
+    const longBase64 = "R0lGOD" + "D".repeat(500);
+    const deep = { a: { b: { c: { png: longBase64 } } } };
+    await plugin["tool.execute.after"]!(
+      { tool: "Deep", sessionID: "s-deep", callID: "deep-1", args: {} } as any,
+      { output: deep, title: "t", metadata: {} } as any,
+    );
+    const observe = calls.find((c) => c.url.endsWith("/agentmemory/observe") && c.body.data?.call_id === "deep-1");
+    expect(observe!.body.data.tool_output).toMatch(/<base64:stripped:/);
+  });
+
+  it("survives circular references without throwing", async () => {
+    const { plugin, calls } = await loadPlugin();
+    const longBase64 = "iVBORw0KGgo" + "C".repeat(500);
+    const circ: any = { label: longBase64 };
+    circ.self = circ;
+    await plugin["tool.execute.after"]!(
+      { tool: "Weird", sessionID: "s-circ", callID: "circ-1", args: {} } as any,
+      { output: circ, title: "t", metadata: {} } as any,
+    );
+    const observe = calls.find((c) => c.url.endsWith("/agentmemory/observe") && c.body.data?.call_id === "circ-1");
+    expect(observe).toBeDefined();
+    expect(observe!.body.data.tool_output).toMatch(/<base64:stripped:/);
+  });
+
+  it("strips data: URLs inside a nested object", async () => {
+    const { plugin, calls } = await loadPlugin();
+    const dataUrl = "data:image/png;base64," + "A".repeat(500);
+    await plugin["tool.execute.after"]!(
+      { tool: "Preview", sessionID: "s-dataurl", callID: "dataurl-1", args: {} } as any,
+      { output: { preview: { src: dataUrl } }, title: "t", metadata: {} } as any,
+    );
+    const observe = calls.find((c) => c.url.endsWith("/agentmemory/observe") && c.body.data?.call_id === "dataurl-1");
+    expect(observe!.body.data.tool_output).toMatch(/<blob:stripped:/);
+  });
+});
+
 describe("OpenCode plugin behavior: permission.asked v2 payload", () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(async () => { await teardownPlugin(); });
