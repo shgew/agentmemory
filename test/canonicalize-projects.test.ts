@@ -576,4 +576,17 @@ describe("canonicalize-projects migration", () => {
     }
   });
 
+  it("deletes profiles keyed by non-path mapping keys when migrating to a different canonical slug", async () => {
+    const { sdk, kv } = registerSubject();
+    await kv.set(KV.profiles, "old-name-c", profile("old-name-c"));
+    await kv.set(KV.profiles, "proj-c", profile("proj-c"));
+
+    const result = await runCanonicalize(sdk, { step: "canonicalize-projects" });
+
+    expect(result.perScope[KV.profiles]?.deleted).toBe(1);
+    expect(result.perScope[KV.profiles]?.alreadyCanonical).toBe(1);
+    expect(await kv.get<ProjectProfile>(KV.profiles, "old-name-c")).toBeNull();
+    expect((await kv.get<ProjectProfile>(KV.profiles, "proj-c"))?.project).toBe("proj-c");
+  });
+
 });

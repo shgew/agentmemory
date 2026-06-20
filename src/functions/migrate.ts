@@ -183,8 +183,11 @@ function updateProject<Row extends ProjectRow>(row: Row, project: string, update
   return { ...row, project };
 }
 
-function projectRowKey(row: ProjectRow): string {
-  return row.id ?? row.sessionId ?? row.project ?? "";
+const PATH_SHAPED = /^[/\\]|^[A-Za-z]:[/\\]/;
+
+  function projectRowKey(row: ProjectRow): string {
+  const raw = row.id ?? row.sessionId ?? row.project ?? "";
+  return PATH_SHAPED.test(raw) ? redactProfileKey(raw) : raw;
 }
 
 function stripWorktreeSegment(project: string): string {
@@ -246,6 +249,7 @@ async function migrateProjectScope<Row extends ProjectRow>(
 
 async function migrateProfiles(
   kv: StateKV,
+  mapping: Record<string, string>,
   canonicalProjects: ReadonlySet<string>,
   dryRun: boolean,
   touchedIds: string[],
@@ -259,7 +263,7 @@ async function migrateProfiles(
       report.unscoped++;
       continue;
     }
-    if (key.startsWith("/")) {
+    if (PATH_SHAPED.test(key)) {
       report.deleted = (report.deleted ?? 0) + 1;
       if (!dryRun) {
         await kv.delete(KV.profiles, key);
@@ -269,6 +273,15 @@ async function migrateProfiles(
     }
     if (canonicalProjects.has(key)) {
       report.alreadyCanonical++;
+      continue;
+    }
+    const mapped = mapping[key];
+    if (mapped !== undefined && mapped !== key) {
+      report.deleted = (report.deleted ?? 0) + 1;
+      if (!dryRun) {
+        await kv.delete(KV.profiles, key);
+        touchedIds.push(key);
+      }
       continue;
     }
     report.noMatch++;
@@ -326,7 +339,7 @@ export async function canonicalizeProjects(
     ...emptyScopeReport(),
     notes: "team scopes skipped: no enumerator",
   };
-  perScope[KV.profiles] = await migrateProfiles(kv, canonicalProjects, dryRun, touchedIds);
+  perScope[KV.profiles] = await migrateProfiles(kv, effectiveMap, canonicalProjects, dryRun, touchedIds);
 
   let totalUpdated = 0;
   let totalDeleted = 0;

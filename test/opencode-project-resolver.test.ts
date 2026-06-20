@@ -1,32 +1,35 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { AgentmemoryCapturePlugin } from "../plugin/opencode/agentmemory-capture";
+import type { Event as EventV1 } from "@opencode-ai/sdk";
+import type { Plugin } from "@opencode-ai/plugin";
 import { RESOLVER_SCENARIOS } from "./_fixtures/project-resolver-scenarios.js";
 
 type PluginInstance = Awaited<ReturnType<typeof AgentmemoryCapturePlugin>>;
 
-const FAKE_CTX = {
+type PluginCtx = Parameters<Plugin>[0];
+
+const FAKE_CTX: PluginCtx = {
   worktree: undefined,
   project: { id: "some-uuid" },
   client: undefined,
   directory: "/tmp/test-worktree",
   $: undefined,
-} as any;
+} as unknown as PluginCtx;
 
-type PostCall = { url: string; body: any };
+type PostCall = { url: string; body: Record<string, unknown> | null };
 
 function installFetchMock(): PostCall[] {
   const calls: PostCall[] = [];
-  const fakeFetch = vi.fn(async (input: any, init?: any) => {
-    const url = typeof input === "string" ? input : input?.url ?? "";
+  const fakeFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : (input as Request).url ?? "";
     const bodyStr = typeof init?.body === "string" ? init.body : "";
-    let parsed: any = null;
-    try { parsed = bodyStr ? JSON.parse(bodyStr) : null; } catch {}
+    let parsed: Record<string, unknown> | null = null;
+    try { parsed = bodyStr ? JSON.parse(bodyStr) as Record<string, unknown> : null; } catch {}
     calls.push({ url, body: parsed });
-    return {
-      ok: true,
+    return new Response(JSON.stringify({ context: "<test-context>" }), {
       status: 200,
-      json: async () => ({ context: "<test-context>" }),
-    } as any;
+      headers: { "content-type": "application/json" },
+    });
   });
   vi.stubGlobal("fetch", fakeFetch);
   return calls;
@@ -75,7 +78,7 @@ describe("opencode plugin project resolver", () => {
       const calls = installFetchMock();
       activePlugin = await AgentmemoryCapturePlugin(FAKE_CTX);
       await activePlugin.event!({
-        event: { type: "session.created", properties: { info: { id: "s_project_resolver", title: "T", parentID: null, version: "1" } } } as any,
+        event: { type: "session.created", properties: { info: { id: "s_project_resolver", title: "T", parentID: null, version: "1" } } } as EventV1,
       });
 
       const start = findPost(calls, "/session/start");
