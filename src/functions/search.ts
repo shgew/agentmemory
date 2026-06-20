@@ -8,6 +8,7 @@ import type { EmbeddingProvider } from '../types.js'
 import { memoryToObservation } from '../state/memory-utils.js'
 import { migrateVectorIndex } from './migrate-vector-index.js'
 import { recordAccessBatch } from './access-tracker.js'
+import { recordAudit } from './audit.js'
 import { logger } from "../logger.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
 
@@ -374,8 +375,24 @@ export async function reindexVectors(kv: StateKV): Promise<{
   let swapped = false
   if (stats.success) {
     vi.restoreFrom(index)
-    await flushIndexSave()
     swapped = true
+    try {
+      await flushIndexSave()
+    } catch (err) {
+      return {
+        ...stats,
+        success: false,
+        swapped,
+        provider: ep.name,
+        dimensions: ep.dimensions,
+        error: `index swapped but persistence failed: ${err instanceof Error ? err.message : String(err)}`,
+      }
+    }
+    await recordAudit(kv, 'vector_index_swap', 'mem::reindex-vectors', [ep.name], {
+      provider: ep.name,
+      dimensions: ep.dimensions,
+      totalProcessed: stats.totalProcessed,
+    })
   }
   return { ...stats, swapped, provider: ep.name, dimensions: ep.dimensions }
 }

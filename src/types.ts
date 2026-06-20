@@ -608,7 +608,8 @@ export interface AuditEntry {
     | "slot_replace"
     | "slot_create"
     | "slot_delete"
-    | "slot_reflect";
+    | "slot_reflect"
+    | "vector_index_swap";
   userId?: string;
   functionId: string;
   targetIds: string[];
