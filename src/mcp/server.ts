@@ -253,7 +253,20 @@ export function registerMcpEndpoints(
           }
 
           case "memory_sessions": {
-            const sessions = await kv.list(KV.sessions);
+            const rawLimit = Number(args.limit);
+            const limit =
+              Number.isFinite(rawLimit) && rawLimit > 0
+                ? Math.floor(rawLimit)
+                : 20;
+            const allSessions = await kv.list<Session>(KV.sessions);
+            const recencyKey = (s: Session): string =>
+              [s.updatedAt, s.endedAt, s.lastCheckpointAt, s.startedAt].reduce(
+                (acc: string, t) => (typeof t === "string" && t > acc ? t : acc),
+                "",
+              );
+            const sessions = allSessions
+              .sort((a, b) => (recencyKey(a) < recencyKey(b) ? 1 : -1))
+              .slice(0, limit);
             return {
               status_code: 200,
               body: {
