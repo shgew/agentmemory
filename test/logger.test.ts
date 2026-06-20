@@ -58,4 +58,11 @@ describe("logger timestamps", () => {
     expect(line).toMatch(ISO_PREFIX);
     expect(line).toContain("[agentmemory] feature enabled");
   });
+
+  it("does not write quiet bootLog lines to stderr", () => {
+    setBootVerbose(false);
+    const spy = spyStderr();
+    bootLog("buffered line");
+    expect(spy).not.toHaveBeenCalled();
+  });
 });
