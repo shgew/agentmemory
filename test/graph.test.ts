@@ -1,10 +1,10 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { registerGraphFunction } from "../src/functions/graph.js";
+import { registerGraphFunction, getGraphExtractTimeoutMs } from "../src/functions/graph.js";
 import type {
   CompressedObservation,
   GraphNode,
@@ -728,5 +728,84 @@ describe("Graph Functions", () => {
       expect(result.success).toBe(true);
       expect(listCalls).toBe(0);
     });
+  });
+});
+
+
+describe("parseGraphXml relation resolution", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    vi.clearAllMocks();
+    mockProvider.compress.mockResolvedValue(
+      `<entities></entities><relationships></relationships>`,
+    );
+    registerGraphFunction(sdk as never, kv as never, mockProvider as never);
+  });
+
+  it("resolves relationship endpoints case-insensitively and trimmed", async () => {
+    mockProvider.compress.mockResolvedValueOnce(`<entities>
+<entity type="concept" name="UserService"/>
+<entity type="concept" name="Database"/>
+</entities>
+<relationships>
+<relationship type="uses" source="userservice" target=" Database " weight="0.8"/>
+</relationships>`);
+
+    const result = (await sdk.trigger("mem::graph-extract", {
+      observations: [testObs],
+    })) as { success: boolean; nodesAdded: number; edgesAdded: number };
+
+    expect(result.success).toBe(true);
+    expect(result.nodesAdded).toBe(2);
+    expect(result.edgesAdded).toBe(1);
+
+    const edges = await kv.list<GraphEdge>("mem:graph:edges");
+    expect(edges).toHaveLength(1);
+    expect(edges[0].type).toBe("uses");
+  });
+
+  it("accepts body-form <relationship>...</relationship> tags", async () => {
+    mockProvider.compress.mockResolvedValueOnce(`<entities>
+<entity type="file" name="src/a.ts"/>
+<entity type="function" name="run"/>
+</entities>
+<relationships>
+<relationship type="uses" source="src/a.ts" target="run" weight="0.7"></relationship>
+</relationships>`);
+
+    const result = (await sdk.trigger("mem::graph-extract", {
+      observations: [testObs],
+    })) as { success: boolean; edgesAdded: number };
+
+    expect(result.success).toBe(true);
+    expect(result.edgesAdded).toBe(1);
+
+    const edges = await kv.list<GraphEdge>("mem:graph:edges");
+    expect(edges).toHaveLength(1);
+    expect(edges[0].type).toBe("uses");
+  });
+
+  it("drops a relationship whose endpoint is not a declared entity", async () => {
+    mockProvider.compress.mockResolvedValueOnce(`<entities>
+<entity type="concept" name="Declared"/>
+</entities>
+<relationships>
+<relationship type="related_to" source="Declared" target="Undeclared" weight="0.5"/>
+</relationships>`);
+
+    const result = (await sdk.trigger("mem::graph-extract", {
+      observations: [testObs],
+    })) as { success: boolean; nodesAdded: number; edgesAdded: number };
+
+    expect(result.success).toBe(true);
+    expect(result.nodesAdded).toBe(1);
+    expect(result.edgesAdded).toBe(0);
+
+    const edges = await kv.list<GraphEdge>("mem:graph:edges");
+    expect(edges).toHaveLength(0);
   });
 });

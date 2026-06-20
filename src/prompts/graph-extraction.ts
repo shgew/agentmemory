@@ -14,7 +14,19 @@ Rules:
 - Extract concrete entities only (real file paths, function names, library names)
 - Use the most specific type available
 - Weight relationships by how strong/direct the connection is
-- If no entities found, output empty tags`;
+- If no entities found, output empty tags
+- Every relationship source and target MUST be the exact name of an entity declared in <entities>; never reference an entity you did not declare
+
+Example:
+<entities>
+  <entity type="file" name="src/auth/login.ts"/>
+  <entity type="function" name="validateToken"/>
+  <entity type="library" name="jose"/>
+</entities>
+<relationships>
+  <relationship type="imports" source="src/auth/login.ts" target="jose" weight="0.9"/>
+  <relationship type="uses" source="validateToken" target="jose" weight="0.8"/>
+</relationships>`;
 
 export function buildGraphExtractionPrompt(
   observations: Array<{
