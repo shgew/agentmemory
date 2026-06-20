@@ -11,7 +11,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/MCP-53_tools-1f6feb?style=flat-square" alt="53 MCP tools" />
   <img src="https://img.shields.io/badge/Plugin-22_hooks-1f6feb?style=flat-square" alt="22 hooks" />
-  <img src="https://img.shields.io/badge/Commands-2_slash-1f6feb?style=flat-square" alt="2 slash commands" />
+  <img src="https://img.shields.io/badge/Skills-9_invocable-1f6feb?style=flat-square" alt="9 invocable skills" />
   <img src="https://img.shields.io/badge/R@5-95.2%25-00875f?style=flat-square" alt="95.2% R@5" />
 </p>
 
@@ -58,16 +58,6 @@ Copy the plugin file from this repo:
 ```bash
 mkdir -p ~/.config/opencode/plugins
 cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
-```
-
-### 4. Add the slash commands
-
-Copy the commands into your project or global `.opencode/commands/` directory:
-
-```bash
-mkdir -p ~/.config/opencode/commands
-cp plugin/opencode/commands/recall.md ~/.config/opencode/commands/
-cp plugin/opencode/commands/remember.md ~/.config/opencode/commands/
 ```
 
 Restart OpenCode or open a new session. The plugin auto-captures everything.
@@ -206,10 +196,6 @@ agentmemory  ──push──▶  OpenCode system prompt
 
 agentmemory already persists everything in SQLite (`data/state_store.db`). Adding an intermediate MEMORY.md file would duplicate data, introduce sync lag, and require the model to re-parse structured context from markdown. Direct injection delivers the same data with lower latency and zero staleness — the agent always sees what agentmemory knows right now.
 
-## Slash commands
-
-- `/recall <query>` — Search past observations and lessons
-- `/remember <text>` — Save an insight to long-term memory
 
 ## Session instruction injection
 
@@ -222,7 +208,7 @@ Agentmemory usage instructions are injected into the system prompt on the first 
 | SubagentStop | OpenCode's `SubtaskPart` type has no completion/result fields; subtask lifecycle ends are not exposed as distinct events in the OpenCode SDK |
 | TaskCompleted | No team/teammate concept in OpenCode; `todo.updated` captures task state changes as a partial equivalent |
 | Stop | `session.compacted` event handler exists; `experimental.session.compacting` injection hook defined in SDK but Go binary (v1.14.41) doesn't wire it — will auto-activate when upstream implements it |
-| Skills (remember/recall/forget/session-history) | Covered by injected system instructions via `experimental.chat.system.transform` — agent receives usage guidance on first turn |
+| Skills (remember/recall/forget/session-history/health/...) | Shipped under `plugin/skills/` (16 native skills, 9 invocable). OpenCode merges them into its slash-command palette automatically via `source: skill`. |
 | Consolidation pipeline (crystals/auto + consolidate-pipeline) | Now called on `session.deleted` — mirrors Claude's `CONSOLIDATION_ENABLED=true` behavior |
 | Claude MEMORY.md bridge | OpenCode-specific; OpenCode uses its own AGENTS.md mechanism, not Claude's MEMORY.md |
 
