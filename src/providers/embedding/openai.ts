@@ -45,13 +45,13 @@ const DEFAULT_MAX_BATCH = 256;
 // embedBatch splits into sequential sub-batches of this size to stay under it.
 function resolveMaxBatch(override: string | undefined): number {
   if (override !== undefined && override.trim().length > 0) {
-    const parsed = parseInt(override, 10);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
+    const raw = override.trim();
+    if (!/^[1-9]\d*$/.test(raw)) {
       throw new Error(
         `OPENAI_EMBEDDING_MAX_BATCH must be a positive integer, got: ${override}`,
       );
     }
-    return parsed;
+    return Number(raw);
   }
   return DEFAULT_MAX_BATCH;
 }
