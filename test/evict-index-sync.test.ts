@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CompressedObservation, Memory, Session } from "../src/types.js";
 import { KV } from "../src/state/schema.js";
 
@@ -72,6 +72,10 @@ function removeMock() {
 }
 
 describe("mem::evict keeps the search index in sync", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("removes evicted low-importance observations from the index and flushes", async () => {
     const sessionId = "ses_idx";
     const session: Session = {
