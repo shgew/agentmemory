@@ -167,6 +167,11 @@ async function seedDefaults(kv: StateKV): Promise<void> {
           pinned: tmpl.pinned,
           updatedAt: ts,
         });
+        await recordAudit(kv, "slot_seed_reconcile", "seedDefaults", [tmpl.label], {
+          scope: tmpl.scope,
+          fromPinned: existing.pinned,
+          toPinned: tmpl.pinned,
+        });
       }
       continue;
     }

@@ -614,7 +614,8 @@ export interface AuditEntry {
     | "canonicalize_projects"
     | "session_sweep"
     | "session_checkpoint"
-    | "vector_index_swap";
+    | "vector_index_swap"
+    | "slot_seed_reconcile";
   userId?: string;
   functionId: string;
   targetIds: string[];
