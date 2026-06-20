@@ -449,4 +449,92 @@ describe("handleToolCall", () => {
     expect(parsed.deleted).toBe(1);
     expect(parsed.requested).toBe(2);
   });
+
+  it("memory_recall filters local fallback by project when provided", async () => {
+    const kv = new InMemoryKV();
+    await handleToolCall(
+      "memory_save",
+      { content: "auth pattern in foo", project: "foo" },
+      kv,
+    );
+    await handleToolCall(
+      "memory_save",
+      { content: "auth pattern in bar", project: "bar" },
+      kv,
+    );
+    const result = await handleToolCall(
+      "memory_recall",
+      { query: "auth", project: "foo" },
+      kv,
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.results).toHaveLength(1);
+    expect(parsed.results[0].content).toBe("auth pattern in foo");
+    expect(parsed.results[0].project).toBe("foo");
+  });
+
+  it("memory_smart_search filters local fallback by project", async () => {
+    const kv = new InMemoryKV();
+    await handleToolCall(
+      "memory_save",
+      { content: "bcrypt in proj-a", project: "proj-a" },
+      kv,
+    );
+    await handleToolCall(
+      "memory_save",
+      { content: "bcrypt in proj-b", project: "proj-b" },
+      kv,
+    );
+    const result = await handleToolCall(
+      "memory_smart_search",
+      { query: "bcrypt", project: "proj-a" },
+      kv,
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.results).toHaveLength(1);
+    expect(parsed.results[0].content).toBe("bcrypt in proj-a");
+  });
+
+  it("memory_recall without project returns all matches across projects", async () => {
+    const kv = new InMemoryKV();
+    await handleToolCall(
+      "memory_save",
+      { content: "shared thing in foo", project: "foo" },
+      kv,
+    );
+    await handleToolCall(
+      "memory_save",
+      { content: "shared thing in bar", project: "bar" },
+      kv,
+    );
+    const result = await handleToolCall(
+      "memory_recall",
+      { query: "shared thing" },
+      kv,
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.results).toHaveLength(2);
+  });
+
+  it("memory_recall with project also matches legacy memories without a project field", async () => {
+    const kv = new InMemoryKV();
+    await handleToolCall(
+      "memory_save",
+      { content: "legacy memory" },
+      kv,
+    );
+    await handleToolCall(
+      "memory_save",
+      { content: "project-tagged memory", project: "alpha" },
+      kv,
+    );
+    const result = await handleToolCall(
+      "memory_recall",
+      { query: "memory", project: "alpha" },
+      kv,
+    );
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.results).toHaveLength(1);
+    expect(parsed.results[0].content).toBe("project-tagged memory");
+  });
 });

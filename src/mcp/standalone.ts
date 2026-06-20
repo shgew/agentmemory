@@ -173,6 +173,10 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
         const n = Number(budget);
         if (Number.isFinite(n) && n > 0) v.tokenBudget = Math.floor(n);
       }
+      const project = args["project"];
+      if (typeof project === "string" && project.trim()) {
+        v.project = project.trim();
+      }
       return v;
     }
     case "memory_sessions": {
@@ -299,9 +303,11 @@ async function handleLocal(
     case "memory_smart_search": {
       const query = (v.query || "").toLowerCase();
       const limit = v.limit ?? DEFAULT_LIMIT;
-      const all =
-        await kvInstance.list<Record<string, unknown>>("mem:memories");
-      const results = all
+      const all = await kvInstance.list<Record<string, unknown>>("mem:memories");
+      const scoped = v.project
+        ? all.filter((m) => typeof m["project"] === "string" && m["project"] === v.project)
+        : all;
+      const results = scoped
         .filter((m) => {
           const text = [
             typeof m["title"] === "string" ? m["title"] : "",
