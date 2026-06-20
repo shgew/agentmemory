@@ -129,5 +129,7 @@ describe("api::sessions limit + recency", () => {
     const res = (await fn(reqWithLimit("0"))) as SessionsResponse;
 
     expect(res.body.sessions).toHaveLength(1);
+    const negative = (await fn(reqWithLimit("-1"))) as SessionsResponse;
+    expect(negative.body.sessions).toHaveLength(1);
   });
 });

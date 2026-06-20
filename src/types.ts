@@ -14,6 +14,8 @@ export interface Session {
   summary?: string;
   commitShas?: string[];
   agentId?: string;
+  updatedAt?: string;
+  lastCheckpointAt?: string;
 }
 
 export interface CommitLink {
