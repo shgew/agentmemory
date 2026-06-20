@@ -92,6 +92,15 @@ export function createFallbackProvider(
   return new ResilientProvider(providers[0]);
 }
 
+// #blockers: graph extraction can run on a different model than summarize so a
+// relation-native or smaller model can be paired with the heavier summary
+// model. Falls back to the base model when AGENTMEMORY_GRAPH_MODEL is unset.
+export function resolveGraphProviderConfig(
+  base: ProviderConfig,
+): ProviderConfig {
+  return { ...base, model: getEnvVar("AGENTMEMORY_GRAPH_MODEL") || base.model };
+}
+
 function createBaseProvider(config: ProviderConfig): MemoryProvider {
   switch (config.provider) {
     case "minimax":
