@@ -26,16 +26,21 @@
 
 type Fields = Record<string, unknown> | undefined;
 
+function ts(): string {
+  return new Date().toISOString();
+}
+
 function fmt(level: string, msg: string, fields: Fields): string {
+  const prefix = `${ts()} [agentmemory] ${level}`;
   if (!fields || Object.keys(fields).length === 0) {
-    return `[agentmemory] ${level} ${msg}`;
+    return `${prefix} ${msg}`;
   }
   try {
-    return `[agentmemory] ${level} ${msg} ${JSON.stringify(fields)}`;
+    return `${prefix} ${msg} ${JSON.stringify(fields)}`;
   } catch {
-    // Fields contained a circular reference or a BigInt — fall back
+    // Fields contained a circular reference or a BigInt - fall back
     // to the plain message so a log line never throws.
-    return `[agentmemory] ${level} ${msg}`;
+    return `${prefix} ${msg}`;
   }
 }
 
@@ -88,7 +93,7 @@ export function isBootVerbose(): boolean {
 export function bootLog(msg: string): void {
   if (bootVerbose) {
     try {
-      process.stderr.write(`[agentmemory] ${msg}\n`);
+      process.stderr.write(`${ts()} [agentmemory] ${msg}\n`);
     } catch {
       // stderr unavailable — drop.
     }
@@ -101,7 +106,7 @@ export function bootWarn(msg: string): void {
   // Warnings always surface; they're rare and the user needs to see
   // them even when the rest of the boot log is suppressed.
   try {
-    process.stderr.write(`[agentmemory] warn ${msg}\n`);
+    process.stderr.write(`${ts()} [agentmemory] warn ${msg}\n`);
   } catch {}
 }
 
