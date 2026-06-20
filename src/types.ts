@@ -613,7 +613,8 @@ export interface AuditEntry {
     | "slot_reflect"
     | "canonicalize_projects"
     | "session_sweep"
-    | "session_checkpoint";
+    | "session_checkpoint"
+    | "vector_index_swap";
   userId?: string;
   functionId: string;
   targetIds: string[];
