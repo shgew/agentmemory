@@ -6,6 +6,7 @@ import { SearchIndex } from '../state/search-index.js'
 import { VectorIndex } from '../state/vector-index.js'
 import type { EmbeddingProvider } from '../types.js'
 import { memoryToObservation } from '../state/memory-utils.js'
+import { migrateVectorIndex } from './migrate-vector-index.js'
 import { recordAccessBatch } from './access-tracker.js'
 import { logger } from "../logger.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
@@ -319,7 +320,71 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
   return count
 }
 
+// Re-embed the whole corpus against the active embedding provider and swap
+// the result into the live vector index. Used after switching embedding
+// model/dimensions: the new model produces a different vector space, so old
+// vectors must be recomputed (see the dimension restore guard in index.ts).
+// The new index is built off to the side via migrateVectorIndex so the live
+// index keeps serving during the (possibly long) rebuild, then swapped in
+// place with restoreFrom, since IndexPersistence holds a reference to the live
+// VectorIndex, so replacing the reference would desync persistence. The swap
+// only happens on a fully clean rebuild (failed === 0); on any failure the
+// live index is left untouched and the caller gets failedSessions to retry.
+export async function reindexVectors(kv: StateKV): Promise<{
+  success: boolean
+  swapped: boolean
+  totalProcessed: number
+  failed: number
+  vectorSize: number
+  failedSessions: string[]
+  provider: string | null
+  dimensions: number | null
+  error?: string
+}> {
+  const ep = currentEmbeddingProvider
+  if (!ep) {
+    return {
+      success: false,
+      swapped: false,
+      totalProcessed: 0,
+      failed: 0,
+      vectorSize: 0,
+      failedSessions: [],
+      provider: null,
+      dimensions: null,
+      error:
+        'no embedding provider configured; set EMBEDDING_PROVIDER or a provider API key and restart',
+    }
+  }
+  const vi = vectorIndex
+  if (!vi) {
+    return {
+      success: false,
+      swapped: false,
+      totalProcessed: 0,
+      failed: 0,
+      vectorSize: 0,
+      failedSessions: [],
+      provider: ep.name,
+      dimensions: ep.dimensions,
+      error: 'vector index not initialized',
+    }
+  }
+  const { index, ...stats } = await migrateVectorIndex(kv, ep)
+  let swapped = false
+  if (stats.success) {
+    vi.restoreFrom(index)
+    await flushIndexSave()
+    swapped = true
+  }
+  return { ...stats, swapped, provider: ep.name, dimensions: ep.dimensions }
+}
+
 export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
+  sdk.registerFunction('mem::reindex-vectors', async () => {
+    return await reindexVectors(kv)
+  })
+
   sdk.registerFunction(
     'mem::search',
     async (data: {
