@@ -134,16 +134,45 @@ export function registerConsolidationPipelineFunction(
       }
 
       if (tier === "all" || tier === "reflect") {
-        try {
-          const reflectResult = await sdk.trigger({ function_id: "mem::reflect", payload: {
-            maxClusters: 10,
-            project: data?.project,
-          } });
-          results.reflect = reflectResult;
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          logger.warn("Reflect tier failed", { error: msg });
-          results.reflect = { error: msg };
+        const REFLECT_GATE_MS = 24 * 60 * 60 * 1000;
+        const reflectWatermarkKey = `reflect:last-success:${data?.project || "global"}`;
+        let reflectGated = false;
+        if (tier === "all") {
+          const last = await kv
+            .get<{ at: string }>(KV.config, reflectWatermarkKey)
+            .catch(() => null);
+          if (
+            last?.at &&
+            Date.now() - new Date(last.at).getTime() < REFLECT_GATE_MS
+          ) {
+            reflectGated = true;
+          }
+        }
+        if (reflectGated) {
+          results.reflect = {
+            skipped: true,
+            reason: "reflect ran within the last 24h",
+          };
+        } else {
+          try {
+            const reflectResult = await sdk.trigger({ function_id: "mem::reflect", payload: {
+              maxClusters: 10,
+              project: data?.project,
+            } });
+            results.reflect = reflectResult;
+            if (
+              (reflectResult as { success?: boolean } | null | undefined)
+                ?.success === true
+            ) {
+              await kv.set(KV.config, reflectWatermarkKey, {
+                at: new Date().toISOString(),
+              });
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.warn("Reflect tier failed", { error: msg });
+            results.reflect = { error: msg };
+          }
         }
       }
 

@@ -10,6 +10,7 @@ vi.mock("../src/config.js", () => ({
 }));
 
 import { registerConsolidationPipelineFunction } from "../src/functions/consolidation-pipeline.js";
+import { registerReflectFunctions } from "../src/functions/reflect.js";
 import { isConsolidationEnabled } from "../src/config.js";
 import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory } from "../src/types.js";
 
@@ -248,5 +249,100 @@ describe("Consolidation Pipeline", () => {
     expect(result.success).toBe(true);
     expect(result.results).toBeDefined();
     vi.mocked(isConsolidationEnabled).mockReturnValue(true);
+  });
+
+  it("reflect gate skips automatic reflect within 24h of last success", async () => {
+    const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
+    const reflectFn = vi.fn().mockResolvedValue({ success: true });
+    sdk.registerFunction("mem::reflect", reflectFn);
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    await kv.set("mem:config", "reflect:last-success:global", { at: new Date().toISOString() });
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", { tier: "all" })) as {
+      results: Record<string, unknown>;
+    };
+    const reflect = result.results.reflect as { skipped?: boolean };
+    expect(reflect.skipped).toBe(true);
+    expect(reflectFn).not.toHaveBeenCalled();
+  });
+
+  it("reflect gate runs reflect after 24h and updates the watermark", async () => {
+    const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
+    const reflectFn = vi.fn().mockResolvedValue({ success: true, newInsights: 1 });
+    sdk.registerFunction("mem::reflect", reflectFn);
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    await kv.set("mem:config", "reflect:last-success:global", {
+      at: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+    });
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", { tier: "all" })) as {
+      results: Record<string, unknown>;
+    };
+    const reflect = result.results.reflect as { skipped?: boolean };
+    expect(reflect.skipped).toBeUndefined();
+    expect(reflectFn).toHaveBeenCalled();
+    const wm = await kv.get<{ at: string }>("mem:config", "reflect:last-success:global");
+    expect(new Date(wm!.at).getTime()).toBeGreaterThan(Date.now() - 5000);
+  });
+
+  it("explicit tier=reflect bypasses the gate", async () => {
+    const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
+    const reflectFn = vi.fn().mockResolvedValue({ success: true });
+    sdk.registerFunction("mem::reflect", reflectFn);
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    await kv.set("mem:config", "reflect:last-success:global", { at: new Date().toISOString() });
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "reflect" });
+    expect(reflectFn).toHaveBeenCalled();
+  });
+
+  it("reflect gate does not write the watermark when reflect fails", async () => {
+    const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
+    sdk.registerFunction("mem::reflect", vi.fn().mockResolvedValue({ success: false, error: "boom" }));
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "all" });
+
+    const wm = await kv.get("mem:config", "reflect:last-success:global");
+    expect(wm).toBeNull();
+  });
+
+  it("reflect gate does not write the watermark when the real reflect fails on every cluster", async () => {
+    const now = new Date().toISOString();
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockRejectedValue(new Error("provider down")),
+    };
+    registerReflectFunctions(sdk as never, kv as never, provider as never);
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+
+    await kv.set("mem:graph:nodes", "n1", {
+      id: "node_security", type: "concept", name: "security",
+      properties: {}, sourceObservationIds: [], createdAt: now,
+    });
+    await kv.set("mem:graph:nodes", "n2", {
+      id: "node_validation", type: "concept", name: "validation",
+      properties: {}, sourceObservationIds: [], createdAt: now,
+    });
+    await kv.set("mem:graph:edges", "e1", {
+      id: "e1", type: "related_to", sourceNodeId: "node_security",
+      targetNodeId: "node_validation", weight: 1, sourceObservationIds: [], createdAt: now,
+    });
+    for (const [i, fact] of [
+      "always validate security inputs",
+      "testing improves security coverage",
+      "validation prevents injection",
+    ].entries()) {
+      await kv.set("mem:semantic", `s${i}`, {
+        id: `s${i}`, fact, confidence: 0.8, sourceSessionIds: [], sourceMemoryIds: [],
+        accessCount: 1, lastAccessedAt: now, strength: 0.8, createdAt: now, updatedAt: now,
+      });
+    }
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "all" });
+
+    const wm = await kv.get("mem:config", "reflect:last-success:global");
+    expect(wm).toBeNull();
   });
 });

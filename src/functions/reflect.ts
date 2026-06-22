@@ -1,6 +1,6 @@
 import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
-import { KV, fingerprintId } from "../state/schema.js";
+import { KV, fingerprintId, jaccardSimilarity } from "../state/schema.js";
 import type {
   Insight,
   GraphNode,
@@ -32,6 +32,119 @@ function reinforceInsight(insight: Insight): void {
   );
   insight.lastReinforcedAt = now;
   insight.updatedAt = now;
+}
+
+function normalizeForMatch(text: string): string {
+  return text
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sameInsightTitle(a: string, b: string): boolean {
+  const normA = normalizeForMatch(a);
+  const normB = normalizeForMatch(b);
+  if (normA === normB) return true;
+  const tokensA = normA.split(" ").filter((t) => t.length > 2);
+  const tokensB = normB.split(" ").filter((t) => t.length > 2);
+  if (tokensA.length < 4 || tokensB.length < 4) return false;
+  return jaccardSimilarity(normA, normB) >= 0.9;
+}
+
+function isBetterRepresentative(candidate: Insight, current: Insight): boolean {
+  if (candidate.confidence !== current.confidence) {
+    return candidate.confidence > current.confidence;
+  }
+  const candTime = candidate.lastReinforcedAt ?? candidate.updatedAt;
+  const currTime = current.lastReinforcedAt ?? current.updatedAt;
+  return candTime > currTime;
+}
+
+function collapseInsightsByTitle<T extends Insight>(items: T[]): T[] {
+  const reps: T[] = [];
+  for (const item of items) {
+    let merged = false;
+    for (let i = 0; i < reps.length; i++) {
+      if (item.project === reps[i].project && sameInsightTitle(item.title, reps[i].title)) {
+        if (isBetterRepresentative(item, reps[i])) reps[i] = item;
+        merged = true;
+        break;
+      }
+    }
+    if (!merged) reps.push(item);
+  }
+  return reps;
+}
+
+function isNearDuplicateInsight(
+  a: { title: string; content: string },
+  b: { title: string; content: string },
+): boolean {
+  const titleSim = jaccardSimilarity(
+    normalizeForMatch(a.title),
+    normalizeForMatch(b.title),
+  );
+  if (titleSim < 0.75) return false;
+  const combinedSim = jaccardSimilarity(
+    normalizeForMatch(`${a.title} ${a.content}`),
+    normalizeForMatch(`${b.title} ${b.content}`),
+  );
+  return combinedSim >= 0.88;
+}
+
+function findNearDuplicateInsight(
+  candidate: { title: string; content: string; project?: string },
+  existing: Insight[],
+): Insight | null {
+  let best: Insight | null = null;
+  let bestSim = 0;
+  for (const ins of existing) {
+    if (ins.deleted) continue;
+    if (ins.project !== candidate.project) continue;
+    if (!isNearDuplicateInsight(candidate, ins)) continue;
+    const sim = jaccardSimilarity(
+      normalizeForMatch(`${candidate.title} ${candidate.content}`),
+      normalizeForMatch(`${ins.title} ${ins.content}`),
+    );
+    if (sim > bestSim) {
+      bestSim = sim;
+      best = ins;
+    }
+  }
+  return best;
+}
+
+function boundedUnion(
+  existing: string[],
+  incoming: string[],
+  cap: number,
+): string[] {
+  if (incoming.length === 0) return existing;
+  const seen = new Set(existing);
+  const result = existing.slice();
+  for (const item of incoming) {
+    if (result.length >= cap) break;
+    if (!seen.has(item)) {
+      seen.add(item);
+      result.push(item);
+    }
+  }
+  return result;
+}
+
+function reinforceInsightWithProvenance(
+  insight: Insight,
+  cluster: ConceptCluster,
+  conceptNames: string[],
+): void {
+  reinforceInsight(insight);
+  insight.sourceMemoryIds = boundedUnion(insight.sourceMemoryIds, cluster.factIds, 100);
+  insight.sourceLessonIds = boundedUnion(insight.sourceLessonIds, cluster.lessonIds, 100);
+  insight.sourceCrystalIds = boundedUnion(insight.sourceCrystalIds, cluster.crystalIds, 100);
+  insight.sourceConceptCluster = boundedUnion(insight.sourceConceptCluster, conceptNames, 50);
+  insight.tags = boundedUnion(insight.tags, conceptNames, 50);
 }
 
 function buildGraphClusters(
@@ -204,6 +317,12 @@ export function registerReflectFunctions(
       let reinforced = 0;
       let clustersSkipped = 0;
       let totalInsights = 0;
+      let clustersAttempted = 0;
+      let clustersFailed = 0;
+      const activeInsights: Insight[] = (
+        await kv.list<Insight>(KV.insights)
+      ).filter((i) => !i.deleted);
+      const reinforcedIds = new Set<string>();
 
       for (const conceptNames of conceptClusters) {
         if (totalInsights >= maxTotal) break;
@@ -236,6 +355,7 @@ export function registerReflectFunctions(
           clustersSkipped++;
           continue;
         }
+        clustersAttempted++;
 
         const cluster: ConceptCluster = {
           concepts: conceptNames,
@@ -276,13 +396,35 @@ export function registerReflectFunctions(
 
             if (!content) continue;
 
-            const fp = fingerprintId("ins", content.trim().toLowerCase());
-            const existing = await kv.get<Insight>(KV.insights, fp);
+            const fp = fingerprintId(
+              "ins",
+              `${data?.project ?? ""}\n${content.trim().toLowerCase()}`,
+            );
+            let target = await kv.get<Insight>(KV.insights, fp);
+            if (target?.deleted) target = null;
 
-            if (existing && !existing.deleted) {
-              reinforceInsight(existing);
-              await kv.set(KV.insights, existing.id, existing);
-              reinforced++;
+            if (!target) {
+              const legacyFp = fingerprintId("ins", content.trim().toLowerCase());
+              const legacy = await kv.get<Insight>(KV.insights, legacyFp);
+              if (legacy && !legacy.deleted && legacy.project === data?.project) {
+                target = legacy;
+              }
+            }
+
+            if (!target) {
+              target = findNearDuplicateInsight(
+                { title, content, project: data?.project },
+                activeInsights,
+              );
+            }
+
+            if (target) {
+              if (!reinforcedIds.has(target.id)) {
+                reinforceInsightWithProvenance(target, cluster, conceptNames);
+                await kv.set(KV.insights, target.id, target);
+                reinforcedIds.add(target.id);
+                reinforced++;
+              }
             } else {
               const now = new Date().toISOString();
               const insight: Insight = {
@@ -302,6 +444,7 @@ export function registerReflectFunctions(
                 decayRate: 0.05,
               };
               await kv.set(KV.insights, insight.id, insight);
+              activeInsights.push(insight);
               newInsights++;
             }
 
@@ -309,9 +452,12 @@ export function registerReflectFunctions(
             totalInsights++;
           }
         } catch {
+          clustersFailed++;
           continue;
         }
       }
+      const reflectFailed =
+        clustersAttempted > 0 && clustersFailed === clustersAttempted;
 
       try {
         await recordAudit(kv, "reflect", "mem::reflect", [], {
@@ -324,7 +470,7 @@ export function registerReflectFunctions(
       } catch {}
 
       return {
-        success: true,
+        success: !reflectFailed,
         newInsights,
         reinforced,
         clustersProcessed: conceptClusters.length - clustersSkipped,
@@ -351,6 +497,8 @@ export function registerReflectFunctions(
       if (data?.project) {
         items = items.filter((i) => i.project === data.project);
       }
+
+      items = collapseInsightsByTitle(items);
 
       items.sort((a, b) => b.confidence - a.confidence);
 
@@ -405,16 +553,24 @@ export function registerReflectFunctions(
 
       scored.sort((a, b) => b.score - a.score);
 
+      const dedupedScored: typeof scored = [];
+      for (const s of scored) {
+        if (dedupedScored.some((d) => d.insight.project === s.insight.project && sameInsightTitle(d.insight.title, s.insight.title))) {
+          continue;
+        }
+        dedupedScored.push(s);
+      }
+
       try {
         await recordAudit(kv, "insight_search", "mem::insight-search", [], {
           query: data.query,
-          resultCount: scored.length,
+          resultCount: dedupedScored.length,
         });
       } catch {}
 
       return {
         success: true,
-        insights: scored.slice(0, limit).map((s) => ({
+        insights: dedupedScored.slice(0, limit).map((s) => ({
           ...s.insight,
           score: Math.round(s.score * 1000) / 1000,
         })),

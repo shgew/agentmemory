@@ -6,6 +6,7 @@ vi.mock("../src/logger.js", () => ({
 
 import { registerReflectFunctions } from "../src/functions/reflect.js";
 import type { Insight, GraphNode, GraphEdge, SemanticMemory, Lesson, Crystal } from "../src/types.js";
+import { fingerprintId } from "../src/state/schema.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -218,6 +219,110 @@ describe("Reflect", () => {
       expect(after[0].reinforcements).toBe(1);
     });
 
+    it("reinforces a near-duplicate insight instead of inserting a new one", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+
+      const respA = `<insights><insight confidence="0.9" title="Defense in Depth">Security requires layered protection across input validation and safe deny lists together.</insight></insights>`;
+      const respB = `<insights><insight confidence="0.9" title="Defense in Depth">Security requires layered protection across input validation and safe deny lists working together.</insight></insights>`;
+      provider.summarize.mockReset();
+      provider.summarize.mockResolvedValueOnce(respA).mockResolvedValueOnce(respB);
+
+      await sdk.trigger("mem::reflect", {});
+      const first = await kv.list<Insight>("mem:insights");
+      expect(first.length).toBe(1);
+
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        reinforced: number;
+        newInsights: number;
+      };
+
+      expect(result.reinforced).toBe(1);
+      expect(result.newInsights).toBe(0);
+
+      const after = await kv.list<Insight>("mem:insights");
+      expect(after.length).toBe(1);
+      expect(after[0].reinforcements).toBe(1);
+    });
+
+    it("unions new-cluster provenance when reinforcing a near-duplicate", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs", "sem_1"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage", "sem_2"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection", "sem_3"));
+
+      const respA = `<insights><insight confidence="0.8" title="Layered defense protects systems against threats">Use multiple independent layers so a single failure never compromises the whole system together.</insight></insights>`;
+      const respB = `<insights><insight confidence="0.8" title="Layered defense protects systems against threats">Use multiple independent layers so one single failure never compromises the whole system together.</insight></insights>`;
+      provider.summarize.mockReset();
+      provider.summarize.mockResolvedValueOnce(respA).mockResolvedValueOnce(respB);
+
+      await sdk.trigger("mem::reflect", {});
+      await kv.set("mem:semantic", "sem_4", makeSemantic("Security layering matters here", "sem_4"));
+
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        reinforced: number;
+        newInsights: number;
+      };
+      expect(result.reinforced).toBe(1);
+      expect(result.newInsights).toBe(0);
+
+      const insights = await kv.list<Insight>("mem:insights");
+      expect(insights.length).toBe(1);
+      expect(insights[0].sourceMemoryIds).toContain("sem_1");
+      expect(insights[0].sourceMemoryIds).toContain("sem_4");
+      expect(insights[0].reinforcements).toBe(1);
+    });
+
+    it("keeps byte-identical insights in different projects separate", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+
+      await sdk.trigger("mem::reflect", { project: "proj-a" });
+      await sdk.trigger("mem::reflect", { project: "proj-b" });
+
+      const insights = await kv.list<Insight>("mem:insights");
+      expect(insights.length).toBe(4);
+      expect(insights.filter((i) => i.project === "proj-a").length).toBe(2);
+      expect(insights.filter((i) => i.project === "proj-b").length).toBe(2);
+    });
+
+    it("reinforces an existing insight at most once per reflect run", async () => {
+      const ts = new Date().toISOString();
+      await kv.set("mem:insights", "ins_E", {
+        id: "ins_E",
+        title: "Layered defense protects the whole system",
+        content: "Apply multiple independent layers so a single failure never compromises the entire system overall",
+        confidence: 0.8, reinforcements: 0, sourceConceptCluster: ["security"],
+        sourceMemoryIds: [], sourceLessonIds: [], sourceCrystalIds: [],
+        tags: ["security"], createdAt: ts, updatedAt: ts, decayRate: 0.05,
+      });
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+
+      const twoNearDups = `<insights><insight confidence="0.8" title="Layered defense protects the whole system">Apply multiple independent layers so a single failure never compromises the entire system overall today.</insight><insight confidence="0.8" title="Layered defense protects the whole system">Apply multiple independent layers so a single failure never compromises the entire system overall now.</insight></insights>`;
+      provider.summarize.mockReset();
+      provider.summarize.mockResolvedValue(twoNearDups);
+
+      await sdk.trigger("mem::reflect", {});
+
+      const after = await kv.get<Insight>("mem:insights", "ins_E");
+      expect(after!.reinforcements).toBe(1);
+    });
+
     it("falls back to Jaccard grouping when graph is empty", async () => {
       await kv.set("mem:semantic", "sem_1", makeSemantic("security validation is important"));
       await kv.set("mem:semantic", "sem_2", makeSemantic("security testing prevents bugs"));
@@ -248,8 +353,43 @@ describe("Reflect", () => {
         newInsights: number;
       };
 
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
       expect(result.newInsights).toBe(0);
+    });
+
+    it("reinforces a legacy content-only-keyed insight instead of inserting after the key scheme change", async () => {
+      const content = "Caching reduces latency by storing computed results close to the consumer for fast reuse";
+      const legacyFp = fingerprintId("ins", content.trim().toLowerCase());
+      const ts = new Date().toISOString();
+      await kv.set("mem:insights", legacyFp, {
+        id: legacyFp,
+        title: "Old caching note from a previous title scheme",
+        content,
+        confidence: 0.8, reinforcements: 0, sourceConceptCluster: ["security"],
+        sourceMemoryIds: [], sourceLessonIds: [], sourceCrystalIds: [],
+        tags: ["security"], createdAt: ts, updatedAt: ts, decayRate: 0.05,
+      });
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+
+      const resp = `<insights><insight confidence="0.8" title="Completely different heading with no shared words">${content}</insight></insights>`;
+      provider.summarize.mockReset();
+      provider.summarize.mockResolvedValue(resp);
+
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        reinforced: number;
+        newInsights: number;
+      };
+
+      expect(result.newInsights).toBe(0);
+      expect(result.reinforced).toBe(1);
+      const insights = await kv.list<Insight>("mem:insights");
+      expect(insights.length).toBe(1);
+      expect(insights[0].reinforcements).toBe(1);
     });
   });
 
@@ -285,6 +425,42 @@ describe("Reflect", () => {
       const result = (await sdk.trigger("mem::insight-list", { minConfidence: 0.5 })) as { insights: Insight[] };
       expect(result.insights.length).toBe(1);
     });
+
+    it("collapses near-duplicate insights by normalized title in the list", async () => {
+      const now = new Date().toISOString();
+      const base = {
+        content: "Keep registries thin.", reinforcements: 0,
+        sourceConceptCluster: [], sourceMemoryIds: [], sourceLessonIds: [],
+        sourceCrystalIds: [], project: "/dup", tags: [], createdAt: now, updatedAt: now, decayRate: 0.05,
+      };
+      await kv.set("mem:insights", "dup_1", {
+        ...base, id: "dup_1", title: "Prefer thin registries until consumers demand shape", confidence: 0.93,
+      });
+      await kv.set("mem:insights", "dup_2", {
+        ...base, id: "dup_2", title: "Prefer Thin Registries Until Consumers Demand Shape", confidence: 0.91,
+      });
+      await kv.set("mem:insights", "dup_3", {
+        ...base, id: "dup_3", title: "prefer thin registries, until consumers demand a shape.", confidence: 0.92,
+      });
+
+      const result = (await sdk.trigger("mem::insight-list", { project: "/dup" })) as { insights: Insight[] };
+      expect(result.insights.length).toBe(1);
+      expect(result.insights[0].confidence).toBe(0.93);
+    });
+
+    it("does not collapse same-title insights from different projects in the list", async () => {
+      const now = new Date().toISOString();
+      const base = {
+        content: "c", reinforcements: 0, sourceConceptCluster: [], sourceMemoryIds: [],
+        sourceLessonIds: [], sourceCrystalIds: [], tags: [], createdAt: now, updatedAt: now, decayRate: 0.05,
+      };
+      await kv.set("mem:insights", "px", { ...base, id: "px", title: "Shared insight title across many projects", confidence: 0.9, project: "proj-x" });
+      await kv.set("mem:insights", "py", { ...base, id: "py", title: "Shared insight title across many projects", confidence: 0.8, project: "proj-y" });
+
+      const result = (await sdk.trigger("mem::insight-list", {})) as { insights: Insight[] };
+      const shared = result.insights.filter((i) => i.title === "Shared insight title across many projects");
+      expect(shared.length).toBe(2);
+    });
   });
 
   describe("mem::insight-search", () => {
@@ -305,6 +481,45 @@ describe("Reflect", () => {
 
       expect(result.insights.length).toBe(1);
       expect(result.insights[0].title).toBe("Defense in Depth");
+    });
+
+    it("collapses near-duplicate insights in search results", async () => {
+      const now = new Date().toISOString();
+      const base = {
+        content: "Keep registries thin until consumers need shape.", reinforcements: 0,
+        sourceConceptCluster: [], sourceMemoryIds: [], sourceLessonIds: [],
+        sourceCrystalIds: [], tags: [], createdAt: now, updatedAt: now, decayRate: 0.05,
+      };
+      await kv.set("mem:insights", "sdup_1", {
+        ...base, id: "sdup_1", title: "Prefer thin registries until consumers demand shape", confidence: 0.93,
+      });
+      await kv.set("mem:insights", "sdup_2", {
+        ...base, id: "sdup_2", title: "Prefer Thin Registries Until Consumers Demand Shape", confidence: 0.91,
+      });
+      await kv.set("mem:insights", "sdup_3", {
+        ...base, id: "sdup_3", title: "prefer thin registries, until consumers demand a shape!", confidence: 0.92,
+      });
+
+      const result = (await sdk.trigger("mem::insight-search", {
+        query: "thin registries shape",
+      })) as { insights: Array<Insight & { score: number }> };
+
+      const dupes = result.insights.filter((i) => i.title.toLowerCase().includes("registries"));
+      expect(dupes.length).toBe(1);
+    });
+
+    it("does not collapse same-title insights from different projects in search", async () => {
+      const now = new Date().toISOString();
+      const base = {
+        content: "registries thin shape", reinforcements: 0, sourceConceptCluster: [], sourceMemoryIds: [],
+        sourceLessonIds: [], sourceCrystalIds: [], tags: [], createdAt: now, updatedAt: now, decayRate: 0.05,
+      };
+      await kv.set("mem:insights", "qx", { ...base, id: "qx", title: "Registries should stay thin in shape", confidence: 0.9, project: "proj-x" });
+      await kv.set("mem:insights", "qy", { ...base, id: "qy", title: "Registries should stay thin in shape", confidence: 0.8, project: "proj-y" });
+
+      const result = (await sdk.trigger("mem::insight-search", { query: "registries thin shape" })) as { insights: Array<Insight & { score: number }> };
+      const shared = result.insights.filter((i) => i.title === "Registries should stay thin in shape");
+      expect(shared.length).toBe(2);
     });
 
     it("rejects empty query", async () => {
