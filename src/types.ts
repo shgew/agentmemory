@@ -210,6 +210,7 @@ export interface HealthSnapshot {
     heapTotal: number;
     rss: number;
     external: number;
+    heapSizeLimit?: number;
   };
   cpu: { userMicros: number; systemMicros: number; percent: number };
   eventLoopLagMs: number;

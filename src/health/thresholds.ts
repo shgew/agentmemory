@@ -59,17 +59,24 @@ export function evaluateHealth(
     degraded = true;
   }
 
-  const memPercent =
-    snapshot.memory.heapTotal > 0
+  const heapSizeLimit = snapshot.memory.heapSizeLimit;
+  const hasHeapSizeLimit =
+    typeof heapSizeLimit === "number" &&
+    Number.isFinite(heapSizeLimit) &&
+    heapSizeLimit > 0;
+  const memPercent = hasHeapSizeLimit
+    ? (snapshot.memory.heapUsed / heapSizeLimit) * 100
+    : snapshot.memory.heapTotal > 0
       ? (snapshot.memory.heapUsed / snapshot.memory.heapTotal) * 100
       : 0;
   const rss = snapshot.memory.rss ?? 0;
   const rssAboveFloor = rss >= cfg.memoryRssFloorBytes;
+  const memoryAlertAllowed = hasHeapSizeLimit || rssAboveFloor;
   const memMb = Math.round(rss / (1024 * 1024));
-  if (memPercent > cfg.memoryCriticalPercent && rssAboveFloor) {
+  if (memPercent > cfg.memoryCriticalPercent && memoryAlertAllowed) {
     alerts.push(`memory_critical_${Math.round(memPercent)}%_rss${memMb}mb`);
     critical = true;
-  } else if (memPercent > cfg.memoryWarnPercent && rssAboveFloor) {
+  } else if (memPercent > cfg.memoryWarnPercent && memoryAlertAllowed) {
     alerts.push(`memory_warn_${Math.round(memPercent)}%_rss${memMb}mb`);
     degraded = true;
   } else if (memPercent > cfg.memoryWarnPercent) {
