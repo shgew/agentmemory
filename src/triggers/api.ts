@@ -287,6 +287,25 @@ export function registerApiTriggers(
     },
   });
 
+  sdk.registerFunction("api::metrics-reset",
+    async (): Promise<Response> => {
+      const cleared = metricsStore ? await metricsStore.clear() : 0;
+      return {
+        status_code: 200,
+        body: { success: true, cleared },
+      };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::metrics-reset",
+    config: {
+      api_path: "/agentmemory/metrics/reset",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
   sdk.registerFunction("api::observe",
     async (req: ApiRequest<HookPayload>): Promise<Response> => {
       const body = (req.body ?? {}) as unknown as Record<string, unknown>;
