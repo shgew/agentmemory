@@ -843,6 +843,8 @@ export interface Insight {
   lastDecayedAt?: string;
   decayRate: number;
   deleted?: boolean;
+  reflectClusterFp?: string;
+  reflectClusterFpVersion?: number;
 }
 
 export interface DiagnosticCheck {
