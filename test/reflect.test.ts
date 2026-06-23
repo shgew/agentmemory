@@ -505,6 +505,67 @@ describe("Reflect", () => {
       expect(provider.summarize).toHaveBeenCalledTimes(2);
       expect(run2.clustersFrozen).toBe(0);
     });
+
+    it("backfills reflectClusterFp on a pre-existing insight and freezes the matching cluster in the same run", async () => {
+      const ts = new Date().toISOString();
+      const lessonId = `lsn_${"Use execFile for security".slice(0, 8)}`;
+      await kv.set("mem:insights", "ins_pre", {
+        id: "ins_pre",
+        title: "Pre-existing note from before the fingerprint feature",
+        content: "Prior synthesized guidance about defense layering for systems",
+        confidence: 0.8, reinforcements: 0, sourceConceptCluster: ["security"],
+        sourceMemoryIds: [], sourceLessonIds: [lessonId], sourceCrystalIds: [],
+        tags: ["security"], createdAt: ts, updatedAt: ts, decayRate: 0.05,
+      });
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+      await kv.set("mem:lessons", "lsn_1", makeLesson("Use execFile for security", ["security"]));
+
+      provider.summarize.mockClear();
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        clustersFrozen: number;
+        newInsights: number;
+      };
+
+      expect(provider.summarize).not.toHaveBeenCalled();
+      expect(result.clustersFrozen).toBe(1);
+      expect(result.newInsights).toBe(0);
+      const after = await kv.get<Insight>("mem:insights", "ins_pre");
+      expect(after!.reflectClusterFp).toBeTruthy();
+      expect(after!.reflectClusterFpVersion).toBe(1);
+    });
+
+    it("reports failure when every non-frozen cluster's provider call fails even though another cluster froze", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_alpha", makeConceptNode("alpha"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:nodes", "node_beta", makeConceptNode("beta"));
+      await kv.set("mem:graph:edges", "edge_sv", makeEdge("security", "validation"));
+      await kv.set("mem:graph:edges", "edge_ab", makeEdge("alpha", "beta"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+      await kv.set("mem:lessons", "lsn_1", makeLesson("Use execFile for security", ["security"]));
+      await kv.set("mem:semantic", "sem_4", makeSemantic("alpha foundation matters", "sem_4"));
+      await kv.set("mem:semantic", "sem_5", makeSemantic("beta extends alpha", "sem_5"));
+      await kv.set("mem:semantic", "sem_6", makeSemantic("alpha beta integration", "sem_6"));
+
+      await sdk.trigger("mem::reflect", {});
+
+      provider.summarize.mockReset();
+      provider.summarize.mockRejectedValue(new Error("LLM down"));
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        success: boolean;
+        clustersFrozen: number;
+      };
+
+      expect(result.clustersFrozen).toBe(1);
+      expect(result.success).toBe(false);
+    });
   });
 
   describe("mem::insight-list", () => {

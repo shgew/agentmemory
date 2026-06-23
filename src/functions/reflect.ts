@@ -327,6 +327,24 @@ export function registerReflectFunctions(
       ).filter((i) => !i.deleted);
       const reinforcedIds = new Set<string>();
 
+      const backfillDirty: Insight[] = [];
+      for (const ins of activeInsights) {
+        if (data?.project !== undefined && ins.project !== data.project) continue;
+        if (ins.reflectClusterFp === undefined && ins.sourceLessonIds.length >= 1) {
+          ins.reflectClusterFp = fingerprintId(
+            "cluster",
+            `${ins.project ?? ""}\n${ins.sourceLessonIds.slice().sort().join(",")}`,
+          );
+          ins.reflectClusterFpVersion = REFLECT_CLUSTER_FP_VERSION;
+          backfillDirty.push(ins);
+        }
+      }
+      if (backfillDirty.length > 0) {
+        await Promise.all(
+          backfillDirty.map((i) => kv.set(KV.insights, i.id, i)),
+        );
+      }
+
       for (const conceptNames of conceptClusters) {
         if (totalInsights >= maxTotal) break;
 
