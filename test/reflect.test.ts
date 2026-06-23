@@ -391,6 +391,120 @@ describe("Reflect", () => {
       expect(insights.length).toBe(1);
       expect(insights[0].reinforcements).toBe(1);
     });
+
+    it("freezes a lesson-bearing cluster on the second run when lessonIds are unchanged", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+      await kv.set("mem:lessons", "lsn_1", makeLesson("Use execFile for security", ["security"]));
+
+      await sdk.trigger("mem::reflect", {});
+      const first = await kv.list<Insight>("mem:insights");
+      expect(first.length).toBe(2);
+
+      provider.summarize.mockClear();
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        clustersFrozen: number;
+        newInsights: number;
+        reinforced: number;
+      };
+
+      expect(provider.summarize).not.toHaveBeenCalled();
+      expect(result.clustersFrozen).toBe(1);
+      expect(result.newInsights).toBe(0);
+      expect(result.reinforced).toBe(0);
+    });
+
+    it("stamps reflectClusterFp and version on insights from a lesson-bearing cluster", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+      await kv.set("mem:lessons", "lsn_1", makeLesson("Use execFile for security", ["security"]));
+
+      await sdk.trigger("mem::reflect", {});
+
+      const insights = await kv.list<Insight>("mem:insights");
+      expect(insights.length).toBe(2);
+      for (const ins of insights) {
+        expect(ins.reflectClusterFp).toBeTruthy();
+        expect(ins.reflectClusterFpVersion).toBe(1);
+      }
+    });
+
+    it("leaves reflectClusterFp undefined on insights from a lesson-less cluster", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+
+      await sdk.trigger("mem::reflect", {});
+
+      const insights = await kv.list<Insight>("mem:insights");
+      expect(insights.length).toBe(2);
+      for (const ins of insights) {
+        expect(ins.reflectClusterFp).toBeUndefined();
+      }
+    });
+
+    it("reprocesses a lesson-bearing cluster when a new lesson changes the lessonIds between runs", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+      await kv.set("mem:lessons", "lsn_1", makeLesson("Use execFile for security", ["security"]));
+
+      await sdk.trigger("mem::reflect", {});
+      const firstFp = (await kv.list<Insight>("mem:insights"))[0].reflectClusterFp;
+      expect(firstFp).toBeTruthy();
+
+      await kv.set("mem:lessons", "lsn_2", makeLesson("Validate inputs at trust boundaries", ["security"]));
+
+      provider.summarize.mockClear();
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        clustersFrozen: number;
+      };
+
+      expect(provider.summarize).toHaveBeenCalled();
+      expect(result.clustersFrozen).toBe(0);
+      const after = await kv.list<Insight>("mem:insights");
+      expect(after[0].reflectClusterFp).not.toBe(firstFp);
+    });
+
+    it("never freezes a lesson-bearing cluster when the provider yields no insights", async () => {
+      provider.summarize.mockReset();
+      provider.summarize.mockResolvedValue("");
+
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+      await kv.set("mem:lessons", "lsn_1", makeLesson("Use execFile for security", ["security"]));
+
+      const run1 = (await sdk.trigger("mem::reflect", {})) as {
+        newInsights: number;
+        clustersFrozen: number;
+      };
+      expect(run1.newInsights).toBe(0);
+      expect(run1.clustersFrozen).toBe(0);
+
+      const run2 = (await sdk.trigger("mem::reflect", {})) as {
+        clustersFrozen: number;
+      };
+      expect(provider.summarize).toHaveBeenCalledTimes(2);
+      expect(run2.clustersFrozen).toBe(0);
+    });
   });
 
   describe("mem::insight-list", () => {

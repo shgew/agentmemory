@@ -13,6 +13,8 @@ import type {
 import { recordAudit } from "./audit.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 
+const REFLECT_CLUSTER_FP_VERSION = 1;
+
 interface ConceptCluster {
   concepts: string[];
   facts: Array<{ fact: string; confidence: number }>;
@@ -319,6 +321,7 @@ export function registerReflectFunctions(
       let totalInsights = 0;
       let clustersAttempted = 0;
       let clustersFailed = 0;
+      let clustersFrozen = 0;
       const activeInsights: Insight[] = (
         await kv.list<Insight>(KV.insights)
       ).filter((i) => !i.deleted);
@@ -354,6 +357,22 @@ export function registerReflectFunctions(
         if (totalItems < 3) {
           clustersSkipped++;
           continue;
+        }
+
+        let clusterFp: string | undefined;
+        if (clusterLessons.length >= 1) {
+          clusterFp = fingerprintId(
+            "cluster",
+            `${data?.project ?? ""}\n${clusterLessons.map((l) => l.id).sort().join(",")}`,
+          );
+          if (
+            activeInsights.some(
+              (i) => !i.deleted && i.reflectClusterFp === clusterFp,
+            )
+          ) {
+            clustersFrozen++;
+            continue;
+          }
         }
         clustersAttempted++;
 
@@ -421,6 +440,10 @@ export function registerReflectFunctions(
             if (target) {
               if (!reinforcedIds.has(target.id)) {
                 reinforceInsightWithProvenance(target, cluster, conceptNames);
+                if (clusterFp !== undefined) {
+                  target.reflectClusterFp = clusterFp;
+                  target.reflectClusterFpVersion = REFLECT_CLUSTER_FP_VERSION;
+                }
                 await kv.set(KV.insights, target.id, target);
                 reinforcedIds.add(target.id);
                 reinforced++;
@@ -443,6 +466,10 @@ export function registerReflectFunctions(
                 updatedAt: now,
                 decayRate: 0.05,
               };
+              if (clusterFp !== undefined) {
+                insight.reflectClusterFp = clusterFp;
+                insight.reflectClusterFpVersion = REFLECT_CLUSTER_FP_VERSION;
+              }
               await kv.set(KV.insights, insight.id, insight);
               activeInsights.push(insight);
               newInsights++;
@@ -463,7 +490,8 @@ export function registerReflectFunctions(
         await recordAudit(kv, "reflect", "mem::reflect", [], {
           newInsights,
           reinforced,
-          clustersProcessed: conceptClusters.length - clustersSkipped,
+          clustersProcessed: conceptClusters.length - clustersSkipped - clustersFrozen,
+          clustersFrozen,
           clustersSkipped,
           usedFallback,
         });
@@ -473,7 +501,8 @@ export function registerReflectFunctions(
         success: !reflectFailed,
         newInsights,
         reinforced,
-        clustersProcessed: conceptClusters.length - clustersSkipped,
+        clustersProcessed: conceptClusters.length - clustersSkipped - clustersFrozen,
+        clustersFrozen,
         clustersSkipped,
         usedFallback,
       };
