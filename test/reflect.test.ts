@@ -566,6 +566,27 @@ describe("Reflect", () => {
       expect(result.clustersFrozen).toBe(1);
       expect(result.success).toBe(false);
     });
+
+    it("does not crash when a pre-existing insight is missing sourceLessonIds", async () => {
+      const ts = new Date().toISOString();
+      await kv.set("mem:insights", "ins_legacy", {
+        id: "ins_legacy",
+        title: "Legacy insight from before the provenance fields existed",
+        content: "Old guidance with no source arrays",
+        confidence: 0.8, reinforcements: 0, sourceConceptCluster: ["security"],
+        sourceMemoryIds: [], sourceCrystalIds: [],
+        tags: ["security"], createdAt: ts, updatedAt: ts, decayRate: 0.05,
+      } as never);
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+
+      const result = (await sdk.trigger("mem::reflect", {})) as { success: boolean };
+      expect(result.success).toBe(true);
+    });
   });
 
   describe("mem::insight-list", () => {

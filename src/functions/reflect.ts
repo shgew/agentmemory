@@ -330,7 +330,7 @@ export function registerReflectFunctions(
       const backfillDirty: Insight[] = [];
       for (const ins of activeInsights) {
         if (data?.project !== undefined && ins.project !== data.project) continue;
-        if (ins.reflectClusterFp === undefined && ins.sourceLessonIds.length >= 1) {
+        if (ins.reflectClusterFp === undefined && Array.isArray(ins.sourceLessonIds) && ins.sourceLessonIds.length >= 1) {
           ins.reflectClusterFp = fingerprintId(
             "cluster",
             `${ins.project ?? ""}\n${ins.sourceLessonIds.slice().sort().join(",")}`,
