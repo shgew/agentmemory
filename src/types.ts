@@ -368,20 +368,23 @@ export interface StandaloneConfig {
   agentType?: string;
 }
 
-export type GraphNodeType =
-  | "file"
-  | "function"
-  | "concept"
-  | "error"
-  | "decision"
-  | "pattern"
-  | "library"
-  | "person"
-  | "project"
-  | "preference"
-  | "location"
-  | "organization"
-  | "event";
+export const GRAPH_NODE_TYPES = [
+  "file",
+  "function",
+  "concept",
+  "error",
+  "decision",
+  "pattern",
+  "library",
+  "person",
+  "project",
+  "preference",
+  "location",
+  "organization",
+  "event",
+] as const;
+
+export type GraphNodeType = (typeof GRAPH_NODE_TYPES)[number];
 
 export interface GraphNode {
   id: string;
@@ -395,23 +398,26 @@ export interface GraphNode {
   stale?: boolean;
 }
 
-export type GraphEdgeType =
-  | "uses"
-  | "imports"
-  | "modifies"
-  | "causes"
-  | "fixes"
-  | "depends_on"
-  | "related_to"
-  | "works_at"
-  | "prefers"
-  | "blocked_by"
-  | "caused_by"
-  | "optimizes_for"
-  | "rejected"
-  | "avoids"
-  | "located_in"
-  | "succeeded_by";
+export const GRAPH_EDGE_TYPES = [
+  "uses",
+  "imports",
+  "modifies",
+  "causes",
+  "fixes",
+  "depends_on",
+  "related_to",
+  "works_at",
+  "prefers",
+  "blocked_by",
+  "caused_by",
+  "optimizes_for",
+  "rejected",
+  "avoids",
+  "located_in",
+  "succeeded_by",
+] as const;
+
+export type GraphEdgeType = (typeof GRAPH_EDGE_TYPES)[number];
 
 export interface GraphEdge {
   id: string;

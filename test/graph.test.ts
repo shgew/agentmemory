@@ -1020,3 +1020,79 @@ describe("getGraphChunkSize / getGraphChunkConcurrency", () => {
     expect(getGraphChunkConcurrency()).toBe(6);
   });
 });
+
+describe("Graph type validation (enum allowlist)", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    vi.clearAllMocks();
+    registerGraphFunction(sdk as never, kv as never, mockProvider as never);
+  });
+
+  it("drops relationships whose type is not in the edge-type enum", async () => {
+    mockProvider.compress.mockResolvedValueOnce(`<entities>
+<entity type="file" name="a.ts"/>
+<entity type="function" name="foo"/>
+</entities>
+<relationships>
+<relationship type="defines" source="a.ts" target="foo" weight="0.9"/>
+<relationship type="uses" source="foo" target="a.ts" weight="0.8"/>
+</relationships>`);
+    await sdk.trigger("mem::graph-extract", { observations: [testObs] });
+    const edges = await kv.list<GraphEdge>("mem:graph:edges");
+    expect(edges.length).toBe(1);
+    expect(edges[0].type).toBe("uses");
+  });
+
+  it("drops entities whose type is not in the node-type enum", async () => {
+    mockProvider.compress.mockResolvedValueOnce(`<entities>
+<entity type="file" name="a.ts"/>
+<entity type="bogus" name="weird"/>
+</entities>
+<relationships></relationships>`);
+    await sdk.trigger("mem::graph-extract", { observations: [testObs] });
+    const nodes = await kv.list<GraphNode>("mem:graph:nodes");
+    expect(nodes.length).toBe(1);
+    expect(nodes[0].name).toBe("a.ts");
+  });
+
+  it("accepts the extended edge vocabulary (caused_by, rejected, succeeded_by)", async () => {
+    mockProvider.compress.mockResolvedValueOnce(`<entities>
+<entity type="error" name="timeout"/>
+<entity type="concept" name="rate cap"/>
+<entity type="decision" name="add retry"/>
+<entity type="decision" name="raise limit"/>
+</entities>
+<relationships>
+<relationship type="caused_by" source="timeout" target="rate cap" weight="0.9"/>
+<relationship type="rejected" source="add retry" target="raise limit" weight="0.6"/>
+<relationship type="succeeded_by" source="add retry" target="raise limit" weight="0.5"/>
+</relationships>`);
+    await sdk.trigger("mem::graph-extract", { observations: [testObs] });
+    const edges = await kv.list<GraphEdge>("mem:graph:edges");
+    const types = edges.map((e) => e.type);
+    expect(types).toContain("caused_by");
+    expect(types).toContain("rejected");
+    expect(types).toContain("succeeded_by");
+  });
+
+  it("accepts the extended node vocabulary (project, preference, organization, event)", async () => {
+    mockProvider.compress.mockResolvedValueOnce(`<entities>
+<entity type="project" name="agentmemory"/>
+<entity type="preference" name="no em dashes"/>
+<entity type="organization" name="Chess.com"/>
+<entity type="event" name="cutover to gpt-5.5"/>
+</entities>
+<relationships></relationships>`);
+    await sdk.trigger("mem::graph-extract", { observations: [testObs] });
+    const nodes = await kv.list<GraphNode>("mem:graph:nodes");
+    const types = nodes.map((n) => n.type);
+    expect(types).toContain("project");
+    expect(types).toContain("preference");
+    expect(types).toContain("organization");
+    expect(types).toContain("event");
+  });
+});

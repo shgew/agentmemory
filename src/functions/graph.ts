@@ -7,6 +7,7 @@ import type {
   CompressedObservation,
   MemoryProvider,
 } from "../types.js";
+import { GRAPH_NODE_TYPES, GRAPH_EDGE_TYPES } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import {
@@ -415,6 +416,9 @@ function parseAttrs(raw: string): Record<string, string> {
   return attrs;
 }
 
+const GRAPH_NODE_TYPE_SET = new Set<string>(GRAPH_NODE_TYPES);
+const GRAPH_EDGE_TYPE_SET = new Set<string>(GRAPH_EDGE_TYPES);
+
 function parseGraphXml(
   xml: string,
   observationIds: string[],
@@ -438,7 +442,7 @@ function parseGraphXml(
     const attrs = parseAttrs(rawAttrs);
     const type = attrs["type"] as GraphNode["type"] | undefined;
     const name = attrs["name"];
-    if (!type || !name) return;
+    if (!type || !name || !GRAPH_NODE_TYPE_SET.has(type)) return;
     const properties: Record<string, string> = {};
     const propRegex = /<property\s+key="([^"]+)">([^<]*)<\/property>/g;
     let propMatch;
@@ -474,7 +478,7 @@ function parseGraphXml(
     const type = attrs["type"] as GraphEdge["type"] | undefined;
     const sourceName = attrs["source"];
     const targetName = attrs["target"];
-    if (!type || !sourceName || !targetName) return;
+    if (!type || !sourceName || !targetName || !GRAPH_EDGE_TYPE_SET.has(type)) return;
     const sourceNode = nodeByNormName.get(sourceName.trim().toLowerCase());
     const targetNode = nodeByNormName.get(targetName.trim().toLowerCase());
     if (!sourceNode || !targetNode) return;
