@@ -17,6 +17,7 @@ import {
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import { isAfter, isAtOrBefore } from "../state/timestamp-compare.js";
+import { readGraphSnapshot, SNAPSHOT_KEY } from "../state/graph-snapshot.js";
 
 // #753: keep the response payload below the iii state channel ceiling.
 // 500 nodes + their incident edges hold well under the limit on the
@@ -33,7 +34,6 @@ const MAX_GRAPH_QUERY_LIMIT = 5000;
 // enumeration. Aggregate stats (nodesByType / edgesByType) are computed
 // fresh during rebuild and stored alongside.
 const SNAPSHOT_TOP_NODES = DEFAULT_GRAPH_QUERY_LIMIT;
-const SNAPSHOT_KEY = "current";
 
 // `state::list` over a 75K-node scope can exceed the iii invocation
 // timeout. The query handler races the enumeration against this budget
@@ -115,21 +115,6 @@ function emptySnapshot(): GraphSnapshot {
     updatedAt: new Date(0).toISOString(),
     dirty: true,
   };
-}
-
-async function readSnapshot(kv: StateKV): Promise<GraphSnapshot | null> {
-  try {
-    const snap = await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY);
-    if (snap && typeof snap === "object" && snap.version === 1) {
-      return snap;
-    }
-    return null;
-  } catch (err) {
-    logger.warn("Graph snapshot read failed", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return null;
-  }
 }
 
 function buildSnapshotFromArrays(
@@ -634,7 +619,7 @@ export function registerGraphFunction(
         // list payload exceeds the iii heartbeat budget and the worker
         // dies before merge can complete. Each name-index entry is a
         // single small kv.get/set pair.
-        const snap = (await readSnapshot(kv)) ?? emptySnapshot();
+        const snap = (await readGraphSnapshot(kv)) ?? emptySnapshot();
         const capturedAt = new Date().toISOString();
         let newNodeCount = 0;
         let newEdgeCount = 0;
@@ -798,7 +783,7 @@ export function registerGraphFunction(
       // rebuild incrementally from new observations.
       const noWalk = !data.query && !data.startNodeId;
       if (noWalk) {
-        const snap = await readSnapshot(kv);
+        const snap = await readGraphSnapshot(kv);
         if (snap && snap.stats.totalNodes > 0) {
           return paginateFromSnapshot(snap, data.nodeType, limit, offset);
         }
@@ -842,7 +827,7 @@ export function registerGraphFunction(
         logger.warn("Graph query enumeration timed out, using snapshot", {
           error: msg,
         });
-        const snap = await readSnapshot(kv);
+        const snap = await readGraphSnapshot(kv);
         if (snap) {
           return {
             ...paginateFromSnapshot(snap, data.nodeType, limit, offset),
@@ -933,7 +918,7 @@ export function registerGraphFunction(
   // envelope + a warning pointing at the snapshot-rebuild or graph-reset
   // endpoints — never a 500.
   sdk.registerFunction("mem::graph-stats", async () => {
-    const snap = await readSnapshot(kv);
+    const snap = await readGraphSnapshot(kv);
     if (snap) {
       return {
         ...snap.stats,
@@ -989,7 +974,7 @@ export function registerGraphFunction(
       // can't accidentally bypass the legacy-corpus safeguard.
       const forceRebuild = data?.force === true;
       try {
-        const existing = await readSnapshot(kv);
+        const existing = await readGraphSnapshot(kv);
         if (!existing && !forceRebuild) {
           logger.warn("Graph snapshot rebuild refused: no prior snapshot", {
             hint: "legacy corpus or empty store",
