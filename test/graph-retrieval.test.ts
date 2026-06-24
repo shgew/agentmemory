@@ -1,10 +1,53 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { GraphRetrieval } from "../src/functions/graph-retrieval.js";
-import type { GraphNode, GraphEdge } from "../src/types.js";
+import type { GraphNode, GraphEdge, GraphSnapshot } from "../src/types.js";
+
+function buildSnapshotForTest(
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+): GraphSnapshot {
+  const liveNodes = nodes.filter((n) => !n.stale);
+  const liveEdges = edges.filter((e) => !e.stale);
+  const degree = new Map<string, number>();
+  for (const e of liveEdges) {
+    degree.set(e.sourceNodeId, (degree.get(e.sourceNodeId) ?? 0) + 1);
+    degree.set(e.targetNodeId, (degree.get(e.targetNodeId) ?? 0) + 1);
+  }
+  const ranked = [...liveNodes]
+    .sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0))
+    .slice(0, 500);
+  const rankedIds = new Set(ranked.map((n) => n.id));
+  const topEdges = liveEdges.filter(
+    (e) => rankedIds.has(e.sourceNodeId) && rankedIds.has(e.targetNodeId),
+  );
+  const topDegrees: Record<string, number> = {};
+  for (const n of ranked) topDegrees[n.id] = degree.get(n.id) ?? 0;
+  return {
+    version: 1,
+    topNodes: ranked,
+    topEdges,
+    topDegrees,
+    stats: {
+      totalNodes: liveNodes.length,
+      totalEdges: liveEdges.length,
+      nodesByType: {},
+      edgesByType: {},
+    },
+    updatedAt: new Date().toISOString(),
+    dirty: false,
+  };
+}
+
+interface MockKVOptions {
+  seedSnapshot?: boolean;
+  throwOnGraphList?: boolean;
+  snapshot?: GraphSnapshot;
+}
 
 function mockKV(
   nodes: GraphNode[] = [],
   edges: GraphEdge[] = [],
+  opts: MockKVOptions = {},
 ) {
   const store = new Map<string, Map<string, unknown>>();
   const nodesMap = new Map<string, unknown>();
@@ -14,6 +57,11 @@ function mockKV(
   const edgesMap = new Map<string, unknown>();
   for (const e of edges) edgesMap.set(e.id, e);
   store.set("mem:graph:edges", edgesMap);
+
+  if (opts.snapshot || opts.seedSnapshot !== false) {
+    const snap = opts.snapshot ?? buildSnapshotForTest(nodes, edges);
+    store.set("mem:graph:snapshot", new Map([["current", snap]]));
+  }
 
   return {
     get: async <T>(scope: string, key: string): Promise<T | null> => {
@@ -28,6 +76,14 @@ function mockKV(
       store.get(scope)?.delete(key);
     },
     list: async <T>(scope: string): Promise<T[]> => {
+      if (
+        opts.throwOnGraphList &&
+        (scope === "mem:graph:nodes" || scope === "mem:graph:edges")
+      ) {
+        throw new Error(
+          `mockKV: kv.list on ${scope} is forbidden (retrieval must read the snapshot)`,
+        );
+      }
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
@@ -294,5 +350,82 @@ describe("GraphRetrieval", () => {
     const results = await retrieval.searchByEntities(["Start"], 2);
     expect(results.find((r) => r.obsId === "obs_3")).toBeDefined();
     expect(results.find((r) => r.obsId === "obs_4")).toBeUndefined();
+  });
+
+  // #825: the smart-search hot path must source the graph from the bounded
+  // snapshot, never kv.list the full graphNodes/graphEdges scopes (that
+  // serializes a multi-MB frame and kills the iii worker heartbeat at scale).
+  it("returns [] when the snapshot is absent", async () => {
+    const nodes = [makeNode("n1", "React", "library", ["obs_1"])];
+    const kv = mockKV(nodes, [], { seedSnapshot: false });
+    const retrieval = new GraphRetrieval(kv as never);
+
+    expect(await retrieval.searchByEntities(["React"])).toEqual([]);
+    expect(await retrieval.expandFromChunks(["obs_1"])).toEqual([]);
+  });
+
+  it("never calls kv.list on the graph scopes", async () => {
+    const nodes = [
+      makeNode("n1", "React", "library", ["obs_1"]),
+      makeNode("n2", "Component", "concept", ["obs_2"]),
+    ];
+    const edges = [makeEdge("e1", "n1", "n2", "uses")];
+    const kv = mockKV(nodes, edges, { throwOnGraphList: true });
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const byEntity = await retrieval.searchByEntities(["React"], 2);
+    expect(byEntity.map((r) => r.obsId)).toContain("obs_1");
+    const expanded = await retrieval.expandFromChunks(["obs_1"]);
+    expect(expanded.map((r) => r.obsId)).toContain("obs_2");
+  });
+
+  it("filters a stale node out of the snapshot topNodes", async () => {
+    const live = makeNode("n1", "React", "library", ["obs_live"]);
+    const stale = {
+      ...makeNode("n2", "Reactor", "library", ["obs_stale"]),
+      stale: true,
+    };
+    const snapshot = buildSnapshotForTest([live], []);
+    snapshot.topNodes = [live, stale];
+    const kv = mockKV([], [], { snapshot });
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const obsIds = (await retrieval.searchByEntities(["React"])).map(
+      (r) => r.obsId,
+    );
+    expect(obsIds).toContain("obs_live");
+    expect(obsIds).not.toContain("obs_stale");
+  });
+
+  it("filters stale and orphan edges from the snapshot topEdges", async () => {
+    const n1 = makeNode("n1", "React", "library", ["obs_1"]);
+    const n2 = makeNode("n2", "Hook", "concept", ["obs_2"]);
+    const snapshot = buildSnapshotForTest([n1, n2], []);
+    const staleEdge = { ...makeEdge("e_stale", "n1", "n2", "uses"), stale: true };
+    const orphanEdge = makeEdge("e_orphan", "n1", "n_evicted", "uses");
+    snapshot.topEdges = [staleEdge, orphanEdge];
+    const kv = mockKV([], [], { snapshot });
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const obsIds = (await retrieval.searchByEntities(["React"], 2)).map(
+      (r) => r.obsId,
+    );
+    expect(obsIds).toContain("obs_1");
+    expect(obsIds).not.toContain("obs_2");
+  });
+
+  it("matches entities and expands from the snapshot subgraph", async () => {
+    const nodes = [
+      makeNode("n1", "auth.ts", "file", ["obs_1"]),
+      makeNode("n2", "jwt", "concept", ["obs_2"]),
+    ];
+    const edges = [makeEdge("e1", "n1", "n2", "uses")];
+    const kv = mockKV(nodes, edges);
+    const retrieval = new GraphRetrieval(kv as never);
+
+    const byEntity = await retrieval.searchByEntities(["auth"], 2);
+    expect(byEntity.map((r) => r.obsId)).toContain("obs_2");
+    const expanded = await retrieval.expandFromChunks(["obs_1"]);
+    expect(expanded.map((r) => r.obsId)).toContain("obs_2");
   });
 });

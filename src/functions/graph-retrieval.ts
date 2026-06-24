@@ -2,7 +2,7 @@ import type {
   GraphNode,
   GraphEdge,
 } from "../types.js";
-import { KV } from "../state/schema.js";
+import { readGraphSnapshot } from "../state/graph-snapshot.js";
 import type { StateKV } from "../state/kv.js";
 
 export interface GraphRetrievalResult {
@@ -41,13 +41,37 @@ function buildGraphContext(
 export class GraphRetrieval {
   constructor(private kv: StateKV) {}
 
+  // #825: smart-search calls this on every query. The graph MUST come from
+  // the bounded snapshot (one kv.get) - kv.list over the full graphNodes /
+  // graphEdges scopes serializes a multi-MB frame that blocks the iii worker
+  // heartbeat ("Invocation stopped"). topEdges can carry stale or orphaned
+  // entries when graph-extract evicts a top node without pruning them, so
+  // filter to live edges whose endpoints are both still in topNodes.
+  private async snapshotSubgraph(): Promise<{
+    allNodes: GraphNode[];
+    allEdges: GraphEdge[];
+  } | null> {
+    const snap = await readGraphSnapshot(this.kv);
+    if (!snap || snap.topNodes.length === 0) return null;
+    const allNodes = snap.topNodes.filter((n) => !n.stale);
+    const liveIds = new Set(allNodes.map((n) => n.id));
+    const allEdges = snap.topEdges.filter(
+      (e) =>
+        !e.stale &&
+        liveIds.has(e.sourceNodeId) &&
+        liveIds.has(e.targetNodeId),
+    );
+    return { allNodes, allEdges };
+  }
+
   async searchByEntities(
     entityNames: string[],
     maxDepth = 2,
     maxResults = 20,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const sub = await this.snapshotSubgraph();
+    if (!sub) return [];
+    const { allNodes, allEdges } = sub;
 
     const matchingNodes = allNodes.filter((n) => {
       const nameLower = n.name.toLowerCase();
@@ -119,8 +143,9 @@ export class GraphRetrieval {
     maxDepth = 1,
     maxResults = 10,
   ): Promise<GraphRetrievalResult[]> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const sub = await this.snapshotSubgraph();
+    if (!sub) return [];
+    const { allNodes, allEdges } = sub;
 
     const linkedNodes = allNodes.filter((n) =>
       n.sourceObservationIds.some((id) => obsIds.includes(id)),
@@ -163,8 +188,9 @@ export class GraphRetrieval {
     currentState: GraphEdge[];
     history: GraphEdge[];
   }> {
-    const allNodes = (await this.kv.list<GraphNode>(KV.graphNodes)).filter((n) => !n.stale);
-    const allEdges = (await this.kv.list<GraphEdge>(KV.graphEdges)).filter((e) => !e.stale);
+    const sub = await this.snapshotSubgraph();
+    if (!sub) return { entity: null, currentState: [], history: [] };
+    const { allNodes, allEdges } = sub;
 
     const entity = allNodes.find(
       (n) => n.name.toLowerCase() === entityName.toLowerCase(),
