@@ -537,4 +537,25 @@ describe("handleToolCall", () => {
     expect(parsed.results).toHaveLength(1);
     expect(parsed.results[0].content).toBe("project-tagged memory");
   });
+
+  it("surfaces a proxy 5xx for memory_smart_search instead of masking it with a local empty result", async () => {
+    resetHandleForTests();
+    setLivezProbe(async () => ({ ok: true, status: 200 }));
+    (globalThis as { fetch: typeof fetch }).fetch = (async (url: unknown) => {
+      if (String(url).includes("/agentmemory/smart-search")) {
+        return {
+          ok: false,
+          status: 500,
+          statusText: "Invocation stopped",
+          text: async () => "",
+        } as unknown as Response;
+      }
+      throw new Error(`unexpected fetch: ${String(url)}`);
+    }) as unknown as typeof fetch;
+
+    const kv = new InMemoryKV();
+    await expect(
+      handleToolCall("memory_smart_search", { query: "anything" }, kv),
+    ).rejects.toThrow(/500|Invocation stopped/);
+  });
 });

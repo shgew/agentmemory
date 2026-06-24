@@ -427,9 +427,10 @@ export async function handleToolCall(
       return await handleProxy(validated, handle);
     } catch (err) {
       process.stderr.write(
-        `[@agentmemory/mcp] proxy call failed for ${toolName}: ${err instanceof Error ? err.message : String(err)}; invalidating handle and falling back to local KV\n`,
+        `[@agentmemory/mcp] proxy call failed for ${toolName}: ${err instanceof Error ? err.message : String(err)}; surfacing error instead of masking with local fallback\n`,
       );
       invalidateHandle();
+      throw err;
     }
   }
   return handleLocal(validated, kvInstance);

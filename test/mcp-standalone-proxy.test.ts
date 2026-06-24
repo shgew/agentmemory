@@ -266,7 +266,12 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
       return new Response("boom", { status: 500, statusText: "Internal Server Error" });
     });
     const localKv = new InMemoryKV(undefined);
-    await handleToolCall("memory_save", { content: "first fallback" }, localKv);
+    // A proxy call error (server up, call failed) now surfaces instead of
+    // masking with a local result; the handle is still invalidated so the
+    // next call re-probes.
+    await expect(
+      handleToolCall("memory_save", { content: "first" }, localKv),
+    ).rejects.toThrow(/500/);
     expect(probeCount).toBe(1);
     serverUp = false;
     await handleToolCall("memory_save", { content: "second fallback" }, localKv);
@@ -417,6 +422,12 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
       if (url.endsWith("/agentmemory/livez")) {
         probeStarted++;
         return new Response("ok", { status: 200 });
+      }
+      if (url.endsWith("/agentmemory/remember")) {
+        return new Response(JSON.stringify({ id: "m-1" }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
       }
       return new Response("not found", { status: 404 });
     });
