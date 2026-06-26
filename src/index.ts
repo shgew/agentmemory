@@ -99,6 +99,7 @@ import { registerMcpEndpoints } from "./mcp/server.js";
 import { getAllTools } from "./mcp/tools-registry.js";
 import { startViewerServer } from "./viewer/server.js";
 import { MetricsStore } from "./eval/metrics-store.js";
+import { instrumentFunctionMetrics } from "./eval/instrument.js";
 import { DedupMap } from "./functions/dedup.js";
 import { registerHealthMonitor } from "./health/monitor.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
@@ -224,6 +225,9 @@ async function main() {
   const kv = new StateKV(sdk);
   const secret = getEnvVar("AGENTMEMORY_SECRET");
   const metricsStore = new MetricsStore(kv);
+  // Wrap registerFunction so every mem:: handler auto-records FunctionMetrics
+  // (latency, success, quality). Must run before the registrars below.
+  instrumentFunctionMetrics(sdk, metricsStore);
   const dedupMap = new DedupMap();
 
   const vectorIndex = embeddingProvider ? new VectorIndex() : null;
