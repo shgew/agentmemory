@@ -1492,6 +1492,20 @@ Create `~/.agentmemory/.env`:
                                           # by AGENTMEMORY_LLM_CONCURRENCY (each
                                           # task uses its own ResilientProvider).
 
+# Consolidation pool
+# CONSOLIDATION_CONCURRENCY=1              # Default: 1 (serial). Max session
+                                          # consolidation pipelines that run at
+                                          # once. Events for the SAME session are
+                                          # always serialized by an internal lock;
+                                          # only distinct sessions run in parallel.
+                                          # Raise to drain a session-sweep backlog
+                                          # faster on a provider that tolerates
+                                          # parallel calls; each pipeline still
+                                          # funnels its LLM calls through
+                                          # AGENTMEMORY_LLM_CONCURRENCY. Watch
+                                          # provider 429s and the circuit breaker
+                                          # when raising.
+
 # Graph-extract model routing
 # AGENTMEMORY_GRAPH_MODEL=                # Optional. Route mem::graph-extract to
                                           # a different model than summarize (e.g.

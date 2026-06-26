@@ -8,9 +8,26 @@ import { logger } from "../logger.js";
 import { isAfter } from "../state/timestamp-compare.js";
 import { getSummarizeTimeoutMs } from "../functions/summarize.js";
 import { getGraphExtractTimeoutMs } from "../functions/graph.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 
-let sessionStoppedQueue: Promise<void> = Promise.resolve();
-let sessionStoppedQueueDepth = 0;
+// Consolidation runs through a bounded pool (CONSOLIDATION_CONCURRENCY, default
+// 1 = serial). Each task holds withKeyedLock("session:consolidate:<id>") so two
+// events for the same session never overlap, while distinct sessions run up to
+// the cap concurrently. A finishing task hands its slot straight to the next
+// pending task so the active count never exceeds the cap under a racing enqueue.
+let activeConsolidations = 0;
+const pendingConsolidations: Array<() => void> = [];
+
+const CONSOLIDATION_CONCURRENCY_DEFAULT = 1;
+
+function consolidationConcurrency(): number {
+  const raw = process.env.CONSOLIDATION_CONCURRENCY;
+  if (!raw) return CONSOLIDATION_CONCURRENCY_DEFAULT;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : CONSOLIDATION_CONCURRENCY_DEFAULT;
+}
+
+const consolidationLimit = consolidationConcurrency();
 
 type SessionStoppedPayload = { sessionId: string; since?: string; until?: string; waitForCompletion?: boolean; reason?: string };
 type SessionStoppedQueued = { queued: true; sessionId: string; queueDepth: number };
@@ -25,31 +42,55 @@ function enqueueSessionStopped(
   reason: string,
   run: () => Promise<unknown>,
 ): QueuedSessionStopped {
-  const queueDepth = ++sessionStoppedQueueDepth;
-  const previous = sessionStoppedQueue.catch((err) => {
-    logger.error("Previous session consolidation pipeline failed", {
-      error: errorMessage(err),
-    });
-  });
-  const done = previous.then(async () => {
-    logger.info("Session consolidation pipeline started", { sessionId, reason, queueDepth });
+  const queueDepth =
+    activeConsolidations + pendingConsolidations.length + 1;
+
+  const exec = async (): Promise<unknown> => {
     try {
-      const result = await run();
-      logger.info("Session consolidation pipeline complete", { sessionId, reason });
+      logger.info("Session consolidation pipeline started", {
+        sessionId,
+        reason,
+        queueDepth,
+      });
+      const result = await withKeyedLock(
+        `session:consolidate:${sessionId}`,
+        run,
+      );
+      logger.info("Session consolidation pipeline complete", {
+        sessionId,
+        reason,
+      });
       return result;
     } catch (err) {
-      const error = errorMessage(err);
       logger.error("Session consolidation pipeline failed", {
         sessionId,
         reason,
-        error,
+        error: errorMessage(err),
       });
       throw err;
     } finally {
-      sessionStoppedQueueDepth = Math.max(0, sessionStoppedQueueDepth - 1);
+      const next = pendingConsolidations.shift();
+      if (next) {
+        next();
+      } else {
+        activeConsolidations = Math.max(0, activeConsolidations - 1);
+      }
     }
-  });
-  sessionStoppedQueue = done.then(() => undefined, () => undefined);
+  };
+
+  let done: Promise<unknown>;
+  if (activeConsolidations < consolidationLimit) {
+    activeConsolidations += 1;
+    done = exec();
+  } else {
+    done = new Promise<void>((resolve) => {
+      pendingConsolidations.push(resolve);
+    }).then(exec);
+  }
+
+  // Sink rejections for fire-and-forget callers that discard the done
+  // promise; awaiters via waitForCompletion still observe the rejection.
+  void done.catch(() => {});
   return { queued: true, sessionId, queueDepth, done };
 }
 

@@ -18,6 +18,7 @@ import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import { isAfter, isAtOrBefore } from "../state/timestamp-compare.js";
 import { readGraphSnapshot, SNAPSHOT_KEY } from "../state/graph-snapshot.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 
 // #753: keep the response payload below the iii state channel ceiling.
 // 500 nodes + their incident edges hold well under the limit on the
@@ -535,6 +536,109 @@ async function extractChunkWithRetry(
   return null;
 }
 
+async function mergeExtractIntoSnapshot(
+  kv: StateKV,
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+): Promise<{ newNodeCount: number; newEdgeCount: number }> {
+  // #814 v2: targeted name-index lookups replace the O(n) scan over the full
+  // graphNodes scope, whose multi-MB list payload starved the iii heartbeat at
+  // ~75K nodes. The caller wraps this whole read-modify-write of the shared
+  // snapshot in withKeyedLock("graph:merge") so concurrent extracts under the
+  // consolidation pool cannot lose snapshot stat or topNode updates.
+  const snap = (await readGraphSnapshot(kv)) ?? emptySnapshot();
+  const capturedAt = new Date().toISOString();
+  let newNodeCount = 0;
+  let newEdgeCount = 0;
+  const newEdgesForTopCheck: GraphEdge[] = [];
+
+  for (const node of nodes) {
+    const indexKey = nameIndexKey(node.type, node.name);
+    const existingId = await kv.get<string>(KV.graphNameIndex, indexKey);
+
+    let existing: GraphNode | null = null;
+    if (existingId) {
+      existing = await kv.get<GraphNode>(KV.graphNodes, existingId);
+      // #825: drop pre-reset rows so extract writes a fresh node + index entry
+      // instead of reconnecting to a legacy orphan (which pins the snapshot at 0).
+      if (
+        existing &&
+        snap.resetAt &&
+        typeof existing.createdAt === "string" &&
+        existing.createdAt < snap.resetAt
+      ) {
+        existing = null;
+      }
+    }
+
+    if (existing) {
+      const merged = mergeNode(existing, node, node.sourceObservationIds, capturedAt);
+      await kv.set(KV.graphNodes, existing.id, merged);
+      const topIdx = snap.topNodes.findIndex((n) => n.id === existing!.id);
+      if (topIdx !== -1) snap.topNodes[topIdx] = merged;
+    } else {
+      await kv.set(KV.graphNodes, node.id, node);
+      await kv.set(KV.graphNameIndex, indexKey, node.id);
+      await kv.set(KV.graphNodeDegree, node.id, 0);
+      snap.stats.totalNodes += 1;
+      snap.stats.nodesByType[node.type] =
+        (snap.stats.nodesByType[node.type] ?? 0) + 1;
+      newNodeCount += 1;
+      if (snap.topNodes.length < SNAPSHOT_TOP_NODES) {
+        snap.topNodes.push(node);
+        snap.topDegrees[node.id] = 0;
+      }
+    }
+  }
+
+  for (const edge of edges) {
+    const eKey = edgeIndexKey(edge.sourceNodeId, edge.targetNodeId, edge.type);
+    const existingId = await kv.get<string>(KV.graphEdgeKey, eKey);
+
+    let existing: GraphEdge | null = null;
+    if (existingId) {
+      existing = await kv.get<GraphEdge>(KV.graphEdges, existingId);
+      if (
+        existing &&
+        snap.resetAt &&
+        typeof existing.createdAt === "string" &&
+        existing.createdAt < snap.resetAt
+      ) {
+        existing = null;
+      }
+    }
+
+    if (existing) {
+      const merged = mergeEdge(existing, edge.sourceObservationIds);
+      await kv.set(KV.graphEdges, existing.id, merged);
+      const topIdx = snap.topEdges.findIndex((e) => e.id === existing!.id);
+      if (topIdx !== -1) snap.topEdges[topIdx] = merged;
+    } else {
+      await kv.set(KV.graphEdges, edge.id, edge);
+      await kv.set(KV.graphEdgeKey, eKey, edge.id);
+      snap.stats.totalEdges += 1;
+      snap.stats.edgesByType[edge.type] =
+        (snap.stats.edgesByType[edge.type] ?? 0) + 1;
+      newEdgeCount += 1;
+      await applyDegreeDelta(kv, snap, edge.sourceNodeId, +1);
+      await applyDegreeDelta(kv, snap, edge.targetNodeId, +1);
+      newEdgesForTopCheck.push(edge);
+    }
+  }
+
+  for (const edge of newEdgesForTopCheck) {
+    snapshotPushEdgeIfBothInTop(snap, edge);
+  }
+
+  if (newNodeCount > 0 || newEdgeCount > 0) {
+    snap.updatedAt = capturedAt;
+    snap.dirty = false;
+    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+  }
+
+  return { newNodeCount, newEdgeCount };
+}
+
 export function registerGraphFunction(
   sdk: ISdk,
   kv: StateKV,
@@ -629,123 +733,10 @@ export function registerGraphFunction(
           }
         }
 
-        // #814 v2: targeted name-index lookups replace the O(n) scan
-        // over `kv.list<GraphNode>(KV.graphNodes)`. At 75K nodes the
-        // list payload exceeds the iii heartbeat budget and the worker
-        // dies before merge can complete. Each name-index entry is a
-        // single small kv.get/set pair.
-        const snap = (await readGraphSnapshot(kv)) ?? emptySnapshot();
-        const capturedAt = new Date().toISOString();
-        let newNodeCount = 0;
-        let newEdgeCount = 0;
-        const newEdgesForTopCheck: GraphEdge[] = [];
-
-        for (const node of nodes) {
-          const indexKey = nameIndexKey(node.type, node.name);
-          const existingId = await kv.get<string>(
-            KV.graphNameIndex,
-            indexKey,
-          );
-
-          let existing: GraphNode | null = null;
-          if (existingId) {
-            existing = await kv.get<GraphNode>(KV.graphNodes, existingId);
-            // #825 follow-up: name-index lookups can resolve into
-            // pre-reset rows. Drop them so extract writes a fresh
-            // node + index entry instead of silently reconnecting
-            // to a legacy orphan (which would keep the snapshot at
-            // 0 forever after a reset).
-            if (
-              existing &&
-              snap.resetAt &&
-              typeof existing.createdAt === "string" &&
-              existing.createdAt < snap.resetAt
-            ) {
-              existing = null;
-            }
-          }
-
-          if (existing) {
-            const merged = mergeNode(existing, node, node.sourceObservationIds, capturedAt);
-            await kv.set(KV.graphNodes, existing.id, merged);
-            // Update topNodes entry if present so a stale clone isn't
-            // returned from the snapshot fast path.
-            const topIdx = snap.topNodes.findIndex(
-              (n) => n.id === existing!.id,
-            );
-            if (topIdx !== -1) snap.topNodes[topIdx] = merged;
-          } else {
-            await kv.set(KV.graphNodes, node.id, node);
-            await kv.set(KV.graphNameIndex, indexKey, node.id);
-            await kv.set(KV.graphNodeDegree, node.id, 0);
-            snap.stats.totalNodes += 1;
-            snap.stats.nodesByType[node.type] =
-              (snap.stats.nodesByType[node.type] ?? 0) + 1;
-            newNodeCount += 1;
-            if (snap.topNodes.length < SNAPSHOT_TOP_NODES) {
-              // Degree 0 still beats an empty slot — sit at the tail
-              // until edges arrive and promote.
-              snap.topNodes.push(node);
-              snap.topDegrees[node.id] = 0;
-            }
-          }
-        }
-
-        for (const edge of edges) {
-          const eKey = edgeIndexKey(
-            edge.sourceNodeId,
-            edge.targetNodeId,
-            edge.type,
-          );
-          const existingId = await kv.get<string>(KV.graphEdgeKey, eKey);
-
-          let existing: GraphEdge | null = null;
-          if (existingId) {
-            existing = await kv.get<GraphEdge>(KV.graphEdges, existingId);
-            // Same #825 orphan check as the node path above.
-            if (
-              existing &&
-              snap.resetAt &&
-              typeof existing.createdAt === "string" &&
-              existing.createdAt < snap.resetAt
-            ) {
-              existing = null;
-            }
-          }
-
-          if (existing) {
-            const merged = mergeEdge(existing, edge.sourceObservationIds);
-            await kv.set(KV.graphEdges, existing.id, merged);
-            // Replace cached topEdges entry too if present.
-            const topIdx = snap.topEdges.findIndex(
-              (e) => e.id === existing!.id,
-            );
-            if (topIdx !== -1) snap.topEdges[topIdx] = merged;
-          } else {
-            await kv.set(KV.graphEdges, edge.id, edge);
-            await kv.set(KV.graphEdgeKey, eKey, edge.id);
-            snap.stats.totalEdges += 1;
-            snap.stats.edgesByType[edge.type] =
-              (snap.stats.edgesByType[edge.type] ?? 0) + 1;
-            newEdgeCount += 1;
-            await applyDegreeDelta(kv, snap, edge.sourceNodeId, +1);
-            await applyDegreeDelta(kv, snap, edge.targetNodeId, +1);
-            newEdgesForTopCheck.push(edge);
-          }
-        }
-
-        // Push newly-added edges into snapshot.topEdges if both
-        // endpoints are in the top-N (post-degree-delta). Done after
-        // all degree updates so the topIds set is stable.
-        for (const edge of newEdgesForTopCheck) {
-          snapshotPushEdgeIfBothInTop(snap, edge);
-        }
-
-        if (newNodeCount > 0 || newEdgeCount > 0) {
-          snap.updatedAt = capturedAt;
-          snap.dirty = false;
-          await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
-        }
+        const { newNodeCount, newEdgeCount } = await withKeyedLock(
+          "graph:merge",
+          () => mergeExtractIntoSnapshot(kv, nodes, edges),
+        );
 
         await recordAudit(kv, "observe", "mem::graph-extract", obsIds, {
           nodesExtracted: nodes.length,
