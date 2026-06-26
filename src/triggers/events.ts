@@ -95,8 +95,15 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     sessionId: string;
     since?: string;
     until?: string;
+    reason?: string;
   }): Promise<unknown> => {
-    const { sessionId, since, until } = params;
+    const { sessionId, since, until, reason } = params;
+    // Idle checkpoints fire every few minutes for every active session and
+    // only need the windowed graph-extract. Re-running the full-session
+    // summarize on each one is the O(N^2) drain that lets the consolidation
+    // backlog outpace intake. The final summary is produced on session stop
+    // or end; until then the graph and raw observations stay current.
+    const shouldSummarize = reason !== "idle-checkpoint";
     const graphPromise: Promise<void> = isGraphExtractionEnabled()
       ? (async () => {
           try {
@@ -126,32 +133,34 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
 
     let summarizeError: Error | null = null;
     let summary: unknown;
-    try {
-      summary = await sdk.trigger({
-        function_id: "mem::summarize",
-        payload: { sessionId, ...(until ? { until } : {}) },
-        timeoutMs: getSummarizeTimeoutMs(),
-      });
-      if (
-        summary &&
-        typeof summary === "object" &&
-        (summary as { success?: boolean }).success === false
-      ) {
-        const error = (summary as { error?: string }).error ?? "unknown";
-        if (error === "no_provider" || error === "no_observations") {
-          logger.info("Summarize skipped as no-op, pipeline continues", {
-            sessionId,
-            error,
-          });
-        } else {
-          summarizeError = new Error(
-            `mem::summarize returned failure: ${error}`,
-          );
+    if (shouldSummarize) {
+      try {
+        summary = await sdk.trigger({
+          function_id: "mem::summarize",
+          payload: { sessionId, ...(until ? { until } : {}) },
+          timeoutMs: getSummarizeTimeoutMs(),
+        });
+        if (
+          summary &&
+          typeof summary === "object" &&
+          (summary as { success?: boolean }).success === false
+        ) {
+          const error = (summary as { error?: string }).error ?? "unknown";
+          if (error === "no_provider" || error === "no_observations") {
+            logger.info("Summarize skipped as no-op, pipeline continues", {
+              sessionId,
+              error,
+            });
+          } else {
+            summarizeError = new Error(
+              `mem::summarize returned failure: ${error}`,
+            );
+          }
         }
+      } catch (err) {
+        summarizeError =
+          err instanceof Error ? err : new Error(errorMessage(err));
       }
-    } catch (err) {
-      summarizeError =
-        err instanceof Error ? err : new Error(errorMessage(err));
     }
 
     if (!summarizeError && isReflectEnabled()) {
@@ -181,7 +190,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("event::session::stopped", async (data: SessionStoppedPayload) => {
     const reason = data.reason ?? "stopped";
     const queued = enqueueSessionStopped(data.sessionId, reason, async () =>
-      runSessionConsolidation({ sessionId: data.sessionId, since: data.since, until: data.until }),
+      runSessionConsolidation({ sessionId: data.sessionId, since: data.since, until: data.until, reason }),
     );
     return data.waitForCompletion ? queued.done : {
       queued: true,
@@ -198,7 +207,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("event::session::checkpoint", async (data: SessionStoppedPayload) => {
     const reason = data.reason ?? "checkpoint";
     const queued = enqueueSessionStopped(data.sessionId, reason, async () =>
-      runSessionConsolidation({ sessionId: data.sessionId, since: data.since, until: data.until }),
+      runSessionConsolidation({ sessionId: data.sessionId, since: data.since, until: data.until, reason }),
     );
     return data.waitForCompletion ? queued.done : {
       queued: true,

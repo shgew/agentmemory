@@ -1059,8 +1059,15 @@ describe("Session Sweep - idle-checkpoint mode + finalize decouple", () => {
     expect(checkpoint).toHaveLength(0);
   });
 
-  it("idle-checkpoint sweep: crashing summarize leaves lastCheckpointAt unchanged and routes session to failed", async () => {
+  it("idle-checkpoint sweep skips summarize, so a crashing summarize cannot fail it", async () => {
+    // Idle checkpoints no longer run the full-session summarize (the
+    // O(N^2) drain that let the backlog outpace intake); the final
+    // summary is deferred to session stop/end, where a summarize crash
+    // still routes the session to failed. On the idle path summarize is
+    // never reached, so the session is checkpointed regardless.
+    let summarizeCalled = false;
     sdk.registerFunction("mem::summarize", async () => {
+      summarizeCalled = true;
       throw new Error("simulated pipeline failure");
     });
     const anchor = new Date(Date.now() - 11 * 60 * 1000).toISOString();
@@ -1076,10 +1083,11 @@ describe("Session Sweep - idle-checkpoint mode + finalize decouple", () => {
       payload: { mode: "idle-checkpoint", maxAgeMs: 600000, sessionIds: ["ses_idle_crash"] },
     })) as { checkpointed: string[]; failed: Array<{ sessionId: string; error: string }> };
 
-    expect(result.checkpointed).not.toContain("ses_idle_crash");
-    expect(result.failed.map((f) => f.sessionId)).toContain("ses_idle_crash");
+    expect(summarizeCalled).toBe(false);
+    expect(result.failed.map((f) => f.sessionId)).not.toContain("ses_idle_crash");
+    expect(result.checkpointed).toContain("ses_idle_crash");
     const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_idle_crash");
     expect(stored?.status).toBe("active");
-    expect(stored?.lastCheckpointAt).toBeUndefined();
+    expect(stored?.lastCheckpointAt).toBe(anchor);
   });
 });
