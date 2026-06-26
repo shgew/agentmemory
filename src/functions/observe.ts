@@ -37,6 +37,41 @@ export function extractImage(d: unknown): string | undefined {
   return undefined;
 }
 
+// Publish an observation to the live-viewer streams without blocking or
+// failing capture. Stream writes are best-effort (the durable record already
+// lives in KV); a disconnected stream worker must not throw mem::observe or add
+// inter-worker round-trip latency to the hot path, so dispatch fire-and-forget
+// with TriggerAction.Void() and surface any rejection as a warning only.
+function publishToStreams(
+  sdk: ISdk,
+  obsId: string,
+  sessionId: string,
+  requests: Array<{ function_id: string; payload: Record<string, unknown> }>,
+): void {
+  void Promise.allSettled(
+    requests.map((req) =>
+      sdk.trigger({
+        function_id: req.function_id,
+        payload: req.payload,
+        action: TriggerAction.Void(),
+      }),
+    ),
+  ).then((results) => {
+    for (const result of results) {
+      if (result.status === "rejected") {
+        logger.warn("Non-fatal stream publish failure in observe", {
+          obsId,
+          sessionId,
+          error:
+            result.reason instanceof Error
+              ? result.reason.message
+              : String(result.reason),
+        });
+      }
+    }
+  });
+}
+
 export function registerObserveFunction(
   sdk: ISdk,
   kv: StateKV,
@@ -127,20 +162,10 @@ export function registerObserveFunction(
       const pendingImageData = extractedImage;
 
       return withKeyedLock(`obs:${payload.sessionId}`, async () => {
-        if (maxObservationsPerSession && maxObservationsPerSession > 0) {
-          const existing = await kv.list(KV.observations(payload.sessionId));
-          if (existing.length >= maxObservationsPerSession) {
-            return {
-              success: false,
-              error: `Session observation limit reached (${maxObservationsPerSession})`,
-            };
-          }
-        }
-
-        // Existing session is the source of truth for agentId (even
-        // undefined). Env AGENT_ID only fires when no session row
-        // exists yet — otherwise an unscoped session would get
-        // retroactively scoped by a later AGENT_ID export.
+        // The existing session row is the source of truth for both agentId
+        // (even when undefined) and the observation-count cap. Env AGENT_ID
+        // only applies when no row exists yet; otherwise an unscoped session
+        // would get retroactively scoped by a later AGENT_ID export.
         const existingSession = await kv.get<{
           agentId?: string;
           observationCount?: number;
@@ -149,6 +174,24 @@ export function registerObserveFunction(
           endedAt?: string;
           lastCheckpointAt?: string;
         }>(KV.sessions, payload.sessionId);
+
+        // Soft lifetime cap via the maintained observationCount (O(1)) instead
+        // of listing all stored observations (O(n)). Reaching the cap is an
+        // intentional drop, not an error, so the return omits success:false and
+        // the FunctionMetrics instrument does not score it as a failure.
+        if (maxObservationsPerSession && maxObservationsPerSession > 0) {
+          const currentCount = existingSession?.observationCount ?? 0;
+          if (currentCount >= maxObservationsPerSession) {
+            return {
+              skipped: true,
+              limitReached: true,
+              reason: "observation_limit_reached",
+              sessionId: payload.sessionId,
+              limit: maxObservationsPerSession,
+            };
+          }
+        }
+
         const inheritedAgentId = existingSession
           ? existingSession.agentId
           : getAgentId();
@@ -203,27 +246,27 @@ export function registerObserveFunction(
           dedupMap.record(dedupHash);
         }
 
-        await sdk.trigger({
-          function_id: "stream::set",
-          payload: {
-          stream_name: STREAM.name,
-          group_id: STREAM.group(payload.sessionId),
-          item_id: obsId,
-          data: { type: "raw", observation: raw },
+        publishToStreams(sdk, obsId, payload.sessionId, [
+          {
+            function_id: "stream::set",
+            payload: {
+              stream_name: STREAM.name,
+              group_id: STREAM.group(payload.sessionId),
+              item_id: obsId,
+              data: { type: "raw", observation: raw },
+            },
           },
-        });
-
-        await sdk.trigger({
-          function_id: "stream::send",
-          payload: {
-            stream_name: STREAM.name,
-            group_id: STREAM.viewerGroup,
-            id: `raw-${obsId}`,
-            type: "raw_observation",
-            data: { type: "raw", observation: raw, sessionId: payload.sessionId },
+          {
+            function_id: "stream::send",
+            payload: {
+              stream_name: STREAM.name,
+              group_id: STREAM.viewerGroup,
+              id: `raw-${obsId}`,
+              type: "raw_observation",
+              data: { type: "raw", observation: raw, sessionId: payload.sessionId },
+            },
           },
-          action: TriggerAction.Void(),
-        });
+        ]);
 
         const session = existingSession;
         if (session) {
@@ -322,28 +365,30 @@ export function registerObserveFunction(
             synthetic.title + " " + (synthetic.narrative || ""),
             { kind: "synthetic", logId: synthetic.id },
           );
-          await sdk.trigger({
-            function_id: "stream::set",
-            payload: {
-              stream_name: STREAM.name,
-              group_id: STREAM.group(payload.sessionId),
-              item_id: obsId,
-              data: { type: "compressed", observation: synthetic },
-            },
-          });
-          await sdk.trigger({
-            function_id: "stream::set",
-            payload: {
-              stream_name: STREAM.name,
-              group_id: STREAM.viewerGroup,
-              item_id: obsId,
-              data: {
-                type: "compressed",
-                observation: synthetic,
-                sessionId: payload.sessionId,
+          publishToStreams(sdk, obsId, payload.sessionId, [
+            {
+              function_id: "stream::set",
+              payload: {
+                stream_name: STREAM.name,
+                group_id: STREAM.group(payload.sessionId),
+                item_id: obsId,
+                data: { type: "compressed", observation: synthetic },
               },
             },
-          });
+            {
+              function_id: "stream::set",
+              payload: {
+                stream_name: STREAM.name,
+                group_id: STREAM.viewerGroup,
+                item_id: obsId,
+                data: {
+                  type: "compressed",
+                  observation: synthetic,
+                  sessionId: payload.sessionId,
+                },
+              },
+            },
+          ]);
         }
 
         logger.info("Observation captured", {
