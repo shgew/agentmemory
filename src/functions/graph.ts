@@ -196,6 +196,21 @@ function paginateFromSnapshot(
   };
 }
 
+function snapshotSubgraph(snap: GraphSnapshot): {
+  allNodes: GraphNode[];
+  allEdges: GraphEdge[];
+} {
+  const allNodes = snap.topNodes.filter((n) => !n.stale);
+  const liveIds = new Set(allNodes.map((n) => n.id));
+  const allEdges = snap.topEdges.filter(
+    (e) =>
+      !e.stale &&
+      liveIds.has(e.sourceNodeId) &&
+      liveIds.has(e.targetNodeId),
+  );
+  return { allNodes, allEdges };
+}
+
 // #814 v2: the rebuild path won't terminate on corpora large enough
 // that kv.list returns a payload too big to JSON.parse without
 // starving the iii heartbeat. We don't actually know the corpus size
@@ -805,39 +820,15 @@ export function registerGraphFunction(
         };
       }
 
-      // Query / startNodeId paths still need broader access. Race the
-      // live enumeration against a wall-clock budget so a long
-      // kv.list doesn't block the worker indefinitely. On timeout the
-      // caller gets a snapshot-backed approximation instead of a 500.
-      let allNodes: GraphNode[];
-      let allEdges: GraphEdge[];
-      try {
-        const [rawNodes, rawEdges] = await withTimeout(
-          Promise.all([
-            kv.list<GraphNode>(KV.graphNodes),
-            kv.list<GraphEdge>(KV.graphEdges),
-          ]),
-          LIVE_ENUMERATION_BUDGET_MS,
-          "graph-query enumeration",
-        );
-        allNodes = rawNodes.filter((n) => !n.stale);
-        allEdges = rawEdges.filter((e) => !e.stale);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.warn("Graph query enumeration timed out, using snapshot", {
-          error: msg,
-        });
-        const snap = await readGraphSnapshot(kv);
-        if (snap) {
-          return {
-            ...paginateFromSnapshot(snap, data.nodeType, limit, offset),
-            warning:
-              "Live graph enumeration exceeded budget. Query / " +
-              "startNodeId paths degrade on >25K-node corpora until a " +
-              "per-node edge index lands. Result reflects top-degree " +
-              "snapshot, not the requested walk.",
-          };
-        }
+      // The query and startNodeId paths previously enumerated the full
+      // graph via kv.list. On a large corpus that serializes a multi-MB
+      // state frame and starves the single-threaded iii worker heartbeat;
+      // the soft withTimeout rejects the promise but cannot abort the
+      // serialization, so the worker reconnects and the caller sees a 500.
+      // Both paths now read the bounded snapshot exclusively, matching
+      // graph-stats, the noWalk branch, and graph-retrieval.ts.
+      const snap = await readGraphSnapshot(kv);
+      if (!snap || snap.topNodes.length === 0) {
         return {
           nodes: [],
           edges: [],
@@ -847,10 +838,24 @@ export function registerGraphFunction(
           truncated: false,
           limit,
           offset,
+          fromSnapshot: true,
           warning:
-            "Graph enumeration exceeded budget and no snapshot is available.",
+            "No graph snapshot available. Either no graph has been " +
+            "extracted yet, or you are on a legacy corpus from a pre-#814 " +
+            "agentmemory build. Run POST /agentmemory/graph/snapshot-rebuild " +
+            "(safe up to ~25K nodes) or POST /agentmemory/graph/reset to " +
+            "wipe and let future extracts repopulate.",
         };
       }
+      const { allNodes, allEdges } = snapshotSubgraph(snap);
+      const snapshotWarning =
+        snap.stats.totalNodes > allNodes.length
+          ? "Result scoped to the top-degree graph snapshot (" +
+            `${allNodes.length} of ${snap.stats.totalNodes} nodes). The ` +
+            "query and startNodeId paths read the bounded snapshot, not the " +
+            "full graph, so low-degree matches outside the snapshot are not " +
+            "returned."
+          : undefined;
 
       if (data.query) {
         const lower = data.query.toLowerCase();
@@ -861,10 +866,32 @@ export function registerGraphFunction(
               (v) => typeof v === "string" && v.toLowerCase().includes(lower),
             ),
         );
-        return paginate(matchingNodes, allEdges, 0, limit, offset);
+        return {
+          ...paginate(matchingNodes, allEdges, 0, limit, offset),
+          fromSnapshot: true,
+          ...(snapshotWarning ? { warning: snapshotWarning } : {}),
+        };
       }
 
       if (data.startNodeId) {
+        if (!allNodes.some((n) => n.id === data.startNodeId)) {
+          return {
+            nodes: [],
+            edges: [],
+            depth: 0,
+            totalNodes: 0,
+            totalEdges: 0,
+            truncated: false,
+            limit,
+            offset,
+            fromSnapshot: true,
+            warning:
+              "startNodeId is outside the bounded graph snapshot " +
+              "(top-degree subgraph). The walk path no longer enumerates " +
+              "the full graph; query by name, or widen the snapshot, to " +
+              "reach low-degree nodes.",
+          };
+        }
         const visited = new Set<string>();
         const visitedEdges = new Set<string>();
         const resultNodes: GraphNode[] = [];
@@ -903,10 +930,13 @@ export function registerGraphFunction(
           }
         }
 
-        return paginate(resultNodes, resultEdges, maxDepth, limit, offset);
+        return {
+          ...paginate(resultNodes, resultEdges, maxDepth, limit, offset),
+          fromSnapshot: true,
+          ...(snapshotWarning ? { warning: snapshotWarning } : {}),
+        };
       }
 
-      // Unreachable — noWalk branch handles the rest.
       return paginate([], [], 0, limit, offset);
     },
   );

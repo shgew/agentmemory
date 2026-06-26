@@ -583,67 +583,12 @@ describe("Graph Functions", () => {
     });
   });
 
-  // CodeRabbit feedback: cover the timeout-budget fallback path and
-  // the oversized-corpus rebuild refusal. The hot path never enumerates
-  // any more, but the rebuild endpoint AND the BFS / query branches
-  // still call kv.list — both need explicit failure-mode tests.
+  // The rebuild endpoint still calls kv.list (it backfills the snapshot
+  // from the full graphNodes/graphEdges scopes), so it keeps the
+  // wall-clock budget and the oversized-corpus refusal. The graph-query
+  // hot path no longer enumerates at all; its snapshot-scoping is covered
+  // by the "graph-query snapshot scoping" suite below.
   describe("budget + tooLarge guards (#814 v2)", () => {
-    function slowKV(delayMs: number) {
-      const base = mockKV();
-      return {
-        ...base,
-        list: async <T>(scope: string): Promise<T[]> => {
-          await new Promise((r) => setTimeout(r, delayMs));
-          return base.list<T>(scope);
-        },
-      };
-    }
-
-    it("graph-query startNodeId returns warning envelope when enumeration exceeds budget", async () => {
-      const slow = slowKV(7000); // > LIVE_ENUMERATION_BUDGET_MS (6000ms)
-      const localSdk = mockSdk();
-      registerGraphFunction(localSdk as never, slow as never, mockProvider as never);
-
-      const result = (await localSdk.trigger("mem::graph-query", {
-        startNodeId: "n_missing",
-      })) as GraphQueryResult;
-
-      expect(result.warning).toBeTruthy();
-      expect(result.warning).toMatch(/budget|enumeration/i);
-    }, 10000);
-
-    // CodeRabbit raised that slowKV(setTimeout) doesn't simulate a
-    // blocked event loop. The real production failure is iii rejecting
-    // the trigger with "Invocation stopped" after the worker dies
-    // (heartbeat starvation). A rejecting kv.list mock covers that
-    // catch-path directly without introducing a busy-wait that would
-    // also starve the budget timer and produce a flaky test.
-    function rejectingKV() {
-      const base = mockKV();
-      return {
-        ...base,
-        list: async <T>(_scope: string): Promise<T[]> => {
-          throw new Error("Invocation stopped");
-        },
-      };
-    }
-
-    it("graph-query rejects-from-engine path returns warning envelope (worker-death simulation)", async () => {
-      const rejector = rejectingKV();
-      const localSdk = mockSdk();
-      registerGraphFunction(
-        localSdk as never,
-        rejector as never,
-        mockProvider as never,
-      );
-
-      const result = (await localSdk.trigger("mem::graph-query", {
-        startNodeId: "n_missing",
-      })) as GraphQueryResult;
-
-      expect(result.warning).toBeTruthy();
-      expect(result.nodes).toEqual([]);
-    });
 
     it("graph-snapshot-rebuild refuses corpora past REBUILD_SAFE_NODE_CEILING", async () => {
       // Direct-poke the mock store with > 25K node values so kv.list
@@ -1094,5 +1039,206 @@ describe("Graph type validation (enum allowlist)", () => {
     expect(types).toContain("preference");
     expect(types).toContain("organization");
     expect(types).toContain("event");
+  });
+});
+
+describe("graph-query snapshot scoping (enumeration-free, graph-query-500 fix)", () => {
+  type SnapNode = {
+    id: string;
+    type: string;
+    name: string;
+    properties: Record<string, string>;
+    sourceObservationIds: string[];
+    createdAt: string;
+    stale?: boolean;
+  };
+  type SnapEdge = {
+    id: string;
+    type: string;
+    sourceNodeId: string;
+    targetNodeId: string;
+    weight: number;
+    sourceObservationIds: string[];
+    createdAt: string;
+    stale?: boolean;
+  };
+
+  function gnode(id: string, name: string, type = "concept"): SnapNode {
+    return {
+      id,
+      type,
+      name,
+      properties: {},
+      sourceObservationIds: [`obs_${id}`],
+      createdAt: "2026-01-01T00:00:00Z",
+    };
+  }
+
+  function gedge(id: string, sourceNodeId: string, targetNodeId: string): SnapEdge {
+    return {
+      id,
+      type: "related_to",
+      sourceNodeId,
+      targetNodeId,
+      weight: 0.8,
+      sourceObservationIds: ["obs_1"],
+      createdAt: "2026-01-01T00:00:00Z",
+    };
+  }
+
+  function snapshotWith(nodes: SnapNode[], edges: SnapEdge[], totalNodes?: number) {
+    const topDegrees: Record<string, number> = {};
+    for (const n of nodes) topDegrees[n.id] = 1;
+    return {
+      version: 1,
+      topNodes: nodes,
+      topEdges: edges,
+      topDegrees,
+      stats: {
+        totalNodes: totalNodes ?? nodes.length,
+        totalEdges: edges.length,
+        nodesByType: {},
+        edgesByType: {},
+      },
+      updatedAt: "2026-01-01T00:00:00Z",
+      dirty: false,
+    };
+  }
+
+  // get/set work; list THROWS on the graph node/edge scopes so any
+  // enumeration fails the test loudly. This is the real production
+  // failure mode: the unbounded kv.list serializes a multi-MB frame and
+  // starves the iii worker heartbeat. A graph-query that reads only the
+  // bounded snapshot must never touch these scopes.
+  function snapshotOnlyKV(snapshot: unknown) {
+    const store = new Map<string, Map<string, unknown>>();
+    store.set("mem:graph:snapshot", new Map([["current", snapshot]]));
+    return {
+      get: async <T>(scope: string, key: string): Promise<T | null> =>
+        (store.get(scope)?.get(key) as T) ?? null,
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (!store.has(scope)) store.set(scope, new Map());
+        store.get(scope)!.set(key, data);
+        return data;
+      },
+      delete: async (scope: string, key: string): Promise<void> => {
+        store.get(scope)?.delete(key);
+      },
+      list: async <T>(scope: string): Promise<T[]> => {
+        if (scope === "mem:graph:nodes" || scope === "mem:graph:edges") {
+          throw new Error(
+            `kv.list on ${scope} is forbidden: graph-query must read the bounded snapshot`,
+          );
+        }
+        const entries = store.get(scope);
+        return entries ? (Array.from(entries.values()) as T[]) : [];
+      },
+    };
+  }
+
+  it("query filters the snapshot subgraph by substring without enumerating", async () => {
+    const snap = snapshotWith(
+      [gnode("n1", "alpha"), gnode("n2", "beta"), gnode("n3", "alphabet")],
+      [],
+    );
+    const localSdk = mockSdk();
+    registerGraphFunction(
+      localSdk as never,
+      snapshotOnlyKV(snap) as never,
+      mockProvider as never,
+    );
+
+    const result = (await localSdk.trigger("mem::graph-query", {
+      query: "alph",
+    })) as GraphQueryResult;
+
+    expect(result.fromSnapshot).toBe(true);
+    expect(result.nodes.map((n) => n.name).sort()).toEqual([
+      "alpha",
+      "alphabet",
+    ]);
+    expect(
+      result.nodes.every((n) => n.name.toLowerCase().includes("alph")),
+    ).toBe(true);
+  });
+
+  it("startNodeId BFS stays within the reachable snapshot subgraph", async () => {
+    const snap = snapshotWith(
+      [gnode("n1", "Start"), gnode("n2", "Mid"), gnode("n3", "Unrelated")],
+      [gedge("e1", "n1", "n2")],
+    );
+    const localSdk = mockSdk();
+    registerGraphFunction(
+      localSdk as never,
+      snapshotOnlyKV(snap) as never,
+      mockProvider as never,
+    );
+
+    const result = (await localSdk.trigger("mem::graph-query", {
+      startNodeId: "n1",
+      maxDepth: 2,
+    })) as GraphQueryResult;
+
+    expect(result.fromSnapshot).toBe(true);
+    expect(result.nodes.map((n) => n.id).sort()).toEqual(["n1", "n2"]);
+    expect(result.edges.map((e) => e.id)).toContain("e1");
+  });
+
+  it("startNodeId outside the snapshot returns an empty result with a warning", async () => {
+    const snap = snapshotWith([gnode("n1", "Start")], []);
+    const localSdk = mockSdk();
+    registerGraphFunction(
+      localSdk as never,
+      snapshotOnlyKV(snap) as never,
+      mockProvider as never,
+    );
+
+    const result = (await localSdk.trigger("mem::graph-query", {
+      startNodeId: "n_missing",
+      maxDepth: 2,
+    })) as GraphQueryResult;
+
+    expect(result.nodes).toEqual([]);
+    expect(result.edges).toEqual([]);
+    expect(result.warning).toMatch(/snapshot|outside/i);
+  });
+
+  it("query warns when the corpus is larger than the bounded snapshot", async () => {
+    const snap = snapshotWith([gnode("n1", "alpha")], [], 5000);
+    const localSdk = mockSdk();
+    registerGraphFunction(
+      localSdk as never,
+      snapshotOnlyKV(snap) as never,
+      mockProvider as never,
+    );
+
+    const result = (await localSdk.trigger("mem::graph-query", {
+      query: "alpha",
+    })) as GraphQueryResult;
+
+    expect(result.fromSnapshot).toBe(true);
+    expect(result.nodes.map((n) => n.name)).toEqual(["alpha"]);
+    expect(result.warning).toBeTruthy();
+  });
+
+  it("applies the nodeType filter to startNodeId walk result nodes", async () => {
+    const snap = snapshotWith(
+      [gnode("n1", "Start", "file"), gnode("n2", "Mid", "concept")],
+      [gedge("e1", "n1", "n2")],
+    );
+    const localSdk = mockSdk();
+    registerGraphFunction(
+      localSdk as never,
+      snapshotOnlyKV(snap) as never,
+      mockProvider as never,
+    );
+
+    const result = (await localSdk.trigger("mem::graph-query", {
+      startNodeId: "n1",
+      nodeType: "concept",
+      maxDepth: 2,
+    })) as GraphQueryResult;
+
+    expect(result.nodes.map((n) => n.id)).toEqual(["n2"]);
   });
 });
