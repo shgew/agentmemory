@@ -282,6 +282,11 @@ export const V040_TOOLS: McpToolDef[] = [
           description: "Max BFS depth (default 3, max 5)",
         },
         query: { type: "string", description: "Search nodes by name" },
+        limit: {
+          type: "number",
+          description: "Max nodes to return (default 50, max 100)",
+        },
+        offset: { type: "number", description: "Pagination offset (default 0)" },
       },
     },
   },

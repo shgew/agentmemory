@@ -7,8 +7,10 @@ import type {
   Session,
   GraphNode,
   GraphEdge,
+  GraphQueryResult,
 } from "../types.js";
 import { getVisibleTools } from "./tools-registry.js";
+import { trimGraphQueryForMcp } from "./graph-trim.js";
 import { timingSafeCompare } from "../auth.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
 
@@ -453,6 +455,8 @@ export function registerMcpEndpoints(
                 nodeType?: string;
                 maxDepth?: number;
                 query?: string;
+                limit?: number;
+                offset?: number;
               } = {};
               const startNodeId = asNonEmptyString(args.startNodeId);
               const nodeType = asNonEmptyString(args.nodeType);
@@ -462,6 +466,10 @@ export function registerMcpEndpoints(
               if (nodeType) payload.nodeType = nodeType;
               if (query) payload.query = query;
               if (maxDepth !== undefined) payload.maxDepth = Math.max(1, Math.min(8, maxDepth));
+              const limit = Math.max(1, Math.min(100, asNumber(args.limit) ?? 50));
+              const offset = asNumber(args.offset);
+              payload.limit = limit;
+              if (offset !== undefined) payload.offset = Math.max(0, offset);
               const result = await sdk.trigger({
                 function_id: "mem::graph-query",
                 payload,
@@ -470,7 +478,7 @@ export function registerMcpEndpoints(
                 status_code: 200,
                 body: {
                   content: [
-                    { type: "text", text: JSON.stringify(result, null, 2) },
+                    { type: "text", text: JSON.stringify(trimGraphQueryForMcp(result as GraphQueryResult), null, 2) },
                   ],
                 },
               };
