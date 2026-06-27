@@ -405,15 +405,9 @@ export function registerSlotsFunctions(sdk: ISdk, kv: StateKV): void {
         .sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""))
         .slice(0, max);
 
-      const pendingLines: string[] = [];
       const patternCounts = new Map<string, number>();
       const files = new Set<string>();
       for (const obs of recent) {
-        const title = (obs.title || "").toLowerCase();
-        const narrative = (obs.narrative || "").toLowerCase();
-        if (narrative.includes("todo") || title.includes("todo")) {
-          pendingLines.push(`- ${obs.title || obs.id}`);
-        }
         if (obs.type === "error") {
           patternCounts.set("errors", (patternCounts.get("errors") ?? 0) + 1);
         }
@@ -424,28 +418,6 @@ export function registerSlotsFunctions(sdk: ISdk, kv: StateKV): void {
       }
 
       let applied = 0;
-
-      if (pendingLines.length > 0) {
-        const pendingApplied = await withKeyedLock(`slot:pending_items`, async () => {
-          const { slot, scope } = await readSlot(kv, "pending_items");
-          if (!slot) return false;
-          const already = new Set(slot.content.split("\n"));
-          const fresh = pendingLines.filter((line) => !already.has(line));
-          if (fresh.length === 0) return false;
-          const sep = slot.content && !slot.content.endsWith("\n") ? "\n" : "";
-          const next = `${slot.content}${sep}${fresh.join("\n")}`;
-          const truncated = next.length > slot.sizeLimit
-            ? next.slice(next.length - slot.sizeLimit)
-            : next;
-          await kv.set(scopeKv(scope), "pending_items", {
-            ...slot,
-            content: truncated,
-            updatedAt: nowIso(),
-          });
-          return true;
-        });
-        if (pendingApplied) applied++;
-      }
 
       if (patternCounts.size > 0) {
         const patternsApplied = await withKeyedLock(`slot:session_patterns`, async () => {

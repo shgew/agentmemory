@@ -210,7 +210,7 @@ describe("slots — reflect", () => {
     expect(res.applied).toBe(0);
   });
 
-  it("moves TODO-flavoured observations into pending_items and counts patterns", async () => {
+  it("keeps pending_items agent-curated (slot-reflect no longer auto-dumps TODOs) while still counting patterns", async () => {
     const sessionId = "sess_reflect";
     const obsKey = KV.observations(sessionId);
     const base = {
@@ -247,7 +247,7 @@ describe("slots — reflect", () => {
     const pending = (await handlers["mem::slot-get"]({ label: "pending_items" })) as {
       slot: { content: string };
     };
-    expect(pending.slot.content).toContain("TODO: wire up retries");
+    expect(pending.slot.content).toBe("");
 
     const patterns = (await handlers["mem::slot-get"]({ label: "session_patterns" })) as {
       slot: { content: string };
