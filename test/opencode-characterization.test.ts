@@ -650,7 +650,7 @@ describe("characterization: typed hooks", () => {
     expect(obs!.body.data.tool_output).toContain("file contents");
   });
 
-  it("experimental.chat.system.transform first call posts /context and pushes instructions", async () => {
+  it("experimental.chat.system.transform first call posts /context (hardcoded instructions block removed)", async () => {
     const { plugin, calls } = await loadPlugin();
     const output = { system: [] as string[] };
     await plugin["experimental.chat.system.transform"]!(
@@ -658,7 +658,7 @@ describe("characterization: typed hooks", () => {
       output as any,
     );
     expect(findPost(calls, "/context")).toBeDefined();
-    expect(output.system.some((s) => /agentmemory-instructions/.test(s))).toBe(true);
+    expect(output.system.some((s) => /agentmemory-instructions/.test(s))).toBe(false);
     expect(output.system).toContain("<test-context>");
   });
 

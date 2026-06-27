@@ -419,11 +419,11 @@ describe("OpenCode plugin behavior: resumed-session re-injection", () => {
   });
 });
 
-describe("OpenCode plugin behavior: injected instructions document slot tooling (P1)", () => {
+describe("OpenCode plugin behavior: instruction block removed, slot doctrine deferred to AGENTS.md (P1)", () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(async () => { await teardownPlugin(); });
 
-  it("first system.transform injection lists slot tools and the pending_items loop", async () => {
+  it("first system.transform injection no longer embeds the hardcoded slot-tool instruction block", async () => {
     const { plugin } = await loadPlugin();
     await plugin.event!({
       event: { type: "session.created", properties: { info: { id: "s-p1" } } } as any,
@@ -434,11 +434,8 @@ describe("OpenCode plugin behavior: injected instructions document slot tooling 
       out as any,
     );
     const injected = out.system.join("\n");
-    expect(injected).toMatch(/memory_slot_list/);
-    expect(injected).toMatch(/memory_slot_get/);
-    expect(injected).toMatch(/memory_slot_append/);
-    expect(injected).toMatch(/memory_slot_replace/);
-    expect(injected).toMatch(/pending_items/);
+    expect(injected).not.toMatch(/<agentmemory-instructions>/);
+    expect(injected).not.toMatch(/memory_slot_list/);
   });
 });
 

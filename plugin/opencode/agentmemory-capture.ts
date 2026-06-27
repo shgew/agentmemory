@@ -296,62 +296,6 @@ function assertHttpsOrLoopback(): void {
   }
 }
 
-const AGENTMEMORY_INSTRUCTIONS = `<agentmemory-instructions>
-You have access to agentmemory for persistent cross-session memory. Use these tools proactively.
-
-CORE TOOLS:
-
-memory_save — Save an insight, decision, or fact to long-term memory.
-  Required: content (text), concepts (2-5 comma-separated keywords), type (pattern/preference/architecture/bug/workflow/fact)
-  Optional: files (comma-separated paths)
-  Use when: user says "remember this", after discovering a bug, after making an architectural decision, after learning a project convention.
-
-memory_recall — Search past observations by keywords.
-  Use when: user says "recall", "what did we do", "do you remember", or needs context from past sessions.
-
-memory_smart_search — Hybrid semantic+keyword search with progressive disclosure.
-  Use when: you need the most relevant past context, fuzzy/conceptual searches, or recall doesn't find what you need.
-
-memory_sessions — List recent sessions with status and observation counts.
-  Use when: user asks about session/past history, "what did we work on".
-
-memory_file_history — Get past observations about specific files (across all sessions).
-  Use when: you're about to edit a file and want to know its history, common pitfalls, or past edits.
-
-memory_lesson_save — Save a lesson learned (what worked, what to avoid).
-  Use when: you discover a pattern that could help future sessions avoid mistakes.
-
-memory_lesson_recall — Search lessons by query. Returns lessons sorted by confidence.
-  Use when: before making a decision, check if past lessons apply.
-
-memory_governance_delete — Delete specific memories. Requires explicit user confirmation.
-  Use when: user says "forget this", "delete that memory".
-
-memory_patterns — Detect recurring patterns across sessions.
-  Use when: you want to understand project-level trends over time.
-
-memory_consolidate — Run the 4-tier memory consolidation pipeline.
-  Use when: you want to compress and organize accumulated session observations.
-
-SLOTS (durable cross-session notes):
-
-memory_slot_list: List all memory slots (pinned, project, and global).
-  Use when: resuming work, to see what stable context already exists.
-
-memory_slot_get: Read a single slot by label (pending_items, project_context, user_preferences, ...).
-  Use when: resuming a session. Read pending_items first to recover unfinished work.
-
-memory_slot_append: Append one line to an existing slot.
-  Use when: stopping mid-task. Append a concise line to pending_items describing the unfinished state. Returns 413 if it would exceed the slot size limit; compact via memory_slot_replace first.
-
-memory_slot_replace: Replace a slot's full content in place.
-  Use when: compacting a slot that hit its size limit, or rewriting stale content.
-
-Operating loop: on resume, read pending_items to recover unfinished work; when stopping midstream with real unfinished state, append one concise line to pending_items. Slots are stable anchors, not scratchpads; session-local detail belongs in memory_save or memory_lesson_save.
-
-All memory tools start with \`agentmemory_memory_\`. Use the exact names as they appear in your tool list. Tool results are JSON. Always check what was returned before presenting to the user.
-</agentmemory-instructions>`;
-
 function extractFilePaths(args: Record<string, unknown>): string[] {
   const files: string[] = [];
   for (const key of FILE_KEYS) {
@@ -1044,7 +988,6 @@ export const AgentmemoryCapturePlugin: Plugin = async () => {
 
       if (!contextInjectedSessions.has(sid)) {
         if (!Array.isArray(output.system)) return;
-        output.system.push(AGENTMEMORY_INSTRUCTIONS);
         let ctx = startContextCache.get(sid);
         if (typeof ctx !== "string" || ctx.length === 0) {
           const result: ContextResponse | null = await postJson("/context", {
@@ -1071,12 +1014,14 @@ export const AgentmemoryCapturePlugin: Plugin = async () => {
         toolName: "enrich_inject",
       });
 
-      const enrichCtx = enrichResult?.context;
-      if (typeof enrichCtx === "string" && enrichCtx.length > 0) {
-        if (Array.isArray(output.system)) {
+      // Clear processed files on any non-null response (not just non-empty
+      // context) so empty-result files do not re-fire /enrich every transform.
+      if (enrichResult !== null) {
+        for (const f of files) stash.delete(f);
+        const enrichCtx = enrichResult.context;
+        if (typeof enrichCtx === "string" && enrichCtx.length > 0 && Array.isArray(output.system)) {
           output.system.push(enrichCtx);
         }
-        for (const f of files) stash.delete(f);
       }
     },
 

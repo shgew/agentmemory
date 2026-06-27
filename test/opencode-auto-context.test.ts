@@ -35,3 +35,37 @@ describe("OpenCode plugin auto-context injection (#431)", () => {
     expect(deletedBlock).toMatch(/startContextCache\.delete\(sid\)/);
   });
 });
+
+describe("OpenCode plugin /enrich idempotence", () => {
+  const plugin = readFileSync(
+    "plugin/opencode/agentmemory-capture.ts",
+    "utf-8",
+  );
+
+  it("drops enriched files from the stash on any non-null response, not only non-empty context", () => {
+    const enrichBlock = plugin.slice(plugin.indexOf('"/enrich"'));
+    // Clearing on enrichResult !== null (server processed the files) stops
+    // empty-result files being re-sent to /enrich on every later transform.
+    expect(enrichBlock).toMatch(
+      /if \(enrichResult !== null\)\s*\{[\s\S]*?for \(const f of files\) stash\.delete\(f\)/,
+    );
+  });
+});
+
+
+describe("OpenCode plugin instruction-block removal", () => {
+  const plugin = readFileSync(
+    "plugin/opencode/agentmemory-capture.ts",
+    "utf-8",
+  );
+
+  it("no longer injects a hardcoded AGENTMEMORY_INSTRUCTIONS block (deduped against the AGENTS.md doctrine)", () => {
+    expect(plugin).not.toMatch(/AGENTMEMORY_INSTRUCTIONS/);
+    expect(plugin).not.toMatch(/<agentmemory-instructions>/);
+  });
+
+  it("still injects live /context into the system prompt", () => {
+    expect(plugin).toMatch(/postJson\(["']\/context["']/);
+    expect(plugin).toMatch(/output\.system\.push\(ctx\)/);
+  });
+});
