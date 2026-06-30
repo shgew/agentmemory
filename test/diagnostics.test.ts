@@ -928,3 +928,150 @@ describe("diagnose — completed session with uncheckpointed activity (Option K)
     expect(pendingChecks).toHaveLength(0);
   });
 });
+
+describe("diagnose/heal category resolution (all + string inputs)", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    registerDiagnosticsFunction(sdk as never, kv as never);
+  });
+
+  it("categories: ['all'] runs every category (not zero checks)", async () => {
+    const result = (await sdk.trigger("mem::diagnose", {
+      categories: ["all"],
+    })) as { checks: DiagnosticCheck[]; summary: { pass: number } };
+    expect(result.checks.length).toBeGreaterThan(0);
+    expect(result.summary.pass).toBe(15);
+    expect(new Set(result.checks.map((c) => c.category)).size).toBeGreaterThan(1);
+  });
+
+  it("categories: 'all' as a string (REST shape) runs every category", async () => {
+    const result = (await sdk.trigger("mem::diagnose", {
+      categories: "all",
+    })) as { summary: { pass: number } };
+    expect(result.summary.pass).toBe(15);
+  });
+
+  it("categories: 'sessions' as a string filters to that category", async () => {
+    const result = (await sdk.trigger("mem::diagnose", {
+      categories: "sessions",
+    })) as { checks: DiagnosticCheck[] };
+    expect(result.checks.length).toBeGreaterThan(0);
+    expect(result.checks.every((c) => c.category === "sessions")).toBe(true);
+  });
+
+  it("categories: 'sessions,memories' CSV string filters to both", async () => {
+    const result = (await sdk.trigger("mem::diagnose", {
+      categories: "sessions,memories",
+    })) as { checks: DiagnosticCheck[] };
+    expect(
+      result.checks.every(
+        (c) => c.category === "sessions" || c.category === "memories",
+      ),
+    ).toBe(true);
+    expect(result.checks.some((c) => c.category === "sessions")).toBe(true);
+    expect(result.checks.some((c) => c.category === "memories")).toBe(true);
+  });
+
+  it("only-invalid categories return an error (no silent zero, no mutate-all)", async () => {
+    const result = (await sdk.trigger("mem::diagnose", {
+      categories: ["bogus", "nope"],
+    })) as { success: boolean; error?: string };
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/no valid categor/i);
+  });
+
+  it("mixed valid+invalid categories uses only the valid tokens", async () => {
+    const result = (await sdk.trigger("mem::diagnose", {
+      categories: ["sessions", "bogus"],
+    })) as { checks: DiagnosticCheck[] };
+    expect(result.checks.length).toBeGreaterThan(0);
+    expect(result.checks.every((c) => c.category === "sessions")).toBe(true);
+  });
+
+  it("heal rejects only-invalid categories instead of mutating everything", async () => {
+    const dep = makeAction({ status: "done" });
+    const blocked = makeAction({ status: "blocked", title: "Stuck task" });
+    const edge = makeEdge({
+      sourceActionId: blocked.id,
+      targetActionId: dep.id,
+      type: "requires",
+    });
+    await kv.set(KV.actions, dep.id, dep);
+    await kv.set(KV.actions, blocked.id, blocked);
+    await kv.set(KV.actionEdges, edge.id, edge);
+
+    const result = (await sdk.trigger("mem::heal", {
+      categories: ["bogus"],
+    })) as { success: boolean; error?: string };
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/no valid categor/i);
+
+    const after = await kv.get<Action>(KV.actions, blocked.id);
+    expect(after!.status).toBe("blocked");
+  });
+
+  it("heal accepts categories: ['all'] and runs every category", async () => {
+    const dep = makeAction({ status: "done" });
+    const blocked = makeAction({ status: "blocked", title: "Stuck task" });
+    const edge = makeEdge({
+      sourceActionId: blocked.id,
+      targetActionId: dep.id,
+      type: "requires",
+    });
+    await kv.set(KV.actions, dep.id, dep);
+    await kv.set(KV.actions, blocked.id, blocked);
+    await kv.set(KV.actionEdges, edge.id, edge);
+
+    const result = (await sdk.trigger("mem::heal", {
+      categories: "all",
+    })) as { success: boolean; fixed: number };
+    expect(result.success).toBe(true);
+    expect(result.fixed).toBe(1);
+  });
+});
+
+describe("memory-project-coverage is advisory (not auto-fixable)", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    registerDiagnosticsFunction(sdk as never, kv as never);
+  });
+
+  it("unscoped latest memory warns but is NOT fixable (heal has no handler)", async () => {
+    const unscoped = makeMemory({ isLatest: true });
+    await kv.set(KV.memories, unscoped.id, unscoped);
+
+    const result = (await sdk.trigger("mem::diagnose", {
+      categories: ["memories"],
+    })) as { checks: DiagnosticCheck[] };
+
+    const check = result.checks.find((c) => c.name === "memory-project-coverage");
+    expect(check).toBeDefined();
+    expect(check!.status).toBe("warn");
+    expect(check!.fixable).toBe(false);
+    expect(
+      result.checks.filter((c) => c.category === "memories" && c.fixable),
+    ).toHaveLength(0);
+  });
+
+  it("heal does not touch unscoped-project memories", async () => {
+    const unscoped = makeMemory({ isLatest: true });
+    await kv.set(KV.memories, unscoped.id, unscoped);
+
+    const result = (await sdk.trigger("mem::heal", {
+      categories: ["memories"],
+    })) as { success: boolean; fixed: number };
+    expect(result.success).toBe(true);
+    expect(result.fixed).toBe(0);
+
+    const after = await kv.get<Memory>(KV.memories, unscoped.id);
+    expect(after!.project).toBeUndefined();
+  });
+});

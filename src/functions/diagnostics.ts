@@ -41,15 +41,44 @@ const ALL_CATEGORIES = [
   "mesh",
 ];
 
+type CategoryResolution =
+  | { categories: string[] }
+  | { error: string };
+
+function resolveCategories(input: unknown): CategoryResolution {
+  const raw = Array.isArray(input)
+    ? input
+    : typeof input === "string"
+      ? input.split(",")
+      : [];
+  const cleaned = raw
+    .filter((c): c is string => typeof c === "string")
+    .map((c) => c.trim())
+    .filter(Boolean);
+  if (cleaned.length === 0) return { categories: ALL_CATEGORIES };
+  if (cleaned.some((c) => c.toLowerCase() === "all")) {
+    return { categories: ALL_CATEGORIES };
+  }
+  const valid = cleaned.filter((c) => ALL_CATEGORIES.includes(c));
+  if (valid.length === 0) {
+    return {
+      error: `No valid categories in [${cleaned.join(", ")}]. Valid categories: ${ALL_CATEGORIES.join(", ")}`,
+    };
+  }
+  return { categories: valid };
+}
+
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 const ONE_HOUR_MS = 60 * 60 * 1000;
 
 export function registerDiagnosticsFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::diagnose", 
-    async (data: { categories?: string[] }) => {
-      const categories = data.categories && data.categories.length > 0
-        ? data.categories.filter((c) => ALL_CATEGORIES.includes(c))
-        : ALL_CATEGORIES;
+    async (data: { categories?: string[] | string }) => {
+      const resolved = resolveCategories(data.categories);
+      if ("error" in resolved) {
+        return { success: false, error: resolved.error };
+      }
+      const categories = resolved.categories;
 
       const checks: DiagnosticCheck[] = [];
       const now = Date.now();
@@ -391,7 +420,7 @@ export function registerDiagnosticsFunction(sdk: ISdk, kv: StateKV): void {
             category: "memories",
             status: "warn",
             message: `${unscopedCount} of ${latestMemories.length} latest memories have no project scope — run POST /agentmemory/migrate {"step":"infer-memory-projects"} to backfill`,
-            fixable: true,
+            fixable: false,
           });
         } else {
           checks.push({
@@ -399,7 +428,7 @@ export function registerDiagnosticsFunction(sdk: ISdk, kv: StateKV): void {
             category: "memories",
             status: "fail",
             message: `${unscopedCount} of ${latestMemories.length} latest memories have no project scope — run POST /agentmemory/migrate {"step":"infer-memory-projects"} to backfill`,
-            fixable: true,
+            fixable: false,
           });
         }
 
@@ -648,11 +677,13 @@ export function registerDiagnosticsFunction(sdk: ISdk, kv: StateKV): void {
   );
 
   sdk.registerFunction("mem::heal", 
-    async (data: { categories?: string[]; dryRun?: boolean }) => {
+    async (data: { categories?: string[] | string; dryRun?: boolean }) => {
       const dryRun = data.dryRun ?? false;
-      const categories = data.categories && data.categories.length > 0
-        ? data.categories.filter((c) => ALL_CATEGORIES.includes(c))
-        : ALL_CATEGORIES;
+      const resolved = resolveCategories(data.categories);
+      if ("error" in resolved) {
+        return { success: false, error: resolved.error };
+      }
+      const categories = resolved.categories;
 
       let fixed = 0;
       let skipped = 0;

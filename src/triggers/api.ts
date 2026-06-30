@@ -3103,8 +3103,11 @@ export function registerApiTriggers(
   sdk.registerFunction("api::diagnose",  async (req: ApiRequest) => {
     const denied = checkAuth(req, secret);
     if (denied) return denied;
-    const body = req.body as Record<string, unknown>;
-    const result = await sdk.trigger({ function_id: "mem::diagnose", payload: body || {} });
+    const body = (req.body as Record<string, unknown>) || {};
+    const result = await sdk.trigger({
+      function_id: "mem::diagnose",
+      payload: { categories: body.categories },
+    });
     return { status_code: 200, body: result };
   });
   sdk.registerTrigger({ type: "http", function_id: "api::diagnose", config: { api_path: "/agentmemory/diagnostics", http_method: "POST" } });
@@ -3112,8 +3115,11 @@ export function registerApiTriggers(
   sdk.registerFunction("api::heal",  async (req: ApiRequest) => {
     const denied = checkAuth(req, secret);
     if (denied) return denied;
-    const body = req.body as Record<string, unknown>;
-    const result = await sdk.trigger({ function_id: "mem::heal", payload: body || {} });
+    const body = (req.body as Record<string, unknown>) || {};
+    const result = await sdk.trigger({
+      function_id: "mem::heal",
+      payload: { categories: body.categories, dryRun: body.dryRun },
+    });
     return { status_code: 200, body: result };
   });
   sdk.registerTrigger({ type: "http", function_id: "api::heal", config: { api_path: "/agentmemory/diagnostics/heal", http_method: "POST" } });
