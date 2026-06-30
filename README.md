@@ -1477,6 +1477,23 @@ Create `~/.agentmemory/.env`:
                                           # first; bump the yaml or use the event-
                                           # driven path (session.stopped pipeline).
 
+# Reflect (insight-synthesis) wall-clock budget
+# AGENTMEMORY_REFLECT_TIMEOUT_MS=600000   # Default: 600 000 ms (10 min). Caps one
+                                          # mem::reflect run. reflect walks concept
+                                          # clusters (highest-degree first), each issuing
+                                          # one serial LLM call; on a large knowledge
+                                          # graph the full pass can exceed the iii
+                                          # invocation timeout (900 000 ms) and be
+                                          # hard-killed, leaving the 24h reflect watermark
+                                          # unadvanced so reflect re-runs and re-times-out
+                                          # every consolidation cycle. With this budget
+                                          # reflect stops starting new clusters once it is
+                                          # hit and returns partial progress (success +
+                                          # budgetExhausted:true), advancing the watermark
+                                          # so the next run resumes the unprocessed
+                                          # clusters. Keep below the iii invocation
+                                          # timeout, with headroom for one in-flight call.
+
 # Graph-extract chunking
 # GRAPH_CHUNK_SIZE=150                    # Default: 150. When mem::graph-extract
                                           # sees more observations than this it

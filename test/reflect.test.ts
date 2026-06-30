@@ -761,3 +761,64 @@ describe("Reflect", () => {
     });
   });
 });
+
+
+describe("Reflect budget (AGENTMEMORY_REFLECT_TIMEOUT_MS)", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+  let provider: { name: string; compress: ReturnType<typeof vi.fn>; summarize: ReturnType<typeof vi.fn> };
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(XML_RESPONSE),
+    };
+    registerReflectFunctions(sdk as never, kv as never, provider as never);
+  });
+
+  async function seedOneCluster() {
+    await kv.set("mem:graph:nodes", "node_a", makeConceptNode("concept_a"));
+    await kv.set("mem:graph:nodes", "node_b", makeConceptNode("concept_b"));
+    await kv.set("mem:graph:edges", "edge_1", makeEdge("concept_a", "concept_b"));
+    await kv.set("mem:semantic", "sem_1", makeSemantic("fact about concept_a"));
+    await kv.set("mem:semantic", "sem_2", makeSemantic("fact about concept_b"));
+    await kv.set("mem:semantic", "sem_3", makeSemantic("concept_a and concept_b together"));
+  }
+
+  it("normal run does not report budget exhaustion", async () => {
+    await seedOneCluster();
+    const result = (await sdk.trigger("mem::reflect", {})) as {
+      success: boolean;
+      budgetExhausted: boolean;
+    };
+    expect(result.success).toBe(true);
+    expect(result.budgetExhausted).toBe(false);
+    expect(provider.summarize).toHaveBeenCalled();
+  });
+
+  it("exhausted budget returns partial success and skips remaining LLM calls", async () => {
+    await seedOneCluster();
+    // First Date.now() in mem::reflect captures the budget start; force every
+    // later reading past the 600s default so the cluster loop bails before any
+    // provider.summarize call.
+    const t0 = Date.now();
+    const nowSpy = vi.spyOn(Date, "now");
+    nowSpy.mockReturnValueOnce(t0);
+    nowSpy.mockReturnValue(t0 + 10_000_000);
+
+    const result = (await sdk.trigger("mem::reflect", {})) as {
+      success: boolean;
+      budgetExhausted: boolean;
+      newInsights: number;
+    };
+    nowSpy.mockRestore();
+
+    expect(result.success).toBe(true);
+    expect(result.budgetExhausted).toBe(true);
+    expect(result.newInsights).toBe(0);
+    expect(provider.summarize).not.toHaveBeenCalled();
+  });
+});

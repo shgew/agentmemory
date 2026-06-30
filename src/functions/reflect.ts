@@ -181,7 +181,7 @@ function buildGraphClusters(
 
   const visited = new Set<string>();
   const clusters: string[][] = [];
-  const conceptNodeIds = new Set(conceptNodes.map((n) => n.id));
+  const conceptNodeById = new Map(conceptNodes.map((n) => [n.id, n]));
 
   for (const seed of sorted) {
     if (visited.has(seed.id) || clusters.length >= maxClusters) break;
@@ -198,8 +198,8 @@ function buildGraphClusters(
         if (seen.has(current)) continue;
         seen.add(current);
 
-        if (conceptNodeIds.has(current)) {
-          const node = conceptNodes.find((n) => n.id === current);
+        if (conceptNodeById.has(current)) {
+          const node = conceptNodeById.get(current);
           if (node) cluster.push(node.name);
           visited.add(current);
         }
@@ -216,6 +216,17 @@ function buildGraphClusters(
   }
 
   return clusters;
+}
+
+// Wall-clock budget for one mem::reflect run. Must stay below the iii invocation
+// timeout (900s) with headroom for one in-flight summarize call, so reflect returns
+// partial progress (success:true) instead of being hard-killed mid-cluster.
+const REFLECT_TIMEOUT_MS_DEFAULT = 600_000;
+function readReflectTimeoutMs(): number {
+  const raw = process.env.AGENTMEMORY_REFLECT_TIMEOUT_MS;
+  if (!raw) return REFLECT_TIMEOUT_MS_DEFAULT;
+  const n = parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : REFLECT_TIMEOUT_MS_DEFAULT;
 }
 
 function buildJaccardClusters(
@@ -285,6 +296,8 @@ export function registerReflectFunctions(
       const maxClusters = Math.min(data?.maxClusters ?? 10, 20);
       const maxInsightsPerCluster = 5;
       const maxTotal = 50;
+      const reflectStart = Date.now();
+      const reflectBudgetMs = readReflectTimeoutMs();
 
       const [graphNodes, graphEdges, semanticMemories, lessons, crystals] =
         await Promise.all([
@@ -322,6 +335,7 @@ export function registerReflectFunctions(
       let clustersAttempted = 0;
       let clustersFailed = 0;
       let clustersFrozen = 0;
+      let budgetExhausted = false;
       const activeInsights: Insight[] = (
         await kv.list<Insight>(KV.insights)
       ).filter((i) => !i.deleted);
@@ -347,6 +361,12 @@ export function registerReflectFunctions(
 
       for (const conceptNames of conceptClusters) {
         if (totalInsights >= maxTotal) break;
+        // Stop before the iii invocation timeout kills us mid-cluster; return
+        // partial progress so the pipeline can advance the 24h reflect watermark.
+        if (Date.now() - reflectStart >= reflectBudgetMs) {
+          budgetExhausted = true;
+          break;
+        }
 
         const conceptSet = new Set(conceptNames.map((c) => c.toLowerCase()));
 
@@ -512,6 +532,7 @@ export function registerReflectFunctions(
           clustersFrozen,
           clustersSkipped,
           usedFallback,
+          budgetExhausted,
         });
       } catch {}
 
@@ -523,6 +544,7 @@ export function registerReflectFunctions(
         clustersFrozen,
         clustersSkipped,
         usedFallback,
+        budgetExhausted,
       };
     },
   );
