@@ -72,6 +72,34 @@ describe("fetchWithTimeout", () => {
     expect(p).toBeInstanceOf(Promise);
     return p;
   });
+
+  it("aborts a hung response BODY read, not just a hung fetch (headers received, body stalls)", async () => {
+    // Regression: the timeout must cover the response body read, not just
+    // the headers. fetch() resolves when headers arrive; a backend that then
+    // stalls the body stream would otherwise leave response.json()/text()
+    // unbounded because the abort timer was cleared on header receipt.
+    vi.restoreAllMocks();
+    vi.spyOn(globalThis, "fetch").mockImplementation(((_url: string, init?: RequestInit) => {
+      const signal = init?.signal;
+      const stream = new ReadableStream({
+        start(controller) {
+          const abort = () =>
+            controller.error(new DOMException("Aborted", "AbortError"));
+          if (signal?.aborted) return abort();
+          signal?.addEventListener("abort", abort);
+        },
+      });
+      return Promise.resolve(
+        new Response(stream, {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    }) as typeof fetch);
+
+    const res = await fetchWithTimeout("https://example.com", {}, 50);
+    await expect(res.json()).rejects.toThrow();
+  }, 2000);
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -344,3 +372,51 @@ describe("OpenAIProvider thinking-model fallback (#627)", () => {
   });
 });
 
+
+
+// ─────────────────────────────────────────────────────────────
+// Body-stall regression: headers arrive, then the body stream
+// stalls. Before the fix the abort timer was cleared on header
+// receipt, so provider response.json()/text() reads hung forever.
+// ─────────────────────────────────────────────────────────────
+function headersThenHangingBody(_url: string, init?: RequestInit): Promise<Response> {
+  const signal = init?.signal;
+  const stream = new ReadableStream({
+    start(controller) {
+      const abort = () =>
+        controller.error(new DOMException("Aborted", "AbortError"));
+      if (signal?.aborted) return abort();
+      signal?.addEventListener("abort", abort);
+    },
+  });
+  return Promise.resolve(
+    new Response(stream, {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  );
+}
+
+describe("Provider body-stall regression (headers received, body stalls)", () => {
+  beforeEach(() => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      headersThenHangingBody as typeof fetch,
+    );
+    process.env["AGENTMEMORY_LLM_TIMEOUT_MS"] = "50";
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    delete process.env["AGENTMEMORY_LLM_TIMEOUT_MS"];
+    delete process.env["OPENAI_TIMEOUT_MS"];
+  });
+
+  it("OpenAIProvider.compress() aborts when the response body stalls", async () => {
+    const provider = new OpenAIProvider("test-key", "gpt-4o-mini", 1024);
+    await expect(provider.compress("system", "user")).rejects.toThrow();
+  }, 2000);
+
+  it("OpenAIEmbeddingProvider.embedBatch() aborts when the response body stalls", async () => {
+    const provider = new OpenAIEmbeddingProvider("test-key");
+    await expect(provider.embedBatch(["hello"])).rejects.toThrow();
+  }, 2000);
+});
