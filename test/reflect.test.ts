@@ -4,8 +4,12 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { registerReflectFunctions } from "../src/functions/reflect.js";
-import type { Insight, GraphNode, GraphEdge, SemanticMemory, Lesson, Crystal } from "../src/types.js";
+import {
+  readMaxSingleCallMs,
+  readReflectTimeoutMs,
+  registerReflectFunctions,
+} from "../src/functions/reflect.js";
+import type { Insight, GraphNode, GraphEdge, SemanticMemory, Lesson } from "../src/types.js";
 import { fingerprintId } from "../src/state/schema.js";
 
 function mockKV() {
@@ -101,16 +105,13 @@ function makeLesson(content: string, tags: string[]): Lesson {
   };
 }
 
-function makeCrystal(narrative: string, lessons: string[]): Crystal {
-  return {
-    id: `crys_${narrative.slice(0, 8)}`,
-    narrative,
-    keyOutcomes: [],
-    filesAffected: [],
-    lessons,
-    sourceActionIds: [],
-    createdAt: "2026-04-01T00:00:00Z",
-  };
+type ReflectCursorState = { processedFps: string[]; updatedAt: string };
+
+function reflectCursorFp(concepts: string[], project?: string): string {
+  return fingerprintId(
+    "reflectcursor",
+    `${project ?? ""}\n${concepts.map((c) => c.toLowerCase()).slice().sort().join(",")}`,
+  );
 }
 
 const XML_RESPONSE = `<insights>
@@ -788,6 +789,85 @@ describe("Reflect budget (AGENTMEMORY_REFLECT_TIMEOUT_MS)", () => {
     await kv.set("mem:semantic", "sem_3", makeSemantic("concept_a and concept_b together"));
   }
 
+  async function seedTwoProcessableClusters() {
+    await kv.set("mem:graph:nodes", "node_alpha", makeConceptNode("alpha"));
+    await kv.set("mem:graph:nodes", "node_beta", makeConceptNode("beta"));
+    await kv.set("mem:graph:nodes", "node_alphaextra", makeConceptNode("alphaextra"));
+    await kv.set("mem:graph:edges", "edge_ab", makeEdge("alpha", "beta"));
+    await kv.set("mem:graph:edges", "edge_ae", makeEdge("alpha", "alphaextra"));
+    await kv.set("mem:semantic", "sem_alpha_1", makeSemantic("alpha fact one", "sem_alpha_1"));
+    await kv.set("mem:semantic", "sem_beta_1", makeSemantic("beta fact two", "sem_beta_1"));
+    await kv.set("mem:semantic", "sem_alpha_beta", makeSemantic("alpha beta fact three", "sem_alpha_beta"));
+
+    await kv.set("mem:graph:nodes", "node_gamma", makeConceptNode("gamma"));
+    await kv.set("mem:graph:nodes", "node_delta", makeConceptNode("delta"));
+    await kv.set("mem:graph:nodes", "node_gammaextra", makeConceptNode("gammaextra"));
+    await kv.set("mem:graph:edges", "edge_gd", makeEdge("gamma", "delta"));
+    await kv.set("mem:graph:edges", "edge_ge", makeEdge("gamma", "gammaextra"));
+    await kv.set("mem:semantic", "sem_gamma_1", makeSemantic("gamma fact one", "sem_gamma_1"));
+    await kv.set("mem:semantic", "sem_delta_1", makeSemantic("delta fact two", "sem_delta_1"));
+    await kv.set("mem:semantic", "sem_gamma_delta", makeSemantic("gamma delta fact three", "sem_gamma_delta"));
+  }
+
+  async function seedFactsOnlyAndLessonCluster() {
+    await kv.set("mem:graph:nodes", "node_factsonly", makeConceptNode("factsonly"));
+    await kv.set("mem:graph:nodes", "node_evidence", makeConceptNode("evidence"));
+    await kv.set("mem:graph:nodes", "node_archive", makeConceptNode("archive"));
+    await kv.set("mem:graph:edges", "edge_fe", makeEdge("factsonly", "evidence"));
+    await kv.set("mem:graph:edges", "edge_fa", makeEdge("factsonly", "archive"));
+    await kv.set("mem:semantic", "sem_factsonly_1", makeSemantic("factsonly evidence one", "sem_factsonly_1"));
+    await kv.set("mem:semantic", "sem_factsonly_2", makeSemantic("factsonly evidence two", "sem_factsonly_2"));
+    await kv.set("mem:semantic", "sem_evidence_1", makeSemantic("evidence factsonly three", "sem_evidence_1"));
+
+    await kv.set("mem:graph:nodes", "node_policy", makeConceptNode("policy"));
+    await kv.set("mem:graph:nodes", "node_review", makeConceptNode("review"));
+    await kv.set("mem:graph:nodes", "node_policyextra", makeConceptNode("policyextra"));
+    await kv.set("mem:graph:edges", "edge_pr", makeEdge("policy", "review"));
+    await kv.set("mem:graph:edges", "edge_pe", makeEdge("policy", "policyextra"));
+    await kv.set("mem:semantic", "sem_policy_1", makeSemantic("policy review one", "sem_policy_1"));
+    await kv.set("mem:semantic", "sem_review_1", makeSemantic("review policy two", "sem_review_1"));
+    await kv.set("mem:semantic", "sem_policy_review", makeSemantic("policy review three", "sem_policy_review"));
+    await kv.set("mem:lessons", "lsn_policy", makeLesson("Policy review catches drift", ["policy"]));
+  }
+
+  it("keeps the implicit reflect budget under the iii invocation cap", () => {
+    try {
+      vi.stubEnv("AGENTMEMORY_REFLECT_TIMEOUT_MS", "");
+      vi.stubEnv("OPENAI_TIMEOUT_MS", "");
+      for (const llmTimeout of ["60000", "180000", "600000"]) {
+        vi.stubEnv("AGENTMEMORY_LLM_TIMEOUT_MS", llmTimeout);
+
+        expect(readReflectTimeoutMs() + readMaxSingleCallMs() + 60_000).toBeLessThanOrEqual(900_000);
+      }
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("clamps an explicit reflect budget above the safe ceiling", () => {
+    try {
+      vi.stubEnv("AGENTMEMORY_LLM_TIMEOUT_MS", "600000");
+      vi.stubEnv("AGENTMEMORY_REFLECT_TIMEOUT_MS", "600000");
+      vi.stubEnv("OPENAI_TIMEOUT_MS", "");
+
+      expect(readReflectTimeoutMs()).toBe(240_000);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("uses the computed default budget when no timeout env vars are set", () => {
+    try {
+      vi.stubEnv("AGENTMEMORY_REFLECT_TIMEOUT_MS", "");
+      vi.stubEnv("AGENTMEMORY_LLM_TIMEOUT_MS", "");
+      vi.stubEnv("OPENAI_TIMEOUT_MS", "");
+
+      expect(readReflectTimeoutMs()).toBe(780_000);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("normal run does not report budget exhaustion", async () => {
     await seedOneCluster();
     const result = (await sdk.trigger("mem::reflect", {})) as {
@@ -801,9 +881,6 @@ describe("Reflect budget (AGENTMEMORY_REFLECT_TIMEOUT_MS)", () => {
 
   it("exhausted budget returns partial success and skips remaining LLM calls", async () => {
     await seedOneCluster();
-    // First Date.now() in mem::reflect captures the budget start; force every
-    // later reading past the 600s default so the cluster loop bails before any
-    // provider.summarize call.
     const t0 = Date.now();
     const nowSpy = vi.spyOn(Date, "now");
     nowSpy.mockReturnValueOnce(t0);
@@ -820,5 +897,84 @@ describe("Reflect budget (AGENTMEMORY_REFLECT_TIMEOUT_MS)", () => {
     expect(result.budgetExhausted).toBe(true);
     expect(result.newInsights).toBe(0);
     expect(provider.summarize).not.toHaveBeenCalled();
+  });
+
+  it("resumes from the cluster cursor and resets it after a full pass", async () => {
+    await seedTwoProcessableClusters();
+    const nowSpy = vi.spyOn(Date, "now");
+    let now = 1_000;
+    nowSpy.mockImplementation(() => now);
+    provider.summarize.mockImplementation(async () => {
+      now += 2;
+      return XML_RESPONSE;
+    });
+
+    try {
+      vi.stubEnv("AGENTMEMORY_REFLECT_TIMEOUT_MS", "1");
+      vi.stubEnv("OPENAI_TIMEOUT_MS", "");
+
+      const run1 = (await sdk.trigger("mem::reflect", {})) as {
+        fullPassComplete: boolean;
+        budgetExhausted: boolean;
+      };
+      const cursorAfterRun1 = await kv.get<ReflectCursorState>("mem:config", "reflect:cursor:global");
+
+      expect(run1.fullPassComplete).toBe(false);
+      expect(run1.budgetExhausted).toBe(true);
+      expect(cursorAfterRun1?.processedFps).toEqual([reflectCursorFp(["alpha", "beta", "alphaextra"])]);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+
+      now = 2_000;
+      const run2 = (await sdk.trigger("mem::reflect", {})) as {
+        fullPassComplete: boolean;
+        budgetExhausted: boolean;
+      };
+      const cursorAfterRun2 = await kv.get<ReflectCursorState>("mem:config", "reflect:cursor:global");
+      const secondPrompt = String(provider.summarize.mock.calls[1]?.[1] ?? "");
+
+      expect(run2.fullPassComplete).toBe(true);
+      expect(run2.budgetExhausted).toBe(false);
+      expect(secondPrompt).toContain("gamma");
+      expect(secondPrompt).not.toContain("alpha");
+      expect(cursorAfterRun2?.processedFps).toEqual([]);
+      expect(provider.summarize).toHaveBeenCalledTimes(2);
+    } finally {
+      nowSpy.mockRestore();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("does not reprocess facts-only clusters within a cursor pass", async () => {
+    await seedFactsOnlyAndLessonCluster();
+    const nowSpy = vi.spyOn(Date, "now");
+    let now = 1_000;
+    nowSpy.mockImplementation(() => now);
+    provider.summarize.mockImplementation(async () => {
+      now += 2;
+      return XML_RESPONSE;
+    });
+
+    try {
+      vi.stubEnv("AGENTMEMORY_REFLECT_TIMEOUT_MS", "1");
+      vi.stubEnv("OPENAI_TIMEOUT_MS", "");
+
+      const run1 = (await sdk.trigger("mem::reflect", {})) as { fullPassComplete: boolean };
+      const cursorAfterRun1 = await kv.get<ReflectCursorState>("mem:config", "reflect:cursor:global");
+
+      expect(run1.fullPassComplete).toBe(false);
+      expect(cursorAfterRun1?.processedFps).toContain(reflectCursorFp(["factsonly", "evidence", "archive"]));
+
+      now = 2_000;
+      const run2 = (await sdk.trigger("mem::reflect", {})) as { fullPassComplete: boolean };
+      const secondPrompt = String(provider.summarize.mock.calls[1]?.[1] ?? "");
+
+      expect(run2.fullPassComplete).toBe(true);
+      expect(secondPrompt).toContain("policy");
+      expect(secondPrompt).not.toContain("factsonly");
+      expect(provider.summarize).toHaveBeenCalledTimes(2);
+    } finally {
+      nowSpy.mockRestore();
+      vi.unstubAllEnvs();
+    }
   });
 });

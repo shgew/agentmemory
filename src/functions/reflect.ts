@@ -1,6 +1,7 @@
 import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId, jaccardSimilarity } from "../state/schema.js";
+import { logger } from "../logger.js";
 import type {
   Insight,
   GraphNode,
@@ -218,15 +219,38 @@ function buildGraphClusters(
   return clusters;
 }
 
-// Wall-clock budget for one mem::reflect run. Must stay below the iii invocation
-// timeout (900s) with headroom for one in-flight summarize call, so reflect returns
-// partial progress (success:true) instead of being hard-killed mid-cluster.
+const III_INVOCATION_CAP_MS = 900_000;
+const REFLECT_BUDGET_MARGIN_MS = 60_000;
 const REFLECT_TIMEOUT_MS_DEFAULT = 600_000;
-function readReflectTimeoutMs(): number {
+
+export function readMaxSingleCallMs(): number {
+  for (const key of ["OPENAI_TIMEOUT_MS", "AGENTMEMORY_LLM_TIMEOUT_MS"]) {
+    const raw = process.env[key];
+    if (raw) {
+      const n = parseInt(raw, 10);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+  }
+  return 60_000;
+}
+
+export function readReflectTimeoutMs(): number {
+  const maxSingleCall = readMaxSingleCallMs();
+  const ceiling = Math.max(
+    60_000,
+    III_INVOCATION_CAP_MS - maxSingleCall - REFLECT_BUDGET_MARGIN_MS,
+  );
   const raw = process.env.AGENTMEMORY_REFLECT_TIMEOUT_MS;
-  if (!raw) return REFLECT_TIMEOUT_MS_DEFAULT;
+  if (!raw) return ceiling;
   const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : REFLECT_TIMEOUT_MS_DEFAULT;
+  const configured = Number.isFinite(n) && n > 0 ? n : REFLECT_TIMEOUT_MS_DEFAULT;
+  if (configured > ceiling) {
+    logger.warn(
+      "AGENTMEMORY_REFLECT_TIMEOUT_MS exceeds the safe ceiling under the iii invocation cap; clamping",
+      { configured, ceiling, maxSingleCall, cap: III_INVOCATION_CAP_MS, margin: REFLECT_BUDGET_MARGIN_MS },
+    );
+  }
+  return Math.min(configured, ceiling);
 }
 
 function buildJaccardClusters(
@@ -298,6 +322,16 @@ export function registerReflectFunctions(
       const maxTotal = 50;
       const reflectStart = Date.now();
       const reflectBudgetMs = readReflectTimeoutMs();
+      const cursorKey = `reflect:cursor:${data?.project || "global"}`;
+      const cursorState = await kv
+        .get<{ processedFps: string[] }>(KV.config, cursorKey)
+        .catch(() => null);
+      const processedFps = new Set<string>(cursorState?.processedFps ?? []);
+      const clusterIdentityFp = (conceptNames: string[]): string =>
+        fingerprintId(
+          "reflectcursor",
+          `${data?.project ?? ""}\n${conceptNames.map((c) => c.toLowerCase()).slice().sort().join(",")}`,
+        );
 
       const [graphNodes, graphEdges, semanticMemories, lessons, crystals] =
         await Promise.all([
@@ -361,12 +395,13 @@ export function registerReflectFunctions(
 
       for (const conceptNames of conceptClusters) {
         if (totalInsights >= maxTotal) break;
-        // Stop before the iii invocation timeout kills us mid-cluster; return
-        // partial progress so the pipeline can advance the 24h reflect watermark.
+        const identityFp = clusterIdentityFp(conceptNames);
+        if (processedFps.has(identityFp)) continue;
         if (Date.now() - reflectStart >= reflectBudgetMs) {
           budgetExhausted = true;
           break;
         }
+        processedFps.add(identityFp);
 
         const conceptSet = new Set(conceptNames.map((c) => c.toLowerCase()));
 
@@ -521,6 +556,15 @@ export function registerReflectFunctions(
           continue;
         }
       }
+      const fullPassComplete = conceptClusters.every((cn) =>
+        processedFps.has(clusterIdentityFp(cn)),
+      );
+      await kv
+        .set(KV.config, cursorKey, {
+          processedFps: fullPassComplete ? [] : [...processedFps],
+          updatedAt: new Date().toISOString(),
+        })
+        .catch(() => {});
       const reflectFailed =
         clustersAttempted > 0 && clustersFailed === clustersAttempted;
 
@@ -533,6 +577,7 @@ export function registerReflectFunctions(
           clustersSkipped,
           usedFallback,
           budgetExhausted,
+          fullPassComplete,
         });
       } catch {}
 
@@ -545,6 +590,7 @@ export function registerReflectFunctions(
         clustersSkipped,
         usedFallback,
         budgetExhausted,
+        fullPassComplete,
       };
     },
   );
