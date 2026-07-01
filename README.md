@@ -1478,21 +1478,25 @@ Create `~/.agentmemory/.env`:
                                           # driven path (session.stopped pipeline).
 
 # Reflect (insight-synthesis) wall-clock budget
-# AGENTMEMORY_REFLECT_TIMEOUT_MS=600000   # Default: 600 000 ms (10 min). Caps one
-                                          # mem::reflect run. reflect walks concept
-                                          # clusters (highest-degree first), each issuing
-                                          # one serial LLM call; on a large knowledge
-                                          # graph the full pass can exceed the iii
-                                          # invocation timeout (900 000 ms) and be
-                                          # hard-killed, leaving the 24h reflect watermark
-                                          # unadvanced so reflect re-runs and re-times-out
-                                          # every consolidation cycle. With this budget
-                                          # reflect stops starting new clusters once it is
-                                          # hit and returns partial progress (success +
-                                          # budgetExhausted:true), advancing the watermark
-                                          # so the next run resumes the unprocessed
-                                          # clusters. Keep below the iii invocation
-                                          # timeout, with headroom for one in-flight call.
+# AGENTMEMORY_REFLECT_TIMEOUT_MS=         # Optional. Ceiling on one mem::reflect run.
+                                          # reflect walks concept clusters, one serial LLM
+                                          # call each; the between-cluster budget check
+                                          # cannot interrupt an in-flight call, so the
+                                          # effective budget is computed and clamped to stay
+                                          # under the iii invocation timeout (900 000 ms):
+                                          # min(configured, 900 000 - maxSingleCall - 60 000
+                                          # margin), where maxSingleCall is the per-call LLM
+                                          # timeout (OPENAI_TIMEOUT_MS, else
+                                          # AGENTMEMORY_LLM_TIMEOUT_MS, else 60 000). Unset
+                                          # uses that ceiling; an explicit value above it is
+                                          # clamped (with a warning) so a raised LLM timeout
+                                          # can never push one call past the cap and hard-kill
+                                          # the run. A per-project cluster cursor lets a
+                                          # budget-exhausted run resume the remaining clusters
+                                          # next cycle instead of restarting, and the 24h
+                                          # reflect watermark advances only after a full pass,
+                                          # so partial runs re-run on the normal cadence and
+                                          # drain the backlog.
 
 # Graph-extract chunking
 # GRAPH_CHUNK_SIZE=150                    # Default: 150. When mem::graph-extract
