@@ -16,7 +16,39 @@ function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
   return {
     get: async <T>(scope: string, key: string): Promise<T | null> => {
-      return (store.get(scope)?.get(key) as T) ?? null;
+      const explicit = store.get(scope)?.get(key);
+      if (explicit !== undefined) return explicit as T;
+      // Mirror production: reflect reads the graph via readGraphSnapshot
+      // (a kv.get on mem:graph:snapshot), which graph-extract maintains as a
+      // top-degree view of the graph scopes. Tests seed mem:graph:nodes /
+      // mem:graph:edges, so synthesize that snapshot on read instead of
+      // forcing every test to seed it explicitly.
+      if (scope === "mem:graph:snapshot" && key === "current") {
+        const nodes = Array.from(
+          store.get("mem:graph:nodes")?.values() ?? [],
+        ) as GraphNode[];
+        const edges = Array.from(
+          store.get("mem:graph:edges")?.values() ?? [],
+        ) as GraphEdge[];
+        if (nodes.length === 0 && edges.length === 0) return null;
+        const liveNodes = nodes.filter((n) => !n.stale);
+        const liveEdges = edges.filter((e) => !e.stale);
+        return {
+          version: 1,
+          topNodes: liveNodes,
+          topEdges: liveEdges,
+          topDegrees: {},
+          stats: {
+            totalNodes: liveNodes.length,
+            totalEdges: liveEdges.length,
+            nodesByType: {},
+            edgesByType: {},
+          },
+          updatedAt: "2026-04-01T00:00:00Z",
+          dirty: false,
+        } as T;
+      }
+      return null;
     },
     set: async <T>(scope: string, key: string, data: T): Promise<T> => {
       if (!store.has(scope)) store.set(scope, new Map());
