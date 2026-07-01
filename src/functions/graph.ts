@@ -6,6 +6,7 @@ import type {
   GraphSnapshot,
   CompressedObservation,
   MemoryProvider,
+  GraphTombstone,
 } from "../types.js";
 import { GRAPH_NODE_TYPES, GRAPH_EDGE_TYPES } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
@@ -223,16 +224,35 @@ function snapshotSubgraph(snap: GraphSnapshot): {
 // future extracts rebuild incrementally.
 const REBUILD_SAFE_NODE_CEILING = 25000;
 
-function nameIndexKey(type: string, name: string): string {
+export function nameIndexKey(type: string, name: string): string {
   return `${type}|${name}`;
 }
 
-function edgeIndexKey(
+export function edgeIndexKey(
   sourceNodeId: string,
   targetNodeId: string,
   type: string,
 ): string {
   return `${sourceNodeId}|${targetNodeId}|${type}`;
+}
+
+// Queue a doomed row for physical deletion by mem::graph-vacuum. Keyed by the
+// doomed id so re-recording is idempotent. Callers own any logical bookkeeping
+// (stats/degree/topN) BEFORE recording; the vacuum is a pure physical delete.
+export async function recordGraphTombstone(
+  kv: StateKV,
+  entry: {
+    id: string;
+    kind: "node" | "edge";
+    reason: "cascade" | "orphan" | "retention";
+    indexKey: string;
+  },
+): Promise<void> {
+  const tombstone: GraphTombstone = {
+    ...entry,
+    tombstonedAt: new Date().toISOString(),
+  };
+  await kv.set(KV.graphTombstones, entry.id, tombstone);
 }
 
 // Mutates `snap` to apply a +1 (or -1) degree delta for nodeId,
@@ -243,7 +263,7 @@ function edgeIndexKey(
 //     topNodes (promote, evict tail if topNodes is full)
 //   - node IS in topNodes and its position needs resorting (re-sort
 //     topNodes in place)
-async function applyDegreeDelta(
+export async function applyDegreeDelta(
   kv: StateKV,
   snap: GraphSnapshot,
   nodeId: string,
@@ -288,7 +308,27 @@ async function applyDegreeDelta(
     const node = await kv.get<GraphNode>(KV.graphNodes, nodeId);
     if (node && !node.stale) {
       const evicted = snap.topNodes.pop();
-      if (evicted) delete snap.topDegrees[evicted.id];
+      if (evicted) {
+        delete snap.topDegrees[evicted.id];
+        if (process.env.AGENTMEMORY_GRAPH_RETENTION_CAP === "true") {
+          // Opt-in hard cap (default off): the evicted node just fell out of
+          // the snapshot and is now invisible to every reader, so queue it for
+          // physical deletion rather than leaving it as unbounded archive
+          // weight. Its edges linger as reader-invisible orphans, the accepted
+          // cost of the aggressive cap.
+          await recordGraphTombstone(kv, {
+            id: evicted.id,
+            kind: "node",
+            reason: "retention",
+            indexKey: nameIndexKey(evicted.type, evicted.name),
+          });
+          snap.stats.totalNodes = Math.max(0, snap.stats.totalNodes - 1);
+          snap.stats.nodesByType[evicted.type] = Math.max(
+            0,
+            (snap.stats.nodesByType[evicted.type] ?? 0) - 1,
+          );
+        }
+      }
       snap.topNodes.push(node);
       snap.topDegrees[node.id] = next;
       snap.topNodes.sort(
@@ -567,6 +607,14 @@ async function mergeExtractIntoSnapshot(
         typeof existing.createdAt === "string" &&
         existing.createdAt < snap.resetAt
       ) {
+        // Orphan predates the last reset: queue the legacy row for deletion
+        // (no stat decrement - it was never counted in the post-reset epoch).
+        await recordGraphTombstone(kv, {
+          id: existingId,
+          kind: "node",
+          reason: "orphan",
+          indexKey,
+        });
         existing = null;
       }
     }
@@ -604,6 +652,12 @@ async function mergeExtractIntoSnapshot(
         typeof existing.createdAt === "string" &&
         existing.createdAt < snap.resetAt
       ) {
+        await recordGraphTombstone(kv, {
+          id: existingId,
+          kind: "edge",
+          reason: "orphan",
+          indexKey: eKey,
+        });
         existing = null;
       }
     }
@@ -1149,4 +1203,100 @@ export function registerGraphFunction(
     logger.info("Graph state reset", { counts, tookMs });
     return { success: true, cleared: counts, tookMs };
   });
+
+  // Physical-delete pass for the graph pruning queue. Reads the bounded
+  // KV.graphTombstones scope (the ONLY kv.list here, and it stays a tiny
+  // frame because it is drained faster than produced) and deletes up to
+  // `budget` doomed rows from graphNodes/graphEdges plus their side-index
+  // entries. Runs under the graph:merge lock so a concurrent extract cannot
+  // resurrect a row this pass deletes. All logical bookkeeping (stats,
+  // degree, topN) already happened when the tombstone was recorded, so this
+  // pass is a pure physical delete.
+  sdk.registerFunction(
+    "mem::graph-vacuum",
+    async (data?: { budget?: number }) => {
+      const DEFAULT_BUDGET = 300;
+      const MAX_BUDGET = 5000;
+      const envRaw = process.env.AGENTMEMORY_GRAPH_VACUUM_BUDGET;
+      const envParsed = envRaw ? parseInt(envRaw, 10) : DEFAULT_BUDGET;
+      const envBudget =
+        Number.isFinite(envParsed) && envParsed > 0 ? envParsed : DEFAULT_BUDGET;
+      const budget = Math.max(1, Math.min(data?.budget ?? envBudget, MAX_BUDGET));
+
+      const started = Date.now();
+      const tombstones = await kv
+        .list<GraphTombstone>(KV.graphTombstones)
+        .catch(() => [] as GraphTombstone[]);
+      const batch = tombstones.slice(0, budget);
+      if (batch.length === 0) {
+        return {
+          success: true,
+          deletedNodes: 0,
+          deletedEdges: 0,
+          skippedIndex: 0,
+          remaining: 0,
+          tookMs: Date.now() - started,
+        };
+      }
+
+      let deletedNodes = 0;
+      let deletedEdges = 0;
+      let skippedIndex = 0;
+
+      await withKeyedLock("graph:merge", async () => {
+        for (const t of batch) {
+          if (!t || typeof t.id !== "string") continue;
+          if (t.kind === "edge") {
+            await kv.delete(KV.graphEdges, t.id);
+            // Verify-then-delete: only drop the edge-key entry if it still
+            // resolves to this doomed id. A newer extract may have recreated
+            // the same source|target|type and repointed it to a live edge.
+            if (t.indexKey) {
+              const cur = await kv.get<string>(KV.graphEdgeKey, t.indexKey);
+              if (cur === t.id) await kv.delete(KV.graphEdgeKey, t.indexKey);
+              else skippedIndex++;
+            }
+            deletedEdges++;
+          } else {
+            await kv.delete(KV.graphNodes, t.id);
+            // Degree is keyed by this dead node id, so dropping it is always
+            // safe (a re-extracted node gets a fresh id).
+            await kv.delete(KV.graphNodeDegree, t.id);
+            if (t.indexKey) {
+              const cur = await kv.get<string>(KV.graphNameIndex, t.indexKey);
+              if (cur === t.id) await kv.delete(KV.graphNameIndex, t.indexKey);
+              else skippedIndex++;
+            }
+            deletedNodes++;
+          }
+          await kv.delete(KV.graphTombstones, t.id);
+        }
+      });
+
+      const remaining = Math.max(0, tombstones.length - batch.length);
+      const tookMs = Date.now() - started;
+      await recordAudit(kv, "consolidate", "mem::graph-vacuum", [], {
+        deletedNodes,
+        deletedEdges,
+        skippedIndex,
+        remaining,
+        tookMs,
+      });
+      logger.info("Graph vacuum pass", {
+        deletedNodes,
+        deletedEdges,
+        skippedIndex,
+        remaining,
+        tookMs,
+      });
+      return {
+        success: true,
+        deletedNodes,
+        deletedEdges,
+        skippedIndex,
+        remaining,
+        tookMs,
+      };
+    },
+  );
 }

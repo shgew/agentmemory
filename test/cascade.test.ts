@@ -272,4 +272,107 @@ describe("Cascade Update Function", () => {
     expect(result.success).toBe(true);
     expect(result.total).toBe(0);
   });
+  it("scopes cascade to the snapshot and tombstones evicted rows on a large corpus", async () => {
+    const memory: Memory = {
+      id: "mem_big",
+      createdAt: "2026-03-01T00:00:00Z",
+      updatedAt: "2026-03-01T00:00:00Z",
+      type: "fact",
+      title: "Big corpus fact",
+      content: "content",
+      concepts: [],
+      files: [],
+      sessionIds: [],
+      strength: 5,
+      version: 1,
+      isLatest: false,
+      sourceObservationIds: ["obs_a"],
+    };
+    await kv.set("mem:memories", "mem_big", memory);
+
+    const supNode: GraphNode = {
+      id: "gn_x",
+      type: "concept",
+      name: "x",
+      properties: {},
+      sourceObservationIds: ["obs_a"],
+      createdAt: "2026-03-01T00:00:00Z",
+    };
+    const keepNode: GraphNode = {
+      id: "gn_y",
+      type: "concept",
+      name: "y",
+      properties: {},
+      sourceObservationIds: ["obs_z"],
+      createdAt: "2026-03-01T00:00:00Z",
+    };
+    const supEdge: GraphEdge = {
+      id: "ge_x",
+      type: "related_to",
+      sourceNodeId: "gn_x",
+      targetNodeId: "gn_y",
+      weight: 1,
+      sourceObservationIds: ["obs_a"],
+      createdAt: "2026-03-01T00:00:00Z",
+    };
+    await kv.set("mem:graph:nodes", "gn_x", supNode);
+    await kv.set("mem:graph:edges", "ge_x", supEdge);
+    await kv.set("mem:graph:node-degree", "gn_x", 1);
+    await kv.set("mem:graph:node-degree", "gn_y", 1);
+    await kv.set("mem:graph:snapshot", "current", {
+      version: 1,
+      topNodes: [supNode, keepNode],
+      topEdges: [supEdge],
+      topDegrees: { gn_x: 1, gn_y: 1 },
+      stats: {
+        totalNodes: 30000,
+        totalEdges: 120000,
+        nodesByType: { concept: 30000 },
+        edgesByType: { related_to: 120000 },
+      },
+      updatedAt: "2026-03-01T00:00:00Z",
+      dirty: false,
+    });
+
+    const result = (await sdk.trigger("mem::cascade-update", {
+      supersededMemoryId: "mem_big",
+    })) as { success: boolean; flagged: { nodes: number; edges: number } };
+
+    expect(result.success).toBe(true);
+    expect(result.flagged.nodes).toBe(1);
+    expect(result.flagged.edges).toBe(1);
+
+    // Tombstoned for physical reclaim (with the correct index keys).
+    const nodeTomb = await kv.get<{ reason: string; indexKey: string }>(
+      "mem:graph:tombstones",
+      "gn_x",
+    );
+    expect(nodeTomb?.reason).toBe("cascade");
+    expect(nodeTomb?.indexKey).toBe("concept|x");
+    const edgeTomb = await kv.get<{ reason: string; indexKey: string }>(
+      "mem:graph:tombstones",
+      "ge_x",
+    );
+    expect(edgeTomb?.reason).toBe("cascade");
+    expect(edgeTomb?.indexKey).toBe("gn_x|gn_y|related_to");
+
+    // Evicted from the snapshot + stats decremented; the unrelated node stays.
+    const snap = (await kv.get("mem:graph:snapshot", "current")) as {
+      topNodes: GraphNode[];
+      topEdges: GraphEdge[];
+      stats: { totalNodes: number; totalEdges: number };
+    };
+    expect(snap.topNodes.some((n) => n.id === "gn_x")).toBe(false);
+    expect(snap.topNodes.some((n) => n.id === "gn_y")).toBe(true);
+    expect(snap.topEdges.some((e) => e.id === "ge_x")).toBe(false);
+    expect(snap.stats.totalNodes).toBe(29999);
+    expect(snap.stats.totalEdges).toBe(119999);
+
+    // Surviving endpoint's degree decremented from the removed edge.
+    expect(await kv.get("mem:graph:node-degree", "gn_y")).toBe(0);
+    // Disk row marked stale.
+    const diskNode = (await kv.get<GraphNode>("mem:graph:nodes", "gn_x"))!;
+    expect(diskNode.stale).toBe(true);
+  });
+
 });

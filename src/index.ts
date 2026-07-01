@@ -538,7 +538,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 132 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 133 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,
@@ -598,6 +598,20 @@ async function main() {
     } catch {}
   }, 60 * 60 * 1000);
   recentSearchesSweepTimer.unref();
+
+  // Drain the graph pruning queue (mem::graph-vacuum) on a steady cadence so
+  // tombstoned nodes/edges (cascade, orphan-drop, optional retention cap) are
+  // physically deleted without an operator. Bounded per run, so a backlog
+  // drains over several passes. On-demand: POST /agentmemory/graph/vacuum.
+  const graphVacuumTimer = setInterval(async () => {
+    try {
+      await sdk.trigger({
+        function_id: "mem::graph-vacuum",
+        payload: {},
+      });
+    } catch {}
+  }, 30 * 60 * 1000);
+  graphVacuumTimer.unref();
 
   if (isConsolidationEnabled()) {
     const consolidationTimer = setInterval(async () => {

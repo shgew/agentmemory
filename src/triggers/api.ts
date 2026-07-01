@@ -1651,6 +1651,38 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/reset", http_method: "POST" },
   });
 
+  // Physical-delete pass for the graph pruning queue (tombstones from cascade,
+  // orphan-drop, and the optional retention cap). Bounded per call via
+  // `budget`; leaves the remainder queued for the next pass. On-demand
+  // counterpart to the background drain timer in src/index.ts.
+  sdk.registerFunction("api::graph-vacuum",
+    async (req: ApiRequest<{ budget?: number }>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const rawBudget = req.body?.budget;
+      const budget =
+        typeof rawBudget === "number" &&
+        Number.isFinite(rawBudget) &&
+        rawBudget > 0
+          ? Math.floor(rawBudget)
+          : undefined;
+      try {
+        const result = await sdk.trigger({
+          function_id: "mem::graph-vacuum",
+          payload: budget !== undefined ? { budget } : {},
+        });
+        return { status_code: 200, body: result };
+      } catch {
+        return graphDisabledResponse();
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-vacuum",
+    config: { api_path: "/agentmemory/graph/vacuum", http_method: "POST" },
+  });
+
   sdk.registerFunction("api::graph-extract",
     async (req: ApiRequest<{ observations: unknown[] }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);

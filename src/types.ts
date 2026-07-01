@@ -500,6 +500,23 @@ export interface GraphSnapshot {
   resetAt?: string;
 }
 
+// Graph pruning queue entry. mem::graph-vacuum physically deletes the row at
+// `id` from graphNodes/graphEdges, plus its side-index entry at `indexKey`
+// (verify-then-delete: only when the index still resolves to `id`, so a
+// re-extracted live row that repointed the index is never orphaned).
+// Recorded when a row leaves the live set: an extract drops a pre-resetAt
+// orphan, cascade evicts a superseded row, or the opt-in retention cap evicts
+// a low-degree node from the snapshot.
+export interface GraphTombstone {
+  id: string;
+  kind: "node" | "edge";
+  reason: "cascade" | "orphan" | "retention";
+  // node: `${type}|${name}` (KV.graphNameIndex key)
+  // edge: `${sourceNodeId}|${targetNodeId}|${type}` (KV.graphEdgeKey key)
+  indexKey: string;
+  tombstonedAt: string;
+}
+
 export type ConsolidationTier =
   | "working"
   | "episodic"

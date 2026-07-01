@@ -25,6 +25,7 @@ agentmemory is a persistent memory system for AI coding agents, built on iii-eng
 1. `src/triggers/api.ts` — endpoint registration
 2. `src/index.ts` — endpoint count in the log line
 3. `README.md` — endpoint count (search for "REST endpoints" and "endpoints on port")
+4. `AGENTS.md` - the "Current Stats" REST endpoint count (enforced by `test/consistency.test.ts`)
 
 **When bumping version, you MUST update ALL of the following:**
 1. `package.json` — version field
@@ -117,7 +118,7 @@ Hook scripts in `src/hooks/` are standalone Node.js scripts (no iii-sdk import).
 ## Current Stats (v0.9.16)
 
 - 53 MCP tools (8 visible by default, `AGENTMEMORY_TOOLS=all` for all)
-- 132 REST endpoints
+- 133 REST endpoints
 - 6 MCP resources, 3 MCP prompts
 - 12 hooks, 16 skills
 - 50+ iii functions

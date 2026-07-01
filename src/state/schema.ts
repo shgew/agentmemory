@@ -72,6 +72,11 @@ export const KV = {
   // #771: tracks the most recent smart-search call per session, used by
   // the followup-rate diagnostic. Key = sessionId. TTL-swept hourly.
   recentSearches: "mem:recent-searches",
+  // Graph pruning queue: doomed node/edge ids awaiting physical deletion by
+  // mem::graph-vacuum. Keyed by the doomed id so recording is idempotent.
+  // Bounded (drained faster than produced) so its kv.list stays a tiny frame,
+  // unlike the graphNodes/graphEdges scopes it reclaims.
+  graphTombstones: "mem:graph:tombstones",
 } as const;
 
 export const STREAM = {
