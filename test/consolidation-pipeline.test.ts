@@ -266,9 +266,9 @@ describe("Consolidation Pipeline", () => {
     expect(reflectFn).not.toHaveBeenCalled();
   });
 
-  it("reflect gate runs reflect after 24h and updates the watermark", async () => {
+  it("reflect gate runs reflect after 24h and updates the watermark after a full pass", async () => {
     const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
-    const reflectFn = vi.fn().mockResolvedValue({ success: true, newInsights: 1 });
+    const reflectFn = vi.fn().mockResolvedValue({ success: true, fullPassComplete: true, newInsights: 1 });
     sdk.registerFunction("mem::reflect", reflectFn);
     registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
     await kv.set("mem:config", "reflect:last-success:global", {
@@ -283,6 +283,36 @@ describe("Consolidation Pipeline", () => {
     expect(reflectFn).toHaveBeenCalled();
     const wm = await kv.get<{ at: string }>("mem:config", "reflect:last-success:global");
     expect(new Date(wm!.at).getTime()).toBeGreaterThan(Date.now() - 5000);
+  });
+
+  it("reflect gate does not write the watermark after a partial reflect pass", async () => {
+    const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
+    const reflectFn = vi.fn().mockResolvedValue({ success: true, fullPassComplete: false, newInsights: 0 });
+    sdk.registerFunction("mem::reflect", reflectFn);
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "all" });
+
+    expect(reflectFn).toHaveBeenCalled();
+    const wm = await kv.get("mem:config", "reflect:last-success:global");
+    expect(wm).toBeNull();
+  });
+
+  it("continues procedural and decay tiers after a partial reflect pass", async () => {
+    const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
+    sdk.registerFunction("mem::reflect", vi.fn().mockResolvedValue({
+      success: true,
+      fullPassComplete: false,
+      budgetExhausted: true,
+    }));
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", { tier: "all" })) as {
+      results: Record<string, unknown>;
+    };
+
+    expect(result.results.procedural).toBeDefined();
+    expect(result.results.decay).toBeDefined();
   });
 
   it("explicit tier=reflect bypasses the gate", async () => {

@@ -160,10 +160,11 @@ export function registerConsolidationPipelineFunction(
               project: data?.project,
             } });
             results.reflect = reflectResult;
-            if (
-              (reflectResult as { success?: boolean } | null | undefined)
-                ?.success === true
-            ) {
+            const rr = reflectResult as
+              | { success?: boolean; fullPassComplete?: boolean }
+              | null
+              | undefined;
+            if (rr?.success === true && rr?.fullPassComplete === true) {
               await kv.set(KV.config, reflectWatermarkKey, {
                 at: new Date().toISOString(),
               });
