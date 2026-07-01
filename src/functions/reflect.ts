@@ -13,6 +13,7 @@ import type {
 } from "../types.js";
 import { recordAudit } from "./audit.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
+import { readGraphSnapshot } from "../state/graph-snapshot.js";
 
 const REFLECT_CLUSTER_FP_VERSION = 1;
 
@@ -333,14 +334,17 @@ export function registerReflectFunctions(
           `${data?.project ?? ""}\n${conceptNames.map((c) => c.toLowerCase()).slice().sort().join(",")}`,
         );
 
-      const [graphNodes, graphEdges, semanticMemories, lessons, crystals] =
-        await Promise.all([
-          kv.list<GraphNode>(KV.graphNodes).catch(() => []),
-          kv.list<GraphEdge>(KV.graphEdges).catch(() => []),
-          kv.list<SemanticMemory>(KV.semantic).catch(() => []),
-          kv.list<Lesson>(KV.lessons).catch(() => []),
-          kv.list<Crystal>(KV.crystals).catch(() => []),
-        ]);
+      // #814/#825: reflect is a hot path, so read the bounded graph snapshot
+      // instead of kv.list over full graphNodes/graphEdges (stalls the worker
+      // on large corpora). Falls back to Jaccard clustering when absent.
+      const graphSnapshot = await readGraphSnapshot(kv);
+      const graphNodes = graphSnapshot?.topNodes ?? [];
+      const graphEdges = graphSnapshot?.topEdges ?? [];
+      const [semanticMemories, lessons, crystals] = await Promise.all([
+        kv.list<SemanticMemory>(KV.semantic).catch(() => []),
+        kv.list<Lesson>(KV.lessons).catch(() => []),
+        kv.list<Crystal>(KV.crystals).catch(() => []),
+      ]);
 
       let activeLessons = lessons.filter((l) => !l.deleted);
       if (data?.project) {
