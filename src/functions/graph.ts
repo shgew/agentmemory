@@ -1398,9 +1398,24 @@ export function registerGraphFunction(
             continue;
           }
           const sources = e.sourceObservationIds ?? [];
+          // Keep (skip) an edge only if it is fully relevant: a live source AND
+          // both endpoints still exist as live nodes. A dangling edge (missing
+          // endpoint) or an orphan-endpoint edge is trash even when its own obs
+          // are live, so it must fall through to be tombstoned.
           if (sources.some((s) => liveSet.has(s))) {
-            skippedLive++;
-            continue;
+            const src = await kv.get<GraphNode>(KV.graphNodes, e.sourceNodeId);
+            const srcLive =
+              !!src && (src.sourceObservationIds ?? []).some((s) => liveSet.has(s));
+            if (srcLive) {
+              const tgt = await kv.get<GraphNode>(KV.graphNodes, e.targetNodeId);
+              const tgtLive =
+                !!tgt &&
+                (tgt.sourceObservationIds ?? []).some((s) => liveSet.has(s));
+              if (tgtLive) {
+                skippedLive++;
+                continue;
+              }
+            }
           }
           await recordGraphTombstone(kv, {
             id: e.id,

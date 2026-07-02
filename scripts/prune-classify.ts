@@ -48,8 +48,13 @@ export interface PruneReport {
   keptEdges: number;
   doomedNodes: number;
   doomedEdges: number;
-  doomedBySignal: { stale: number; preReset: number; noLiveSource: number };
-  forcedKeepNodes: number;
+  nodeSignals: { stale: number; noLiveSource: number };
+  edgeSignals: {
+    stale: number;
+    noLiveSource: number;
+    dangling: number;
+    endpointNotRelevant: number;
+  };
 }
 
 export interface ClassifyInput {
@@ -68,35 +73,10 @@ export interface ClassifyResult {
 
 const DEFAULT_TOP_N = 500;
 
-interface DoomSignals {
-  doomed: boolean;
-  stale: boolean;
-  preReset: boolean;
-  noLiveSource: boolean;
-}
-
-interface DoomableRow {
-  stale?: boolean;
-  createdAt: string;
-  sourceObservationIds: string[];
-}
-
-function classifyRow(
-  row: DoomableRow,
-  liveSet: Set<string>,
-  resetAt: string | undefined,
-): DoomSignals {
-  const stale = row.stale === true;
-  const preReset = resetAt !== undefined && row.createdAt < resetAt;
-  const noLiveSource = !row.sourceObservationIds.some((id) => liveSet.has(id));
-  return {
-    doomed: stale || preReset || noLiveSource,
-    stale,
-    preReset,
-    noLiveSource,
-  };
-}
-
+// Relevance is reachability from live data: a node is relevant when it is not
+// stale and at least one of its source observation ids is still in the live set
+// (live observation ids plus live memory ids). The pre-reset timestamp is NOT a
+// delete signal, so a pre-reset row still connected to live observations is kept.
 export function classifyGraph(input: ClassifyInput): ClassifyResult {
   const { nodes, edges, liveSet } = input;
   const resetAt = input.resetAt;
@@ -105,28 +85,56 @@ export function classifyGraph(input: ClassifyInput): ClassifyResult {
   const nodeById = new Map<string, GraphNode>();
   for (const n of nodes) nodeById.set(n.id, n);
 
-  const nodeSignals = new Map<string, DoomSignals>();
-  for (const n of nodes) nodeSignals.set(n.id, classifyRow(n, liveSet, resetAt));
-
-  const edgeSignals = new Map<string, DoomSignals>();
-  const keptEdges: GraphEdge[] = [];
-  for (const e of edges) {
-    const sig = classifyRow(e, liveSet, resetAt);
-    edgeSignals.set(e.id, sig);
-    const bothEndpointsExist =
-      nodeById.has(e.sourceNodeId) && nodeById.has(e.targetNodeId);
-    if (!sig.doomed && bothEndpointsExist) keptEdges.push(e);
-  }
-
-  const keptNodeIds = new Set<string>();
+  const relevantNodeIds = new Set<string>();
+  let staleNodes = 0;
+  let noLiveSourceNodes = 0;
   for (const n of nodes) {
-    if (!nodeSignals.get(n.id)?.doomed) keptNodeIds.add(n.id);
-  }
-  for (const e of keptEdges) {
-    keptNodeIds.add(e.sourceNodeId);
-    keptNodeIds.add(e.targetNodeId);
+    if (n.stale === true) {
+      staleNodes += 1;
+      continue;
+    }
+    if (n.sourceObservationIds.some((id) => liveSet.has(id))) {
+      relevantNodeIds.add(n.id);
+    } else {
+      noLiveSourceNodes += 1;
+    }
   }
 
+  // A relevant edge is not stale, reachable from a live source, and has BOTH
+  // endpoints among the relevant nodes. This drops dangling edges (missing
+  // endpoint) and edges whose endpoint is itself an orphan, so the kept graph is
+  // referentially closed by construction (no kept edge points at a pruned node).
+  const keptEdges: GraphEdge[] = [];
+  const edgeSignals = {
+    stale: 0,
+    noLiveSource: 0,
+    dangling: 0,
+    endpointNotRelevant: 0,
+  };
+  for (const e of edges) {
+    if (e.stale === true) {
+      edgeSignals.stale += 1;
+      continue;
+    }
+    if (!e.sourceObservationIds.some((id) => liveSet.has(id))) {
+      edgeSignals.noLiveSource += 1;
+      continue;
+    }
+    if (!nodeById.has(e.sourceNodeId) || !nodeById.has(e.targetNodeId)) {
+      edgeSignals.dangling += 1;
+      continue;
+    }
+    if (
+      !relevantNodeIds.has(e.sourceNodeId) ||
+      !relevantNodeIds.has(e.targetNodeId)
+    ) {
+      edgeSignals.endpointNotRelevant += 1;
+      continue;
+    }
+    keptEdges.push(e);
+  }
+
+  const keptNodeIds = relevantNodeIds;
   const keptEdgeIds = new Set(keptEdges.map((e) => e.id));
   const manifestEdgeIds = edges
     .filter((e) => !keptEdgeIds.has(e.id))
@@ -171,23 +179,6 @@ export function classifyGraph(input: ClassifyInput): ClassifyResult {
   const edgesByType: Record<string, number> = {};
   for (const e of keptEdges) edgesByType[e.type] = (edgesByType[e.type] ?? 0) + 1;
 
-  const doomedBySignal = { stale: 0, preReset: 0, noLiveSource: 0 };
-  const tally = (sig: DoomSignals | undefined): void => {
-    if (!sig?.doomed) return;
-    if (sig.stale) doomedBySignal.stale += 1;
-    if (sig.preReset) doomedBySignal.preReset += 1;
-    if (sig.noLiveSource) doomedBySignal.noLiveSource += 1;
-  };
-  for (const n of nodes) tally(nodeSignals.get(n.id));
-  for (const e of edges) tally(edgeSignals.get(e.id));
-
-  let forcedKeepNodes = 0;
-  for (const n of nodes) {
-    if (nodeSignals.get(n.id)?.doomed && keptNodeIds.has(n.id)) {
-      forcedKeepNodes += 1;
-    }
-  }
-
   const prunedSnapshot: GraphSnapshot = {
     version: 1,
     topNodes,
@@ -211,8 +202,8 @@ export function classifyGraph(input: ClassifyInput): ClassifyResult {
     keptEdges: keptEdges.length,
     doomedNodes: manifestNodeIds.length,
     doomedEdges: manifestEdgeIds.length,
-    doomedBySignal,
-    forcedKeepNodes,
+    nodeSignals: { stale: staleNodes, noLiveSource: noLiveSourceNodes },
+    edgeSignals,
   };
 
   return {
@@ -283,9 +274,46 @@ function rowId(key: string, value: unknown): string {
   return key;
 }
 
+// The iii file-based KV persists each scope as a JSON object followed by a
+// binary integrity trailer, so a whole-file JSON.parse fails on the trailer.
+// Scan byte-wise to the end of the top-level object (JSON structural bytes are
+// single-byte ASCII, never a UTF-8 continuation byte) and parse just that.
+export function parseBinObject(buf: Buffer): Record<string, unknown> {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let started = false;
+  let end = -1;
+  for (let i = 0; i < buf.length; i += 1) {
+    const c = buf[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === 0x5c) esc = true;
+      else if (c === 0x22) inStr = false;
+      continue;
+    }
+    if (c === 0x22) inStr = true;
+    else if (c === 0x7b) {
+      depth += 1;
+      started = true;
+    } else if (c === 0x7d) {
+      depth -= 1;
+      if (started && depth === 0) {
+        end = i;
+        break;
+      }
+    }
+  }
+  if (end === -1) throw new Error("no balanced top-level JSON object");
+  return JSON.parse(buf.subarray(0, end + 1).toString("utf8")) as Record<
+    string,
+    unknown
+  >;
+}
+
 function readRows<T>(path: string): T[] {
-  const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, T>;
-  return Object.values(parsed);
+  const parsed = parseBinObject(readFileSync(path));
+  return Object.values(parsed) as T[];
 }
 
 function collectLiveIds(
@@ -296,19 +324,14 @@ function collectLiveIds(
   if (obsDir) {
     for (const file of readdirSync(obsDir)) {
       if (!file.endsWith(".bin")) continue;
-      const parsed = JSON.parse(
-        readFileSync(join(obsDir, file), "utf8"),
-      ) as Record<string, unknown>;
+      const parsed = parseBinObject(readFileSync(join(obsDir, file)));
       for (const [key, value] of Object.entries(parsed)) {
         liveSet.add(rowId(key, value));
       }
     }
   }
   if (memoriesPath) {
-    const parsed = JSON.parse(readFileSync(memoriesPath, "utf8")) as Record<
-      string,
-      unknown
-    >;
+    const parsed = parseBinObject(readFileSync(memoriesPath));
     for (const [key, value] of Object.entries(parsed)) {
       liveSet.add(rowId(key, value));
     }

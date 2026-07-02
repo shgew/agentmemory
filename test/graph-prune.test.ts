@@ -262,4 +262,70 @@ describe("mem::graph-prune-orphans", () => {
 
     expect(res.seeded).toBe(2);
   });
+
+  it("keeps a fully-relevant edge (live source and both endpoints live)", async () => {
+    const { kv, sdk } = setup();
+    await seedLiveObs(kv, "s1", "obsLive");
+    await kv.set(KV.graphNodes, "gA", node("gA", "concept", "A", ["obsLive"]));
+    await kv.set(KV.graphNodes, "gB", node("gB", "concept", "B", ["obsLive"]));
+    await kv.set(
+      KV.graphEdges,
+      "ge_rel",
+      edge("ge_rel", "gA", "gB", "related_to", ["obsLive"]),
+    );
+
+    const res = (await sdk.trigger("mem::graph-prune-orphans", {
+      edgeIds: ["ge_rel"],
+    })) as PruneResult;
+
+    expect(res.seeded).toBe(0);
+    expect(res.skippedLive).toBe(1);
+    expect(await kv.get(KV.graphTombstones, "ge_rel")).toBeNull();
+  });
+
+  it("tombstones a dangling edge even when its own observations are live", async () => {
+    const { kv, sdk } = setup();
+    await seedLiveObs(kv, "s1", "obsLive");
+    // Endpoints gA/gB are never created -> dangling; the edge obs ARE live.
+    await kv.set(
+      KV.graphEdges,
+      "ge_dangle",
+      edge("ge_dangle", "gA", "gB", "related_to", ["obsLive"]),
+    );
+
+    const res = (await sdk.trigger("mem::graph-prune-orphans", {
+      edgeIds: ["ge_dangle"],
+    })) as PruneResult;
+
+    expect(res.seeded).toBe(1);
+    expect(res.skippedLive).toBe(0);
+    expect(await kv.get(KV.graphTombstones, "ge_dangle")).toMatchObject({
+      id: "ge_dangle",
+      kind: "edge",
+      reason: "prune",
+    });
+  });
+
+  it("tombstones an edge whose endpoint node is an orphan", async () => {
+    const { kv, sdk } = setup();
+    await seedLiveObs(kv, "s1", "obsLive");
+    await kv.set(KV.graphNodes, "gA", node("gA", "concept", "A", ["obsLive"]));
+    await kv.set(
+      KV.graphNodes,
+      "gOrph",
+      node("gOrph", "concept", "Orph", ["obsGone"]),
+    );
+    await kv.set(
+      KV.graphEdges,
+      "ge_oe",
+      edge("ge_oe", "gA", "gOrph", "related_to", ["obsLive"]),
+    );
+
+    const res = (await sdk.trigger("mem::graph-prune-orphans", {
+      edgeIds: ["ge_oe"],
+    })) as PruneResult;
+
+    expect(res.seeded).toBe(1);
+    expect(await kv.get(KV.graphTombstones, "ge_oe")).not.toBeNull();
+  });
 });
