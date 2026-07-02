@@ -1235,6 +1235,7 @@ export function registerGraphFunction(
           deletedNodes: 0,
           deletedEdges: 0,
           skippedIndex: 0,
+          skippedStale: 0,
           remaining: 0,
           tookMs: Date.now() - started,
         };

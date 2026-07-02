@@ -184,11 +184,13 @@ describe("mem::graph-vacuum", () => {
       deletedNodes: number;
       deletedEdges: number;
       remaining: number;
+      skippedStale: number;
     };
     expect(res.success).toBe(true);
     expect(res.deletedNodes).toBe(0);
     expect(res.deletedEdges).toBe(0);
     expect(res.remaining).toBe(0);
+    expect(res.skippedStale).toBe(0);
   });
 
   it("skips deleting a prune node whose sourceObservationIds length changed since the tombstone", async () => {
