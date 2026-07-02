@@ -1245,10 +1245,15 @@ export function registerGraphFunction(
       let deletedEdges = 0;
       let skippedIndex = 0;
       let skippedStale = 0;
+      let prunedEdgeCount = 0;
+      let prunedNodeCount = 0;
+      const prunedEdgesByType: Record<string, number> = {};
+      const prunedNodesByType: Record<string, number> = {};
 
       await withKeyedLock("graph:merge", async () => {
         for (const t of batch) {
           if (!t || typeof t.id !== "string") continue;
+          let rowType: string | undefined;
           // Prune freshness guard: a row doomed by the offline sweep may have
           // gained a live source via a later merge. observedSourceCount is the
           // source count captured at seed time; if the live row's count has
@@ -1256,10 +1261,10 @@ export function registerGraphFunction(
           // tombstone without deleting.
           if (typeof t.observedSourceCount === "number") {
             const scope = t.kind === "edge" ? KV.graphEdges : KV.graphNodes;
-            const cur = await kv.get<{ sourceObservationIds?: string[] }>(
-              scope,
-              t.id,
-            );
+            const cur = await kv.get<{
+              sourceObservationIds?: string[];
+              type?: string;
+            }>(scope, t.id);
             if (
               cur &&
               (cur.sourceObservationIds?.length ?? 0) !== t.observedSourceCount
@@ -1268,6 +1273,7 @@ export function registerGraphFunction(
               skippedStale++;
               continue;
             }
+            rowType = cur?.type;
           }
           if (t.kind === "edge") {
             await kv.delete(KV.graphEdges, t.id);
@@ -1280,6 +1286,12 @@ export function registerGraphFunction(
               else skippedIndex++;
             }
             deletedEdges++;
+            if (t.reason === "prune") {
+              prunedEdgeCount++;
+              if (rowType)
+                prunedEdgesByType[rowType] =
+                  (prunedEdgesByType[rowType] ?? 0) + 1;
+            }
           } else {
             await kv.delete(KV.graphNodes, t.id);
             // Degree is keyed by this dead node id, so dropping it is always
@@ -1291,8 +1303,43 @@ export function registerGraphFunction(
               else skippedIndex++;
             }
             deletedNodes++;
+            if (t.reason === "prune") {
+              prunedNodeCount++;
+              if (rowType)
+                prunedNodesByType[rowType] =
+                  (prunedNodesByType[rowType] ?? 0) + 1;
+            }
           }
           await kv.delete(KV.graphTombstones, t.id);
+        }
+        // Prune tombstones carry no record-time stats bookkeeping (the seed
+        // path cannot decrement safely because the freshness guard may later
+        // skip the delete), so the counter is adjusted here at delete time,
+        // mirroring the increment mem::graph-extract applies on insert. Runs
+        // under the same graph:merge lock as extract, so no lost update.
+        if (prunedEdgeCount > 0 || prunedNodeCount > 0) {
+          const snap = await readGraphSnapshot(kv);
+          if (snap) {
+            snap.stats.totalEdges = Math.max(
+              0,
+              snap.stats.totalEdges - prunedEdgeCount,
+            );
+            snap.stats.totalNodes = Math.max(
+              0,
+              snap.stats.totalNodes - prunedNodeCount,
+            );
+            for (const [ty, n] of Object.entries(prunedEdgesByType)) {
+              const next = Math.max(0, (snap.stats.edgesByType[ty] ?? 0) - n);
+              if (next === 0) delete snap.stats.edgesByType[ty];
+              else snap.stats.edgesByType[ty] = next;
+            }
+            for (const [ty, n] of Object.entries(prunedNodesByType)) {
+              const next = Math.max(0, (snap.stats.nodesByType[ty] ?? 0) - n);
+              if (next === 0) delete snap.stats.nodesByType[ty];
+              else snap.stats.nodesByType[ty] = next;
+            }
+            await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+          }
         }
       });
 

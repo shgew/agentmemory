@@ -280,6 +280,160 @@ describe("mem::graph-vacuum", () => {
     expect(await kv.get(KV.graphNodes, "gn_dead")).toBeNull();
     expect(await kv.get(KV.graphNameIndex, nameKey("concept", "baz"))).toBeNull();
   });
+
+  it("decrements snapshot stats when it deletes a prune edge", async () => {
+    const { kv, sdk } = setup();
+    await kv.set(KV.graphSnapshot, "current", {
+      version: 1,
+      topNodes: [],
+      topEdges: [],
+      topDegrees: {},
+      stats: {
+        totalNodes: 10,
+        totalEdges: 5,
+        nodesByType: { concept: 10 },
+        edgesByType: { related_to: 5 },
+      },
+      updatedAt: "2026-04-01T00:00:00Z",
+      dirty: false,
+    });
+    await kv.set(KV.graphEdges, "ge_p", {
+      ...edge("ge_p", "a", "b"),
+      sourceObservationIds: ["o1"],
+    });
+    await kv.set(KV.graphEdgeKey, edgeKey("a", "b", "related_to"), "ge_p");
+    await kv.set(KV.graphTombstones, "ge_p", {
+      id: "ge_p",
+      kind: "edge",
+      reason: "prune",
+      indexKey: edgeKey("a", "b", "related_to"),
+      tombstonedAt: "2026-04-01T00:00:00Z",
+      observedSourceCount: 1,
+    });
+
+    const res = (await sdk.trigger("mem::graph-vacuum", {})) as {
+      deletedEdges: number;
+    };
+    expect(res.deletedEdges).toBe(1);
+
+    const snap = await kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
+    expect(snap!.stats.totalEdges).toBe(4);
+    expect(snap!.stats.edgesByType.related_to).toBe(4);
+    expect(snap!.stats.totalNodes).toBe(10);
+  });
+
+  it("decrements snapshot stats when it deletes a prune node", async () => {
+    const { kv, sdk } = setup();
+    await kv.set(KV.graphSnapshot, "current", {
+      version: 1,
+      topNodes: [],
+      topEdges: [],
+      topDegrees: {},
+      stats: {
+        totalNodes: 10,
+        totalEdges: 5,
+        nodesByType: { concept: 10 },
+        edgesByType: { related_to: 5 },
+      },
+      updatedAt: "2026-04-01T00:00:00Z",
+      dirty: false,
+    });
+    await kv.set(KV.graphNodes, "gn_p", {
+      ...node("gn_p", "concept", "p"),
+      sourceObservationIds: ["o1"],
+    });
+    await kv.set(KV.graphNameIndex, nameKey("concept", "p"), "gn_p");
+    await kv.set(KV.graphTombstones, "gn_p", {
+      id: "gn_p",
+      kind: "node",
+      reason: "prune",
+      indexKey: nameKey("concept", "p"),
+      tombstonedAt: "2026-04-01T00:00:00Z",
+      observedSourceCount: 1,
+    });
+
+    await sdk.trigger("mem::graph-vacuum", {});
+
+    const snap = await kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
+    expect(snap!.stats.totalNodes).toBe(9);
+    expect(snap!.stats.nodesByType.concept).toBe(9);
+    expect(snap!.stats.totalEdges).toBe(5);
+  });
+
+  it("does NOT decrement snapshot stats for a non-prune (cascade) deletion", async () => {
+    const { kv, sdk } = setup();
+    await kv.set(KV.graphSnapshot, "current", {
+      version: 1,
+      topNodes: [],
+      topEdges: [],
+      topDegrees: {},
+      stats: {
+        totalNodes: 10,
+        totalEdges: 5,
+        nodesByType: { concept: 10 },
+        edgesByType: { related_to: 5 },
+      },
+      updatedAt: "2026-04-01T00:00:00Z",
+      dirty: false,
+    });
+    await kv.set(KV.graphEdges, "ge_c", edge("ge_c", "a", "b"));
+    await kv.set(KV.graphTombstones, "ge_c", {
+      id: "ge_c",
+      kind: "edge",
+      reason: "cascade",
+      indexKey: edgeKey("a", "b", "related_to"),
+      tombstonedAt: "2026-04-01T00:00:00Z",
+    });
+
+    const res = (await sdk.trigger("mem::graph-vacuum", {})) as {
+      deletedEdges: number;
+    };
+    expect(res.deletedEdges).toBe(1);
+
+    const snap = await kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
+    expect(snap!.stats.totalEdges).toBe(5);
+    expect(snap!.stats.edgesByType.related_to).toBe(5);
+  });
+
+  it("does NOT decrement snapshot stats when a prune deletion is skipped as stale", async () => {
+    const { kv, sdk } = setup();
+    await kv.set(KV.graphSnapshot, "current", {
+      version: 1,
+      topNodes: [],
+      topEdges: [],
+      topDegrees: {},
+      stats: {
+        totalNodes: 10,
+        totalEdges: 5,
+        nodesByType: { concept: 10 },
+        edgesByType: { related_to: 5 },
+      },
+      updatedAt: "2026-04-01T00:00:00Z",
+      dirty: false,
+    });
+    await kv.set(KV.graphEdges, "ge_revived", {
+      ...edge("ge_revived", "a", "b"),
+      sourceObservationIds: ["o1", "o2"],
+    });
+    await kv.set(KV.graphTombstones, "ge_revived", {
+      id: "ge_revived",
+      kind: "edge",
+      reason: "prune",
+      indexKey: edgeKey("a", "b", "related_to"),
+      tombstonedAt: "2026-04-01T00:00:00Z",
+      observedSourceCount: 1,
+    });
+
+    const res = (await sdk.trigger("mem::graph-vacuum", {})) as {
+      deletedEdges: number;
+      skippedStale: number;
+    };
+    expect(res.deletedEdges).toBe(0);
+    expect(res.skippedStale).toBe(1);
+
+    const snap = await kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
+    expect(snap!.stats.totalEdges).toBe(5);
+  });
 });
 
 
