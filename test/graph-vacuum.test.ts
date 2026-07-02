@@ -190,6 +190,94 @@ describe("mem::graph-vacuum", () => {
     expect(res.deletedEdges).toBe(0);
     expect(res.remaining).toBe(0);
   });
+
+  it("skips deleting a prune node whose sourceObservationIds length changed since the tombstone", async () => {
+    const { kv, sdk } = setup();
+    // Row was doomed as an orphan (1 source), then re-merged live (now 2 sources).
+    await kv.set(KV.graphNodes, "gn_live", {
+      ...node("gn_live", "concept", "bar"),
+      sourceObservationIds: ["obsA", "obsB"],
+    });
+    await kv.set(KV.graphNameIndex, nameKey("concept", "bar"), "gn_live");
+    await kv.set(KV.graphNodeDegree, "gn_live", 2);
+    await kv.set(KV.graphTombstones, "gn_live", {
+      id: "gn_live",
+      kind: "node",
+      reason: "prune",
+      indexKey: nameKey("concept", "bar"),
+      tombstonedAt: "2026-04-01T00:00:00Z",
+      observedSourceCount: 1,
+    });
+
+    const res = (await sdk.trigger("mem::graph-vacuum", {})) as {
+      deletedNodes: number;
+      skippedStale: number;
+      remaining: number;
+    };
+
+    expect(res.deletedNodes).toBe(0);
+    expect(res.skippedStale).toBe(1);
+    expect(await kv.get(KV.graphNodes, "gn_live")).not.toBeNull();
+    expect(await kv.get(KV.graphNameIndex, nameKey("concept", "bar"))).toBe("gn_live");
+    expect(await kv.get(KV.graphNodeDegree, "gn_live")).toBe(2);
+    // The stale tombstone is dropped so the vacuum does not retry it forever.
+    expect(await kv.get(KV.graphTombstones, "gn_live")).toBeNull();
+  });
+
+  it("skips deleting a prune edge whose sourceObservationIds length changed since the tombstone", async () => {
+    const { kv, sdk } = setup();
+    await kv.set(KV.graphEdges, "ge_live", {
+      ...edge("ge_live", "a", "b"),
+      sourceObservationIds: ["o1", "o2", "o3"],
+    });
+    await kv.set(KV.graphEdgeKey, edgeKey("a", "b", "related_to"), "ge_live");
+    await kv.set(KV.graphTombstones, "ge_live", {
+      id: "ge_live",
+      kind: "edge",
+      reason: "prune",
+      indexKey: edgeKey("a", "b", "related_to"),
+      tombstonedAt: "2026-04-01T00:00:00Z",
+      observedSourceCount: 1,
+    });
+
+    const res = (await sdk.trigger("mem::graph-vacuum", {})) as {
+      deletedEdges: number;
+      skippedStale: number;
+    };
+
+    expect(res.deletedEdges).toBe(0);
+    expect(res.skippedStale).toBe(1);
+    expect(await kv.get(KV.graphEdges, "ge_live")).not.toBeNull();
+    expect(await kv.get(KV.graphEdgeKey, edgeKey("a", "b", "related_to"))).toBe("ge_live");
+    expect(await kv.get(KV.graphTombstones, "ge_live")).toBeNull();
+  });
+
+  it("deletes a prune-tombstoned node when its sourceObservationIds length is unchanged", async () => {
+    const { kv, sdk } = setup();
+    await kv.set(KV.graphNodes, "gn_dead", {
+      ...node("gn_dead", "concept", "baz"),
+      sourceObservationIds: ["obsX"],
+    });
+    await kv.set(KV.graphNameIndex, nameKey("concept", "baz"), "gn_dead");
+    await kv.set(KV.graphTombstones, "gn_dead", {
+      id: "gn_dead",
+      kind: "node",
+      reason: "prune",
+      indexKey: nameKey("concept", "baz"),
+      tombstonedAt: "2026-04-01T00:00:00Z",
+      observedSourceCount: 1,
+    });
+
+    const res = (await sdk.trigger("mem::graph-vacuum", {})) as {
+      deletedNodes: number;
+      skippedStale: number;
+    };
+
+    expect(res.deletedNodes).toBe(1);
+    expect(res.skippedStale).toBe(0);
+    expect(await kv.get(KV.graphNodes, "gn_dead")).toBeNull();
+    expect(await kv.get(KV.graphNameIndex, nameKey("concept", "baz"))).toBeNull();
+  });
 });
 
 

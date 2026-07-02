@@ -1683,6 +1683,58 @@ export function registerApiTriggers(
     config: { api_path: "/agentmemory/graph/vacuum", http_method: "POST" },
   });
 
+  // Seed prune tombstones for an offline-computed set of orphan candidate ids
+  // (edges first, then nodes). Each candidate is re-validated live by
+  // mem::graph-prune-orphans; drain the seeded tombstones via /graph/vacuum.
+  sdk.registerFunction("api::graph-prune-orphans",
+    async (
+      req: ApiRequest<{
+        nodeIds?: unknown;
+        edgeIds?: unknown;
+        maxSeed?: unknown;
+        tombstoneCeiling?: unknown;
+      }>,
+    ): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const body = req.body ?? {};
+      const toIds = (v: unknown): string[] | undefined =>
+        Array.isArray(v)
+          ? v.filter((x): x is string => typeof x === "string")
+          : undefined;
+      const toPosInt = (v: unknown): number | undefined =>
+        typeof v === "number" && Number.isFinite(v) && v > 0
+          ? Math.floor(v)
+          : undefined;
+      const nodeIds = toIds(body.nodeIds);
+      const edgeIds = toIds(body.edgeIds);
+      const maxSeed = toPosInt(body.maxSeed);
+      const tombstoneCeiling = toPosInt(body.tombstoneCeiling);
+      try {
+        const result = await sdk.trigger({
+          function_id: "mem::graph-prune-orphans",
+          payload: {
+            ...(nodeIds !== undefined ? { nodeIds } : {}),
+            ...(edgeIds !== undefined ? { edgeIds } : {}),
+            ...(maxSeed !== undefined ? { maxSeed } : {}),
+            ...(tombstoneCeiling !== undefined ? { tombstoneCeiling } : {}),
+          },
+        });
+        return { status_code: 200, body: result };
+      } catch {
+        return graphDisabledResponse();
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-prune-orphans",
+    config: {
+      api_path: "/agentmemory/graph/prune-orphans",
+      http_method: "POST",
+    },
+  });
+
   sdk.registerFunction("api::graph-extract",
     async (req: ApiRequest<{ observations: unknown[] }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);

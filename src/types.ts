@@ -510,11 +510,16 @@ export interface GraphSnapshot {
 export interface GraphTombstone {
   id: string;
   kind: "node" | "edge";
-  reason: "cascade" | "orphan" | "retention";
+  reason: "cascade" | "orphan" | "retention" | "prune";
   // node: `${type}|${name}` (KV.graphNameIndex key)
   // edge: `${sourceNodeId}|${targetNodeId}|${type}` (KV.graphEdgeKey key)
   indexKey: string;
   tombstonedAt: string;
+  // Prune-sweep only: source count observed when the tombstone was recorded.
+  // The vacuum skips deletion when the live row's sourceObservationIds length
+  // has since changed, so a row that gained a live source via merge after being
+  // doomed is never physically deleted.
+  observedSourceCount?: number;
 }
 
 export type ConsolidationTier =

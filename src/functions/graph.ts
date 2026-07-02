@@ -244,8 +244,9 @@ export async function recordGraphTombstone(
   entry: {
     id: string;
     kind: "node" | "edge";
-    reason: "cascade" | "orphan" | "retention";
+    reason: "cascade" | "orphan" | "retention" | "prune";
     indexKey: string;
+    observedSourceCount?: number;
   },
 ): Promise<void> {
   const tombstone: GraphTombstone = {
@@ -1242,10 +1243,31 @@ export function registerGraphFunction(
       let deletedNodes = 0;
       let deletedEdges = 0;
       let skippedIndex = 0;
+      let skippedStale = 0;
 
       await withKeyedLock("graph:merge", async () => {
         for (const t of batch) {
           if (!t || typeof t.id !== "string") continue;
+          // Prune freshness guard: a row doomed by the offline sweep may have
+          // gained a live source via a later merge. observedSourceCount is the
+          // source count captured at seed time; if the live row's count has
+          // since changed, the row is no longer that orphan, so drop the
+          // tombstone without deleting.
+          if (typeof t.observedSourceCount === "number") {
+            const scope = t.kind === "edge" ? KV.graphEdges : KV.graphNodes;
+            const cur = await kv.get<{ sourceObservationIds?: string[] }>(
+              scope,
+              t.id,
+            );
+            if (
+              cur &&
+              (cur.sourceObservationIds?.length ?? 0) !== t.observedSourceCount
+            ) {
+              await kv.delete(KV.graphTombstones, t.id);
+              skippedStale++;
+              continue;
+            }
+          }
           if (t.kind === "edge") {
             await kv.delete(KV.graphEdges, t.id);
             // Verify-then-delete: only drop the edge-key entry if it still
@@ -1279,6 +1301,7 @@ export function registerGraphFunction(
         deletedNodes,
         deletedEdges,
         skippedIndex,
+        skippedStale,
         remaining,
         tookMs,
       });
@@ -1286,6 +1309,7 @@ export function registerGraphFunction(
         deletedNodes,
         deletedEdges,
         skippedIndex,
+        skippedStale,
         remaining,
         tookMs,
       });
@@ -1294,8 +1318,141 @@ export function registerGraphFunction(
         deletedNodes,
         deletedEdges,
         skippedIndex,
+        skippedStale,
         remaining,
         tookMs,
+      };
+    },
+  );
+
+  // Operator-driven backlog cleanup: seed prune tombstones for a caller-supplied
+  // set of orphan candidate ids (computed offline from a consistent snapshot, so
+  // this never enumerates the heartbeat-fatal graphNodes/graphEdges scopes). Each
+  // candidate is re-validated LIVE here (kept if it still has a source in the live
+  // observation/memory set) and the tombstone records the current source count so
+  // mem::graph-vacuum skips it if a later merge revives it. Backpressure: refuse
+  // once graphTombstones exceeds tombstoneCeiling, since the vacuum lists it.
+  sdk.registerFunction(
+    "mem::graph-prune-orphans",
+    async (data: {
+      nodeIds?: string[];
+      edgeIds?: string[];
+      maxSeed?: number;
+      tombstoneCeiling?: number;
+    }) => {
+      const maxSeed = Math.max(1, Math.min(data?.maxSeed ?? 1000, 5000));
+      const tombstoneCeiling = Math.max(1, data?.tombstoneCeiling ?? 2000);
+      const nodeIds = Array.isArray(data?.nodeIds) ? data.nodeIds : [];
+      const edgeIds = Array.isArray(data?.edgeIds) ? data.edgeIds : [];
+
+      const queue = await kv
+        .list<GraphTombstone>(KV.graphTombstones)
+        .catch(() => [] as GraphTombstone[]);
+      if (queue.length > tombstoneCeiling) {
+        return {
+          success: true,
+          refused: true,
+          reason:
+            "tombstone queue above ceiling; drain via mem::graph-vacuum first",
+          seeded: 0,
+          skippedLive: 0,
+          skippedMissing: 0,
+          remainingCandidates: nodeIds.length + edgeIds.length,
+          tombstoneQueueLen: queue.length,
+        };
+      }
+
+      const liveSet = new Set<string>();
+      const sessions = await kv
+        .list<{ id?: string }>(KV.sessions)
+        .catch(() => [] as { id?: string }[]);
+      for (const s of sessions) {
+        if (!s?.id) continue;
+        const obs = await kv
+          .list<{ id?: string }>(KV.observations(s.id))
+          .catch(() => [] as { id?: string }[]);
+        for (const o of obs) if (o?.id) liveSet.add(o.id);
+      }
+      const memories = await kv
+        .list<{ id?: string }>(KV.memories)
+        .catch(() => [] as { id?: string }[]);
+      for (const m of memories) if (m?.id) liveSet.add(m.id);
+
+      const candidates: Array<{ id: string; kind: "node" | "edge" }> = [
+        ...edgeIds.map((id) => ({ id, kind: "edge" as const })),
+        ...nodeIds.map((id) => ({ id, kind: "node" as const })),
+      ];
+      const batch = candidates.slice(0, maxSeed);
+      const remainingCandidates = Math.max(0, candidates.length - batch.length);
+
+      let seeded = 0;
+      let skippedLive = 0;
+      let skippedMissing = 0;
+
+      for (const c of batch) {
+        if (c.kind === "edge") {
+          const e = await kv.get<GraphEdge>(KV.graphEdges, c.id);
+          if (!e) {
+            skippedMissing++;
+            continue;
+          }
+          const sources = e.sourceObservationIds ?? [];
+          if (sources.some((s) => liveSet.has(s))) {
+            skippedLive++;
+            continue;
+          }
+          await recordGraphTombstone(kv, {
+            id: e.id,
+            kind: "edge",
+            reason: "prune",
+            indexKey: edgeIndexKey(e.sourceNodeId, e.targetNodeId, e.type),
+            observedSourceCount: sources.length,
+          });
+          seeded++;
+        } else {
+          const n = await kv.get<GraphNode>(KV.graphNodes, c.id);
+          if (!n) {
+            skippedMissing++;
+            continue;
+          }
+          const sources = n.sourceObservationIds ?? [];
+          if (sources.some((s) => liveSet.has(s))) {
+            skippedLive++;
+            continue;
+          }
+          await recordGraphTombstone(kv, {
+            id: n.id,
+            kind: "node",
+            reason: "prune",
+            indexKey: nameIndexKey(n.type, n.name),
+            observedSourceCount: sources.length,
+          });
+          seeded++;
+        }
+      }
+
+      if (seeded > 0) {
+        await recordAudit(kv, "consolidate", "mem::graph-prune-orphans", [], {
+          seeded,
+          skippedLive,
+          skippedMissing,
+          remainingCandidates,
+        });
+      }
+      logger.info("Graph prune-orphans seed pass", {
+        seeded,
+        skippedLive,
+        skippedMissing,
+        remainingCandidates,
+        tombstoneQueueLen: queue.length,
+      });
+      return {
+        success: true,
+        seeded,
+        skippedLive,
+        skippedMissing,
+        remainingCandidates,
+        tombstoneQueueLen: queue.length,
       };
     },
   );
