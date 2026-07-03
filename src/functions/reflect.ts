@@ -186,7 +186,8 @@ function buildGraphClusters(
   const conceptNodeById = new Map(conceptNodes.map((n) => [n.id, n]));
 
   for (const seed of sorted) {
-    if (visited.has(seed.id) || clusters.length >= maxClusters) break;
+    if (clusters.length >= maxClusters) break;
+    if (visited.has(seed.id)) continue;
 
     const cluster: string[] = [];
     const queue = [seed.id];
@@ -284,7 +285,8 @@ function buildJaccardClusters(
   const clusters: string[][] = [];
 
   for (const concept of conceptList) {
-    if (visited.has(concept) || clusters.length >= maxClusters) break;
+    if (clusters.length >= maxClusters) break;
+    if (visited.has(concept)) continue;
 
     const cluster = [concept];
     visited.add(concept);

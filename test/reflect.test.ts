@@ -227,6 +227,50 @@ describe("Reflect", () => {
       expect(provider.summarize).not.toHaveBeenCalled();
     });
 
+    it("builds a disjoint graph cluster whose seed follows visited seeds in degree order", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:nodes", "node_testing", makeConceptNode("testing"));
+      await kv.set("mem:graph:edges", "edge_sv", makeEdge("security", "validation"));
+      await kv.set("mem:graph:edges", "edge_st", makeEdge("security", "testing"));
+      await kv.set("mem:graph:edges", "edge_vt", makeEdge("validation", "testing"));
+      await kv.set("mem:graph:nodes", "node_alpha", makeConceptNode("alpha"));
+      await kv.set("mem:graph:nodes", "node_beta", makeConceptNode("beta"));
+      await kv.set("mem:graph:edges", "edge_ab", makeEdge("alpha", "beta"));
+
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs", "sem_1"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage", "sem_2"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection attacks", "sem_3"));
+      await kv.set("mem:semantic", "sem_4", makeSemantic("alpha foundation matters", "sem_4"));
+      await kv.set("mem:semantic", "sem_5", makeSemantic("beta extends alpha", "sem_5"));
+      await kv.set("mem:semantic", "sem_6", makeSemantic("alpha beta integration", "sem_6"));
+
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        clustersProcessed: number;
+      };
+
+      expect(result.clustersProcessed).toBe(2);
+      expect(provider.summarize).toHaveBeenCalledTimes(2);
+    });
+
+    it("builds a disjoint jaccard cluster whose concept follows an absorbed concept", async () => {
+      await kv.set("mem:semantic", "sem_1", makeSemantic("alpha beta shared context one", "sem_1"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("alpha beta shared context two", "sem_2"));
+      await kv.set("mem:semantic", "sem_3", makeSemantic("alpha beta shared context ten", "sem_3"));
+      await kv.set("mem:semantic", "sem_4", makeSemantic("gamma delta topic one", "sem_4"));
+      await kv.set("mem:semantic", "sem_5", makeSemantic("gamma delta topic two", "sem_5"));
+      await kv.set("mem:semantic", "sem_6", makeSemantic("gamma delta topic six", "sem_6"));
+
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        usedFallback: boolean;
+        clustersProcessed: number;
+      };
+
+      expect(result.usedFallback).toBe(true);
+      expect(result.clustersProcessed).toBe(2);
+      expect(provider.summarize).toHaveBeenCalledTimes(2);
+    });
+
     it("deduplicates insights by fingerprint", async () => {
       await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
       await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
