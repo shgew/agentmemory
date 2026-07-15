@@ -5,7 +5,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerRelationsFunction } from "../src/functions/relations.js";
-import type { Memory } from "../src/types.js";
+import type { Lesson, Memory } from "../src/types.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -62,6 +62,26 @@ function makeMemory(overrides: Partial<Memory> = {}): Memory {
     version: 1,
     isLatest: true,
     ...overrides,
+  };
+}
+
+function makeLesson(overrides: Partial<Lesson>): Lesson {
+  const now = new Date().toISOString();
+  return {
+    id: overrides.id ?? "lsn_default",
+    content: overrides.content ?? "Default lesson",
+    context: overrides.context ?? "",
+    confidence: overrides.confidence ?? 0.7,
+    reinforcements: overrides.reinforcements ?? 0,
+    source: overrides.source ?? "manual",
+    sourceIds: overrides.sourceIds ?? [],
+    project: overrides.project,
+    tags: overrides.tags ?? [],
+    corrects: overrides.corrects,
+    createdAt: overrides.createdAt ?? now,
+    updatedAt: overrides.updatedAt ?? now,
+    decayRate: overrides.decayRate ?? 0.05,
+    deleted: overrides.deleted,
   };
 }
 
@@ -194,6 +214,63 @@ describe("Relations Functions", () => {
       const ids = result.results.map((r) => r.memory.id);
       expect(ids).toContain("mem_2");
       expect(ids).toContain("mem_3");
+    });
+
+    it("traces lesson corrections from obsolete advice to newest correction", async () => {
+      await kv.set("mem:lessons", "lsn_v1", makeLesson({ id: "lsn_v1", project: "api" }));
+      await kv.set(
+        "mem:lessons",
+        "lsn_v2",
+        makeLesson({ id: "lsn_v2", project: "api", corrects: ["lsn_v1"] }),
+      );
+      await kv.set(
+        "mem:lessons",
+        "lsn_v3",
+        makeLesson({ id: "lsn_v3", project: "api", corrects: ["lsn_v2"] }),
+      );
+
+      const result = (await sdk.trigger("mem::get-related", {
+        memoryId: "lsn_v1",
+        maxHops: 2,
+      })) as {
+        results: Array<{
+          lesson: Lesson;
+          hop: number;
+          direction: string;
+        }>;
+      };
+
+      expect(result.results.map(({ lesson, hop, direction }) => ({
+        id: lesson.id,
+        hop,
+        direction,
+      }))).toEqual([
+        { id: "lsn_v2", hop: 1, direction: "correctedBy" },
+        { id: "lsn_v3", hop: 2, direction: "correctedBy" },
+      ]);
+    });
+
+    it("traces a correcting lesson back to obsolete advice", async () => {
+      await kv.set("mem:lessons", "lsn_v1", makeLesson({ id: "lsn_v1", project: "api" }));
+      await kv.set(
+        "mem:lessons",
+        "lsn_v2",
+        makeLesson({ id: "lsn_v2", project: "api", corrects: ["lsn_v1"] }),
+      );
+
+      const result = (await sdk.trigger("mem::get-related", {
+        memoryId: "lsn_v2",
+        maxHops: 1,
+      })) as {
+        results: Array<{ lesson: Lesson; direction: string }>;
+      };
+
+      expect(result.results).toEqual([
+        expect.objectContaining({
+          lesson: expect.objectContaining({ id: "lsn_v1" }),
+          direction: "corrects",
+        }),
+      ]);
     });
   });
 });

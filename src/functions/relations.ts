@@ -6,6 +6,7 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import { safeAudit } from "./audit.js";
 import { recordAccessBatch } from "./access-tracker.js";
 import { logger } from "../logger.js";
+import { getRelatedLessonResult } from "./lesson-corrections.js";
 
 function computeConfidence(
   source: Memory,
@@ -204,6 +205,8 @@ export function registerRelationsFunction(sdk: ISdk, kv: StateKV): void {
       const minConfidence = Number.isFinite(rawMinConf)
         ? Math.max(0, Math.min(1, rawMinConf))
         : 0;
+      const lessonResult = await getRelatedLessonResult(kv, data.memoryId, maxHops, minConfidence);
+      if (lessonResult) return lessonResult;
 
       const allRelations = await kv
         .list<MemoryRelation>(KV.relations)
