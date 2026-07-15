@@ -1,19 +1,42 @@
+/// <reference types="node" />
+
+import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
 import { SearchIndex } from "../src/state/search-index.js";
 import { VectorIndex } from "../src/state/vector-index.js";
 import { HybridSearch } from "../src/state/hybrid-search.js";
 import { LocalEmbeddingProvider } from "../src/providers/embedding/local.js";
-import type { CompressedObservation, EmbeddingProvider } from "../src/types.js";
-import { generateDataset, type LabeledQuery } from "./dataset.js";
-import { writeFileSync } from "node:fs";
+import { buildSnapshotFromArrays } from "../src/functions/graph.js";
+import { extractEntitiesFromQuery } from "../src/functions/query-expansion.js";
+import { KV } from "../src/state/schema.js";
+import { SNAPSHOT_KEY } from "../src/state/graph-snapshot.js";
+import type {
+  CompressedObservation,
+  EmbeddingProvider,
+  GraphEdge,
+  GraphNode,
+  GraphSnapshot,
+} from "../src/types.js";
+import {
+  BENCHMARK_DATASET_VERSION,
+  generateDataset,
+  type GraphBenchmarkLink,
+  type LabeledQuery,
+} from "./dataset.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
+  let snapshotReads = 0;
+  let snapshotWrites = 0;
   return {
-    get: async <T>(scope: string, key: string): Promise<T | null> =>
-      (store.get(scope)?.get(key) as T) ?? null,
+    get: async <T>(scope: string, key: string): Promise<T | null> => {
+      if (scope === KV.graphSnapshot && key === SNAPSHOT_KEY) snapshotReads++;
+      return (store.get(scope)?.get(key) as T) ?? null;
+    },
     set: async <T>(scope: string, key: string, data: T): Promise<T> => {
       if (!store.has(scope)) store.set(scope, new Map());
       store.get(scope)!.set(key, data);
+      if (scope === KV.graphSnapshot && key === SNAPSHOT_KEY) snapshotWrites++;
       return data;
     },
     delete: async (scope: string, key: string): Promise<void> => {
@@ -23,6 +46,8 @@ function mockKV() {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
+    snapshotReads: () => snapshotReads,
+    snapshotWrites: () => snapshotWrites,
   };
 }
 
@@ -88,6 +113,8 @@ interface QueryResult {
   mrr_val: number;
   relevant_count: number;
   latency_ms: number;
+  retrieved_ids: string[];
+  returned_tokens: number;
 }
 
 interface SystemResult {
@@ -95,15 +122,97 @@ interface SystemResult {
   results: QueryResult[];
   embed_time_ms: number;
   tokens_per_query: number;
+  snapshot_reads: number;
+  snapshot_writes: number;
+  snapshot_nodes: number;
+  snapshot_edges: number;
+  graph_search_enabled: boolean;
 }
 
-async function evalSystem(
-  name: string,
+interface EvalSystemOptions {
+  name: string;
+  observations: CompressedObservation[];
+  queries: LabeledQuery[];
+  provider: EmbeddingProvider | null;
+  weights: { bm25: number; vector: number; graph: number };
+  graphSnapshot?: GraphSnapshot;
+  graphSearchEnabled?: boolean;
+}
+
+interface GraphValidityEvidence {
+  proof: GraphBenchmarkLink;
+  dualIds: string[];
+  tripleIds: string[];
+  connectedProbeHits: number;
+  recallDelta: number;
+  zeroEntityQuery: string;
+  zeroEntityIds: string[];
+}
+
+function buildBenchmarkGraphSnapshot(
   observations: CompressedObservation[],
-  queries: LabeledQuery[],
-  provider: EmbeddingProvider | null,
-  weights: { bm25: number; vector: number; graph: number },
-): Promise<SystemResult> {
+  graphLinks: GraphBenchmarkLink[],
+): GraphSnapshot {
+  const observationsById = new Map(
+    observations.map((observation) => [observation.id, observation]),
+  );
+  const nodes: GraphNode[] = [];
+  const edges: GraphEdge[] = [];
+
+  for (const [index, link] of graphLinks.entries()) {
+    const anchor = observationsById.get(link.anchorObsId);
+    const target = observationsById.get(link.graphOnlyObsId);
+    assert(anchor, `Missing graph anchor observation ${link.anchorObsId}`);
+    assert(target, `Missing graph target observation ${link.graphOnlyObsId}`);
+    const suffix = index.toString().padStart(2, "0");
+    const anchorNodeId = `gn_benchmark_anchor_${suffix}`;
+    const targetNodeId = `gn_benchmark_target_${suffix}`;
+    nodes.push(
+      {
+        id: anchorNodeId,
+        type: "project",
+        name: link.anchorEntity,
+        properties: { fixture: BENCHMARK_DATASET_VERSION },
+        sourceObservationIds: [anchor.id],
+        createdAt: anchor.timestamp,
+      },
+      {
+        id: targetNodeId,
+        type: "concept",
+        name: link.targetNodeName,
+        properties: { fixture: BENCHMARK_DATASET_VERSION },
+        sourceObservationIds: [target.id],
+        createdAt: target.timestamp,
+      },
+    );
+    edges.push({
+      id: `ge_benchmark_${suffix}`,
+      type: "related_to",
+      sourceNodeId: anchorNodeId,
+      targetNodeId,
+      weight: 1,
+      sourceObservationIds: [anchor.id, target.id],
+      createdAt: target.timestamp,
+      context: {
+        reasoning: `Synthetic gold link for ${link.query}`,
+        confidence: 1,
+      },
+    });
+  }
+
+  return buildSnapshotFromArrays(nodes, edges);
+}
+
+async function evalSystem(options: EvalSystemOptions): Promise<SystemResult> {
+  const {
+    name,
+    observations,
+    queries,
+    provider,
+    weights,
+    graphSnapshot,
+    graphSearchEnabled = false,
+  } = options;
   const kv = mockKV();
   const bm25 = new SearchIndex();
   const vector = provider ? new VectorIndex() : null;
@@ -114,6 +223,10 @@ async function evalSystem(
   for (const obs of observations) {
     bm25.add(obs);
     await kv.set(`mem:obs:${obs.sessionId}`, obs.id, obs);
+  }
+
+  if (graphSnapshot) {
+    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, graphSnapshot);
   }
 
   if (provider && vector) {
@@ -142,6 +255,8 @@ async function evalSystem(
     weights.bm25,
     weights.vector,
     weights.graph,
+    false,
+    graphSearchEnabled,
   );
 
   console.log(`  Running ${queries.length} queries...`);
@@ -154,6 +269,12 @@ async function evalSystem(
     const latency = performance.now() - start;
 
     const retrieved = searchResults.map(r => r.observation.id);
+    const returnedTokens = searchResults
+      .slice(0, 10)
+      .reduce(
+        (sum, result) => sum + estimateTokens(JSON.stringify(result.observation)),
+        0,
+      );
     results.push({
       query: q.query,
       category: q.category,
@@ -164,24 +285,25 @@ async function evalSystem(
       mrr_val: mrr(retrieved, relevant),
       relevant_count: relevant.size,
       latency_ms: latency,
+      retrieved_ids: retrieved,
+      returned_tokens: returnedTokens,
     });
   }
 
-  let totalReturnedTokens = 0;
-  for (const q of queries) {
-    const searchResults = await hybrid.search(q.query, 10);
-    totalReturnedTokens += searchResults.reduce(
-      (sum, r) => sum + estimateTokens(JSON.stringify(r.observation)),
-      0,
-    );
-  }
-  const avgReturnedTokens = Math.round(totalReturnedTokens / queries.length);
+  const avgReturnedTokens = Math.round(
+    avg(results.map((result) => result.returned_tokens)),
+  );
 
   return {
     name,
     results,
     embed_time_ms: embedTime,
     tokens_per_query: avgReturnedTokens,
+    snapshot_reads: kv.snapshotReads(),
+    snapshot_writes: kv.snapshotWrites(),
+    snapshot_nodes: graphSnapshot?.stats.totalNodes ?? 0,
+    snapshot_edges: graphSnapshot?.stats.totalEdges ?? 0,
+    graph_search_enabled: graphSearchEnabled,
   };
 }
 
@@ -190,6 +312,9 @@ async function evalBuiltinGrep(
   queries: LabeledQuery[],
 ): Promise<SystemResult> {
   const results: QueryResult[] = [];
+  const allTokens = estimateTokens(observations.map(o =>
+    `## ${o.title}\n${o.narrative}\nConcepts: ${o.concepts.join(", ")}`
+  ).join("\n\n"));
 
   for (const q of queries) {
     const relevant = new Set(q.relevantObsIds);
@@ -217,189 +342,289 @@ async function evalBuiltinGrep(
       mrr_val: mrr(retrieved, relevant),
       relevant_count: relevant.size,
       latency_ms: latency,
+      retrieved_ids: retrieved,
+      returned_tokens: allTokens,
     });
   }
 
-  const allTokens = estimateTokens(observations.map(o =>
-    `## ${o.title}\n${o.narrative}\nConcepts: ${o.concepts.join(", ")}`
-  ).join("\n\n"));
-
-  return { name: "Built-in (grep all)", results, embed_time_ms: 0, tokens_per_query: allTokens };
+  return {
+    name: "Built-in (grep all)",
+    results,
+    embed_time_ms: 0,
+    tokens_per_query: allTokens,
+    snapshot_reads: 0,
+    snapshot_writes: 0,
+    snapshot_nodes: 0,
+    snapshot_edges: 0,
+    graph_search_enabled: false,
+  };
 }
 
-function generateReport(systems: SystemResult[], obsCount: number): string {
+function queryResult(system: SystemResult, query: string): QueryResult {
+  const result = system.results.find((candidate) => candidate.query === query);
+  if (!result) {
+    throw new Error(`Missing query result for ${query} in ${system.name}`);
+  }
+  return result;
+}
+
+function validateGraphBenchmark(
+  dual: SystemResult,
+  triple: SystemResult,
+  graphLinks: GraphBenchmarkLink[],
+  zeroEntityQuery: string,
+  zeroEntityIds: string[],
+): GraphValidityEvidence {
+  assert.equal(triple.graph_search_enabled, true);
+  assert.equal(triple.snapshot_writes, 1);
+  assert(triple.snapshot_reads > 0, "Triple-stream search never read the graph snapshot");
+  assert(triple.snapshot_nodes > 0, "Triple-stream graph snapshot has no nodes");
+  assert(triple.snapshot_edges > 0, "Triple-stream graph snapshot has no edges");
+
+  const recoveredLinks = graphLinks.filter((link) => {
+    const dualIds = queryResult(dual, link.query).retrieved_ids.slice(0, 10);
+    const tripleIds = queryResult(triple, link.query).retrieved_ids.slice(0, 10);
+    return (
+      !dualIds.includes(link.graphOnlyObsId) &&
+      tripleIds.includes(link.graphOnlyObsId)
+    );
+  });
+  assert(
+    recoveredLinks.length > 0,
+    "Triple-stream recovered no graph-only gold documents that dual-stream missed",
+  );
+
+  const proof = recoveredLinks[0];
+  const dualIds = queryResult(dual, proof.query).retrieved_ids.slice(0, 10);
+  const tripleIds = queryResult(triple, proof.query).retrieved_ids.slice(0, 10);
+  assert.equal(dualIds.includes(proof.graphOnlyObsId), false);
+  assert.equal(tripleIds.includes(proof.graphOnlyObsId), true);
+  assert.notDeepEqual(tripleIds, dualIds);
+
+  return {
+    proof,
+    dualIds,
+    tripleIds,
+    connectedProbeHits: graphLinks.filter((link) =>
+      queryResult(triple, link.query)
+        .retrieved_ids.slice(0, 10)
+        .includes(link.graphOnlyObsId),
+    ).length,
+    recallDelta:
+      avg(triple.results.map((result) => result.recall_10)) -
+      avg(dual.results.map((result) => result.recall_10)),
+    zeroEntityQuery,
+    zeroEntityIds,
+  };
+}
+
+async function runZeroEntityProbe(
+  observation: CompressedObservation,
+  graphSnapshot: GraphSnapshot,
+): Promise<{ query: string; ids: string[] }> {
+  const query = observation.title.toLowerCase();
+  assert.deepEqual(extractEntitiesFromQuery(query), []);
+
+  const makeSearch = async (graphSearchEnabled: boolean) => {
+    const bm25 = new SearchIndex();
+    bm25.add(observation);
+    const kv = mockKV();
+    await kv.set(
+      KV.observations(observation.sessionId),
+      observation.id,
+      observation,
+    );
+    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, graphSnapshot);
+    const results = await new HybridSearch(
+      bm25,
+      null,
+      null,
+      kv as never,
+      1,
+      0,
+      1,
+      false,
+      graphSearchEnabled,
+    ).search(query, 10);
+    return {
+      ids: results.map((result) => result.observation.id),
+      snapshotReads: kv.snapshotReads(),
+    };
+  };
+
+  const dual = await makeSearch(false);
+  const triple = await makeSearch(true);
+  assert.deepEqual(triple.ids, dual.ids);
+  assert.equal(triple.snapshotReads, 0);
+  return { query, ids: triple.ids };
+}
+
+function generateReport(options: {
+  systems: SystemResult[];
+  observationCount: number;
+  sessionCount: number;
+  queryCount: number;
+  triple: SystemResult;
+  evidence: GraphValidityEvidence;
+}): string {
+  const {
+    systems,
+    observationCount,
+    sessionCount,
+    queryCount,
+    triple,
+    evidence,
+  } = options;
   const lines: string[] = [];
   const w = (s: string) => lines.push(s);
 
-  w("# agentmemory v0.6.0 — Real Embeddings Quality Evaluation");
+  w("# agentmemory real embeddings quality evaluation");
   w("");
-  w(`**Date:** ${new Date().toISOString()}`);
-  w(`**Platform:** ${process.platform} ${process.arch}, Node ${process.version}`);
-  w(`**Dataset:** ${obsCount} observations, 30 sessions, 20 labeled queries`);
-  w(`**Embedding model:** Xenova/all-MiniLM-L6-v2 (384d, local, no API key)`);
+  w(`Date: ${new Date().toISOString()}`);
+  w(`Platform: ${process.platform} ${process.arch}, Node ${process.version}`);
+  w(
+    `Dataset: ${BENCHMARK_DATASET_VERSION}, ${observationCount} observations, ` +
+      `${sessionCount} sessions, ${queryCount} labeled queries`,
+  );
+  w("Embedding model: Xenova/all-MiniLM-L6-v2, 384 dimensions, local");
   w("");
-
-  w("## Head-to-Head: Real Embeddings vs Keyword Search");
+  w("## Retrieval results");
   w("");
   w("| System | Recall@5 | Recall@10 | Precision@5 | NDCG@10 | MRR | Avg Latency | Tokens/query |");
   w("|--------|----------|-----------|-------------|---------|-----|-------------|--------------|");
-
   for (const s of systems) {
     const r = s.results;
     w(`| ${s.name} | ${pct(avg(r.map(q => q.recall_5)))} | ${pct(avg(r.map(q => q.recall_10)))} | ${pct(avg(r.map(q => q.precision_5)))} | ${pct(avg(r.map(q => q.ndcg_10)))} | ${pct(avg(r.map(q => q.mrr_val)))} | ${avg(r.map(q => q.latency_ms)).toFixed(2)}ms | ${s.tokens_per_query.toLocaleString()} |`);
   }
-
   w("");
-  w("## Improvement from Real Embeddings");
+  w("## Graph validity checks");
   w("");
-
-  const bm25Only = systems.find(s => s.name === "BM25-only (stemmed+synonyms)");
-  const dual = systems.find(s => s.name.includes("Dual-stream"));
-  const triple = systems.find(s => s.name.includes("Triple-stream"));
-  const builtin = systems.find(s => s.name.includes("grep"));
-
-  if (bm25Only && dual) {
-    const recallDelta = avg(dual.results.map(q => q.recall_10)) - avg(bm25Only.results.map(q => q.recall_10));
-    w(`Adding real vector embeddings to BM25 improves recall@10 by **${(recallDelta * 100).toFixed(1)} percentage points**.`);
-  }
-  if (builtin && dual) {
-    const tokenSaving = (1 - dual.tokens_per_query / builtin.tokens_per_query) * 100;
-    w(`Token savings vs loading everything: **${tokenSaving.toFixed(0)}%** (${dual.tokens_per_query.toLocaleString()} vs ${builtin.tokens_per_query.toLocaleString()} tokens).`);
-  }
-
+  w(
+    `Snapshot consulted: ${triple.snapshot_reads} reads after ` +
+      `${triple.snapshot_writes} isolated write; ${triple.snapshot_nodes} nodes, ` +
+      `${triple.snapshot_edges} edges.`,
+  );
+  w(`Proof query: ${evidence.proof.query}`);
+  w(`Graph-only gold: ${evidence.proof.graphOnlyObsId}`);
+  w(`Dual top 10: ${evidence.dualIds.join(", ")}`);
+  w(`Triple top 10: ${evidence.tripleIds.join(", ")}`);
+  w("Proof: dual missed the graph-only gold, triple recovered it, and result sets differ.");
+  w(
+    `Graph-specific probes with connected gold in triple top 10: ` +
+      `${evidence.connectedProbeHits}/20.`,
+  );
+  w(
+    `Zero-entity probe: ${evidence.zeroEntityQuery}; result IDs ` +
+      `${evidence.zeroEntityIds.join(", ")}; graph snapshot reads 0.`,
+  );
   w("");
-  w("## Per-Query: Where Real Embeddings Win");
+  w("## Production re-enable gate");
   w("");
-
-  if (bm25Only && dual) {
-    w("Queries where dual-stream (real embeddings) outperforms BM25-only:");
-    w("");
-    w("| Query | Category | BM25 Recall@10 | +Vector Recall@10 | Delta |");
-    w("|-------|----------|---------------|-------------------|-------|");
-
-    for (let i = 0; i < bm25Only.results.length; i++) {
-      const bq = bm25Only.results[i];
-      const dq = dual.results[i];
-      const delta = dq.recall_10 - bq.recall_10;
-      const marker = delta > 0 ? " **" : delta < 0 ? " *" : "";
-      if (Math.abs(delta) > 0.001) {
-        w(`| ${bq.query.slice(0, 45)}${bq.query.length > 45 ? "..." : ""} | ${bq.category} | ${pct(bq.recall_10)} | ${pct(dq.recall_10)} | ${delta > 0 ? "+" : ""}${(delta * 100).toFixed(1)}pp${marker} |`);
-      }
-    }
-  }
-
-  w("");
-  w("## By Category Comparison");
-  w("");
-  const categories = ["exact", "semantic", "cross-session", "entity"];
-
-  w("| Category | Built-in grep | BM25 (stemmed) | +Real Vectors | +Graph |");
-  w("|----------|--------------|----------------|--------------|--------|");
-
-  for (const cat of categories) {
-    const vals = systems.map(s => {
-      const qs = s.results.filter(q => q.category === cat);
-      return qs.length ? pct(avg(qs.map(q => q.recall_10))) : "-";
-    });
-    w(`| ${cat} | ${vals.join(" | ")} |`);
-  }
-
-  w("");
-  w("## Embedding Performance");
-  w("");
-  w("| System | Embedding Time | Model | Dimensions |");
-  w("|--------|---------------|-------|------------|");
-  for (const s of systems) {
-    if (s.embed_time_ms > 100) {
-      w(`| ${s.name} | ${(s.embed_time_ms / 1000).toFixed(1)}s | Xenova/all-MiniLM-L6-v2 | 384 |`);
-    }
-  }
-  w("");
-  w("Embedding is a one-time cost at ingestion. Search is sub-millisecond after indexing.");
-
-  w("");
-  w("## Key Findings");
-  w("");
-
-  if (bm25Only && dual) {
-    const semBm25 = bm25Only.results.filter(q => q.category === "semantic");
-    const semDual = dual.results.filter(q => q.category === "semantic");
-    const semImprove = avg(semDual.map(q => q.recall_10)) - avg(semBm25.map(q => q.recall_10));
-
-    w(`1. **Semantic queries improve most**: ${(semImprove * 100).toFixed(1)}pp recall@10 gain from real embeddings`);
-    w(`2. **"database performance optimization"** — the hardest query — goes from BM25 ${pct(bm25Only.results.find(q => q.query.includes("database perf"))?.recall_10 ?? 0)} to vector-augmented ${pct(dual.results.find(q => q.query.includes("database perf"))?.recall_10 ?? 0)}`);
-    w(`3. **Entity/exact queries** are already well-served by BM25+stemming — vectors add marginal value`);
-    w(`4. **Local embeddings (Xenova)** run without API keys — zero cost, zero latency concerns`);
-  }
-
-  w("");
-  w("## Recommendation");
-  w("");
-  w("Enable local embeddings by default (`EMBEDDING_PROVIDER=local` or install `@xenova/transformers`).");
-  w("This gives agentmemory genuine semantic search that built-in agent memories cannot match —");
-  w("understanding that \"database performance optimization\" relates to \"N+1 query fix\" and \"eager loading\".");
-  w("");
-
-  w("---");
-  w(`*All measurements use Xenova/all-MiniLM-L6-v2 local embeddings (384 dimensions, no API calls).*`);
+  w(
+    "Graph should only be re-enabled in production if it adds at least " +
+      "+3.0 absolute Recall@10 points on this 100-query-or-larger fixture " +
+      "and returns relevant connected results on at least 16 of 20 hand-checked graph probes.",
+  );
+  w(
+    `Current run: ${(evidence.recallDelta * 100).toFixed(1)} Recall@10 points, ` +
+      `${evidence.connectedProbeHits}/20 probes - ` +
+      `${evidence.recallDelta >= 0.03 && evidence.connectedProbeHits >= 16 ? "PASS" : "HOLD"}.`,
+  );
 
   return lines.join("\n");
 }
 
-async function main() {
+async function main(): Promise<void> {
   console.log("=== agentmemory Real Embeddings Benchmark ===\n");
 
   console.log("Loading Xenova/all-MiniLM-L6-v2 model (first run downloads ~80MB)...");
-  let provider: EmbeddingProvider;
+  const provider = new LocalEmbeddingProvider();
   try {
-    provider = new LocalEmbeddingProvider();
     const testEmbed = await provider.embed("test");
     console.log(`Model loaded. Dimensions: ${testEmbed.length}\n`);
   } catch (err) {
     console.error("Failed to load Xenova model:", err);
     console.error("Install with: npm install @xenova/transformers");
-    process.exit(1);
+    throw err;
   }
 
-  const { observations, queries } = generateDataset();
-  console.log(`Dataset: ${observations.length} observations, ${queries.length} queries\n`);
+  const { observations, queries, sessions, graphLinks } = generateDataset();
+  assert(queries.length >= 100, "Benchmark requires at least 100 labeled queries");
+  assert.equal(graphLinks.length, 20);
+  const graphSnapshot = buildBenchmarkGraphSnapshot(observations, graphLinks);
+  assert.equal(graphSnapshot.stats.totalNodes, graphLinks.length * 2);
+  assert.equal(graphSnapshot.stats.totalEdges, graphLinks.length);
+  console.log(
+    `Dataset: ${BENCHMARK_DATASET_VERSION}, ${observations.length} observations, ` +
+      `${sessions.size} sessions, ${queries.length} queries\n`,
+  );
 
   console.log("1. Built-in (grep all)...");
   const builtinResult = await evalBuiltinGrep(observations, queries);
   console.log(`   Recall@10: ${pct(avg(builtinResult.results.map(q => q.recall_10)))}\n`);
 
   console.log("2. BM25-only (stemmed+synonyms)...");
-  const bm25Result = await evalSystem(
-    "BM25-only (stemmed+synonyms)",
-    observations, queries, null,
-    { bm25: 1.0, vector: 0, graph: 0 },
-  );
+  const bm25Result = await evalSystem({
+    name: "BM25-only (stemmed+synonyms)",
+    observations,
+    queries,
+    provider: null,
+    weights: { bm25: 1, vector: 0, graph: 0 },
+  });
   console.log(`   Recall@10: ${pct(avg(bm25Result.results.map(q => q.recall_10)))}\n`);
 
   console.log("3. Dual-stream (BM25 + real Xenova vectors)...");
-  const dualResult = await evalSystem(
-    "Dual-stream (BM25+Xenova)",
-    observations, queries, provider,
-    { bm25: 0.4, vector: 0.6, graph: 0 },
-  );
+  const dualResult = await evalSystem({
+    name: "Dual-stream (BM25+Xenova)",
+    observations,
+    queries,
+    provider,
+    weights: { bm25: 0.4, vector: 0.6, graph: 0 },
+  });
   console.log(`   Recall@10: ${pct(avg(dualResult.results.map(q => q.recall_10)))}\n`);
 
   console.log("4. Triple-stream (BM25 + Xenova + Graph)...");
-  const tripleResult = await evalSystem(
-    "Triple-stream (BM25+Xenova+Graph)",
-    observations, queries, provider,
-    { bm25: 0.4, vector: 0.6, graph: 0.3 },
-  );
+  const tripleResult = await evalSystem({
+    name: "Triple-stream (BM25+Xenova+Graph, graph weight 1.0)",
+    observations,
+    queries,
+    provider,
+    weights: { bm25: 0.4, vector: 0.6, graph: 1 },
+    graphSnapshot,
+    graphSearchEnabled: true,
+  });
   console.log(`   Recall@10: ${pct(avg(tripleResult.results.map(q => q.recall_10)))}\n`);
 
-  const report = generateReport(
-    [builtinResult, bm25Result, dualResult, tripleResult],
-    observations.length,
+  const zeroEntity = await runZeroEntityProbe(observations[0], graphSnapshot);
+  const evidence = validateGraphBenchmark(
+    dualResult,
+    tripleResult,
+    graphLinks,
+    zeroEntity.query,
+    zeroEntity.ids,
   );
+  console.log("Graph validity assertions: PASS");
+  console.log(`  Snapshot reads: ${tripleResult.snapshot_reads}`);
+  console.log(`  Proof query: ${evidence.proof.query}`);
+  console.log(`  Graph-only gold recovered: ${evidence.proof.graphOnlyObsId}`);
+  console.log(`  Dual top 10: ${evidence.dualIds.join(", ")}`);
+  console.log(`  Triple top 10: ${evidence.tripleIds.join(", ")}\n`);
+
+  const report = generateReport({
+    systems: [builtinResult, bm25Result, dualResult, tripleResult],
+    observationCount: observations.length,
+    sessionCount: sessions.size,
+    queryCount: queries.length,
+    triple: tripleResult,
+    evidence,
+  });
 
   writeFileSync("benchmark/REAL-EMBEDDINGS.md", report);
   console.log(report);
   console.log(`\nReport written to benchmark/REAL-EMBEDDINGS.md`);
 }
 
-main().catch(console.error);
+main().catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
+});

@@ -4,21 +4,182 @@ export interface LabeledQuery {
   query: string;
   relevantObsIds: string[];
   description: string;
-  category: "exact" | "semantic" | "temporal" | "cross-session" | "entity";
+  category:
+    | "exact"
+    | "semantic"
+    | "temporal"
+    | "cross-session"
+    | "entity"
+    | "graph";
 }
 
-const SESSION_COUNT = 30;
+export interface GraphBenchmarkLink {
+  query: string;
+  anchorEntity: string;
+  anchorObsId: string;
+  graphOnlyObsId: string;
+  targetNodeName: string;
+}
+
+export const BENCHMARK_DATASET_VERSION = "synthetic-graph-v2";
+
 const OBS_PER_SESSION = 8;
+const FIXTURE_EPOCH_MS = Date.parse("2026-06-01T00:00:00.000Z");
 
 function ts(daysAgo: number): string {
-  return new Date(Date.now() - daysAgo * 86400000).toISOString();
+  return new Date(FIXTURE_EPOCH_MS - daysAgo * 86400000).toISOString();
 }
+
+const GRAPH_PROBE_CASES = [
+  {
+    anchorEntity: "Asterion",
+    title: "Decorrelated jitter stabilized queue workers",
+    narrative: "Queue starvation stopped after retry timing switched from uniform delays to decorrelated jitter.",
+    concepts: ["retry-jitter", "queue-starvation"],
+    file: "src/worker/retry.ts",
+  },
+  {
+    anchorEntity: "Borealis",
+    title: "Checksum scrub repaired orphaned blobs",
+    narrative: "A background checksum scrub found detached object chunks and rebuilt their ownership records.",
+    concepts: ["checksum-scrub", "orphaned-blobs"],
+    file: "src/storage/scrub.ts",
+  },
+  {
+    anchorEntity: "Cygnus",
+    title: "Semaphore capped exporter fanout",
+    narrative: "A bounded semaphore stopped telemetry exporters from opening unbounded concurrent uploads.",
+    concepts: ["semaphore", "exporter-fanout"],
+    file: "src/telemetry/export.ts",
+  },
+  {
+    anchorEntity: "Daedalus",
+    title: "Monotonic clock fixed lease expiry",
+    narrative: "Lease expiration moved from wall time to a monotonic clock to survive system clock corrections.",
+    concepts: ["monotonic-clock", "lease-expiry"],
+    file: "src/coordination/leases.ts",
+  },
+  {
+    anchorEntity: "Equinox",
+    title: "Bounded channel absorbed telemetry backpressure",
+    narrative: "A bounded channel replaced an unbounded queue and shed low-value telemetry under sustained pressure.",
+    concepts: ["bounded-channel", "backpressure"],
+    file: "src/telemetry/buffer.ts",
+  },
+  {
+    anchorEntity: "Faraday",
+    title: "Radix tree replaced linear route scans",
+    narrative: "Route lookup moved from a linear array scan to a radix tree keyed by normalized path segments.",
+    concepts: ["radix-tree", "route-lookup"],
+    file: "src/router/index.ts",
+  },
+  {
+    anchorEntity: "Galileo",
+    title: "Idempotency key prevented duplicate invoices",
+    narrative: "Invoice creation now stores an idempotency key before charging so retries return the original result.",
+    concepts: ["idempotency-key", "duplicate-invoices"],
+    file: "src/billing/invoices.ts",
+  },
+  {
+    anchorEntity: "Helios",
+    title: "Write-ahead journal restored crashed workers",
+    narrative: "Workers replay a write-ahead journal after restart and resume from the last committed offset.",
+    concepts: ["write-ahead-journal", "crash-recovery"],
+    file: "src/worker/journal.ts",
+  },
+  {
+    anchorEntity: "Icarus",
+    title: "Token bucket smoothed webhook bursts",
+    narrative: "Webhook dispatch now drains through a token bucket instead of releasing an entire retry batch at once.",
+    concepts: ["token-bucket", "webhook-bursts"],
+    file: "src/webhooks/dispatch.ts",
+  },
+  {
+    anchorEntity: "Janus",
+    title: "Generation counter rejected stale cache writes",
+    narrative: "Cache writers attach a generation counter so delayed responses cannot overwrite newer values.",
+    concepts: ["generation-counter", "stale-cache-write"],
+    file: "src/cache/generation.ts",
+  },
+  {
+    anchorEntity: "Kepler",
+    title: "Snapshot isolation removed report drift",
+    narrative: "Long-running reports now read from one database snapshot instead of mixing rows from multiple commits.",
+    concepts: ["snapshot-isolation", "report-drift"],
+    file: "src/reports/query.ts",
+  },
+  {
+    anchorEntity: "Lyra",
+    title: "Bloom filter skipped cold shard reads",
+    narrative: "A per-shard bloom filter rejects impossible key lookups before opening cold storage segments.",
+    concepts: ["bloom-filter", "cold-shards"],
+    file: "src/storage/bloom.ts",
+  },
+  {
+    anchorEntity: "Meridian",
+    title: "Circuit breaker isolated a failing provider",
+    narrative: "Repeated provider timeouts now open a circuit and route requests to the healthy fallback.",
+    concepts: ["circuit-breaker", "provider-fallback"],
+    file: "src/providers/resilience.ts",
+  },
+  {
+    anchorEntity: "Nimbus",
+    title: "Content hash deduplicated repeated artifacts",
+    narrative: "Artifacts are keyed by a canonical content hash so repeated uploads reuse the existing object.",
+    concepts: ["content-hash", "artifact-deduplication"],
+    file: "src/artifacts/store.ts",
+  },
+  {
+    anchorEntity: "Oberon",
+    title: "Tombstone sweep removed dangling references",
+    narrative: "A bounded tombstone sweep deletes references whose source objects no longer exist.",
+    concepts: ["tombstone-sweep", "dangling-references"],
+    file: "src/storage/vacuum.ts",
+  },
+  {
+    anchorEntity: "Polaris",
+    title: "Per-tenant salt stopped cache key collisions",
+    narrative: "Cache keys now include a tenant-specific salt before hashing to prevent cross-tenant collisions.",
+    concepts: ["tenant-salt", "cache-collision"],
+    file: "src/cache/keys.ts",
+  },
+  {
+    anchorEntity: "Quasar",
+    title: "Compare-and-swap protected cursor updates",
+    narrative: "Concurrent consumers advance shared cursors with compare-and-swap instead of blind writes.",
+    concepts: ["compare-and-swap", "cursor-update"],
+    file: "src/streams/cursor.ts",
+  },
+  {
+    anchorEntity: "Rhea",
+    title: "Chunked compaction bounded memory spikes",
+    narrative: "Compaction processes fixed-size chunks and releases each buffer before loading the next one.",
+    concepts: ["chunked-compaction", "memory-spike"],
+    file: "src/storage/compact.ts",
+  },
+  {
+    anchorEntity: "Solstice",
+    title: "Deadline propagation stopped zombie requests",
+    narrative: "Request deadlines now propagate through every downstream call and cancel abandoned work.",
+    concepts: ["deadline-propagation", "zombie-requests"],
+    file: "src/http/deadline.ts",
+  },
+  {
+    anchorEntity: "Tethys",
+    title: "Canonical paths removed duplicate modules",
+    narrative: "Module paths are normalized before indexing so aliases resolve to one canonical file identity.",
+    concepts: ["canonical-path", "duplicate-modules"],
+    file: "src/modules/paths.ts",
+  },
+] as const;
 
 const RAW_SESSIONS: Array<{
   sessionRange: [number, number];
   daysAgoRange: [number, number];
   project: string;
-  observations: Array<Omit<CompressedObservation, "id" | "sessionId" | "timestamp">>;
+  observations: Array<
+    Omit<CompressedObservation, "id" | "sessionId" | "timestamp" | "sourceType">
+  >;
 }> = [
   {
     sessionRange: [0, 4],
@@ -116,9 +277,11 @@ export function generateDataset(): {
   observations: CompressedObservation[];
   queries: LabeledQuery[];
   sessions: Map<string, string[]>;
+  graphLinks: GraphBenchmarkLink[];
 } {
   const observations: CompressedObservation[] = [];
   const sessions = new Map<string, string[]>();
+  const graphLinks: GraphBenchmarkLink[] = [];
 
   for (const group of RAW_SESSIONS) {
     const [sStart, sEnd] = group.sessionRange;
@@ -140,6 +303,7 @@ export function generateDataset(): {
           id: obsId,
           sessionId,
           timestamp: ts(daysAgo - hourOffset / 24),
+          sourceType: "synthetic-benchmark",
           ...raw,
         });
         obsIds.push(obsId);
@@ -148,7 +312,53 @@ export function generateDataset(): {
     }
   }
 
-  const queries: LabeledQuery[] = [
+  for (const [index, probe] of GRAPH_PROBE_CASES.entries()) {
+    const suffix = index.toString().padStart(2, "0");
+    const sessionId = `ses_graph_${suffix}`;
+    const anchorObsId = `obs_graph_anchor_${suffix}`;
+    const graphOnlyObsId = `obs_graph_target_${suffix}`;
+    const query = `What hidden follow-up is connected to Project ${probe.anchorEntity}?`;
+    observations.push(
+      {
+        id: anchorObsId,
+        sessionId,
+        timestamp: ts(40 - index),
+        sourceType: "synthetic-benchmark",
+        type: "discovery",
+        title: `Project ${probe.anchorEntity} checkpoint`,
+        subtitle: "Synthetic graph benchmark anchor",
+        facts: [`${probe.anchorEntity} names the graph anchor for probe ${suffix}`],
+        narrative: `Recorded a synthetic checkpoint for Project ${probe.anchorEntity}.`,
+        concepts: ["graph-anchor", probe.anchorEntity.toLowerCase()],
+        files: [],
+        importance: 5,
+      },
+      {
+        id: graphOnlyObsId,
+        sessionId,
+        timestamp: ts(39 - index),
+        sourceType: "synthetic-benchmark",
+        type: "decision",
+        title: probe.title,
+        subtitle: "Synthetic graph-only gold",
+        facts: [probe.narrative],
+        narrative: probe.narrative,
+        concepts: [...probe.concepts],
+        files: [probe.file],
+        importance: 8,
+      },
+    );
+    sessions.set(sessionId, [anchorObsId, graphOnlyObsId]);
+    graphLinks.push({
+      query,
+      anchorEntity: probe.anchorEntity,
+      anchorObsId,
+      graphOnlyObsId,
+      targetNodeName: probe.title,
+    });
+  }
+
+  const seedQueries: LabeledQuery[] = [
     {
       query: "How did we set up authentication?",
       relevantObsIds: observations.filter(o => o.concepts.some(c => ["nextauth", "authentication", "oauth", "jwt", "login", "signup"].includes(c))).map(o => o.id),
@@ -271,7 +481,40 @@ export function generateDataset(): {
     },
   ];
 
-  return { observations, queries, sessions };
+  const queries = seedQueries.flatMap((seed) => {
+    const subject = seed.query.replace(/\?$/, "").toLowerCase();
+    return [
+      seed,
+      {
+        ...seed,
+        query: `Find memories about ${subject}`,
+        description: `${seed.description}. Gold is unchanged for this synthetic paraphrase.`,
+      },
+      {
+        ...seed,
+        query: `Recall implementation details for ${subject}`,
+        description: `${seed.description}. Gold is unchanged for this implementation-focused paraphrase.`,
+      },
+      {
+        ...seed,
+        query: `Which sessions mention ${subject}?`,
+        description: `${seed.description}. Gold is unchanged for this cross-session paraphrase.`,
+      },
+    ];
+  });
+
+  for (const link of graphLinks) {
+    queries.push({
+      query: link.query,
+      relevantObsIds: [link.anchorObsId, link.graphOnlyObsId],
+      description:
+        `Gold contains the named anchor ${link.anchorObsId} and connected target ` +
+        `${link.graphOnlyObsId}; the target intentionally shares no query terms and is relevant only through the fixture edge.`,
+      category: "graph",
+    });
+  }
+
+  return { observations, queries, sessions, graphLinks };
 }
 
 export function generateScaleDataset(count: number): CompressedObservation[] {
