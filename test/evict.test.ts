@@ -15,10 +15,8 @@ vi.mock("../src/logger.js", () => ({
 type Store = Map<string, Map<string, unknown>>;
 type Handler = (payload: unknown) => unknown | Promise<unknown>;
 
-const ORIGINAL_ENV = { ...process.env };
-
 afterEach(() => {
-  process.env = { ...ORIGINAL_ENV };
+  vi.unstubAllEnvs();
 });
 
 function daysAgo(days: number): string {
@@ -51,6 +49,7 @@ function makeObservation(sessionId: string): CompressedObservation {
     id: "obs_1",
     sessionId,
     timestamp: daysAgo(31),
+    sourceType: "post_tool_use",
     type: "decision",
     title: "Chose sqlite storage",
     facts: ["Use sqlite for local state"],
@@ -136,6 +135,45 @@ function storeForObservedSession(sessionId: string): Store {
 }
 
 describe("mem::evict stale sessions", () => {
+  it("deletes an expired observation's retained raw payload", async () => {
+    const sessionId = "ses_expired_raw";
+    const session = makeSession(sessionId);
+    session.startedAt = daysAgo(120);
+    const observation = makeObservation(sessionId);
+    observation.timestamp = daysAgo(100);
+    observation.importance = 2;
+    const rawPayload = makeRawObservation(sessionId);
+    rawPayload.id = observation.id;
+    const store = new Map([
+      [KV.sessions, new Map([[session.id, session]])],
+      [
+        KV.summaries,
+        new Map([
+          [
+            session.id,
+            {
+              sessionId: session.id,
+              project: session.project,
+              createdAt: daysAgo(100),
+            },
+          ],
+        ]),
+      ],
+      [KV.observations(session.id), new Map([[observation.id, observation]])],
+      [KV.rawPayloads, new Map([[rawPayload.id, rawPayload]])],
+      [KV.config, new Map()],
+      [KV.audit, new Map()],
+    ]);
+    const kv = mockKV(store);
+    const { sdk } = mockSdk();
+    registerEvictFunction(sdk as never, kv as never);
+
+    await sdk.trigger({ function_id: "mem::evict", payload: {} });
+
+    expect(await kv.get(KV.observations(sessionId), observation.id)).toBeNull();
+    expect(await kv.get(KV.rawPayloads, rawPayload.id)).toBeNull();
+  });
+
   it("runs session recovery before deleting a stale observed session", async () => {
     const sessionId = "ses_stale";
     const store = storeForObservedSession(sessionId);
@@ -185,10 +223,18 @@ describe("mem::evict stale sessions", () => {
     let evictSettled = false;
     let summarySawSession = false;
 
-    process.env.GRAPH_EXTRACTION_ENABLED = "false";
+    vi.stubEnv("GRAPH_EXTRACTION_ENABLED", "false");
     registerEventTriggers(sdk as never, kv as never);
     registerEvictFunction(sdk as never, kv as never);
-    sdk.registerFunction("mem::summarize", async (payload: { sessionId: string }) => {
+    sdk.registerFunction("mem::summarize", async (payload) => {
+      if (
+        !payload ||
+        typeof payload !== "object" ||
+        !("sessionId" in payload) ||
+        typeof payload.sessionId !== "string"
+      ) {
+        return { success: false, error: "sessionId is required" };
+      }
       enteredSummary.resolve();
       await allowSummary.promise;
       summarySawSession = (await kv.get(KV.sessions, payload.sessionId)) !== null;

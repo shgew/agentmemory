@@ -203,6 +203,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
             obsId,
           );
           await kv.delete(KV.observations(data.sessionId), obsId);
+          await kv.delete(KV.rawPayloads, obsId);
           if (obs?.imageData) await decrementImageRef(kv, sdk, obs.imageData);
           if (obs?.imageRef && obs.imageRef !== obs.imageData) {
             await decrementImageRef(kv, sdk, obs.imageRef);
@@ -224,6 +225,7 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
         );
         for (const obs of observations) {
           await kv.delete(KV.observations(data.sessionId), obs.id);
+          await kv.delete(KV.rawPayloads, obs.id);
           if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
           if (obs.imageRef && obs.imageRef !== obs.imageData) {
             await decrementImageRef(kv, sdk, obs.imageRef);
@@ -232,6 +234,18 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           vectorIndexRemove(obs.id);
           deletedObservationIds.push(obs.id);
           deleted++;
+        }
+        const rawPayloads = (
+          await kv.list<{ id: string; sessionId: string }>(KV.rawPayloads)
+        ).filter((raw) => raw.sessionId === data.sessionId);
+        const deletedIds = new Set(deletedObservationIds);
+        for (const raw of rawPayloads) {
+          if (!deletedIds.has(raw.id)) {
+            await kv.delete(KV.rawPayloads, raw.id);
+            deletedObservationIds.push(raw.id);
+            deletedIds.add(raw.id);
+            deleted++;
+          }
         }
         await kv.delete(KV.sessions, data.sessionId);
         await kv.delete(KV.summaries, data.sessionId);

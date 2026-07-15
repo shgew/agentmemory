@@ -167,6 +167,7 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
               let deletedOk = false;
               try {
                 await kv.delete(KV.observations(sessions[i].id), obs.id);
+                await kv.delete(KV.rawPayloads, obs.id);
                 deletedOk = true;
               } catch {
                 deletedOk = false;

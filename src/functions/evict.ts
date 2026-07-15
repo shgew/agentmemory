@@ -120,6 +120,11 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
         .list<SessionSummary>(KV.summaries)
         .catch(() => []);
       const summaryIds = new Set(summaries.map((s) => s.sessionId));
+      const retainedRawSessionIds = new Set(
+        (await kv.list<RawObservation>(KV.rawPayloads).catch(() => [])).map(
+          (raw) => raw.sessionId,
+        ),
+      );
 
       for (const session of sessions) {
         if (!session.startedAt) continue;
@@ -141,7 +146,6 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
                 return null;
               });
             if (!observations) continue;
-
             let recovered = false;
             const hasCompressedObservations = observations.some(
               isCompressedObservation,
@@ -150,7 +154,10 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
               recovered = await recoverStaleSession(sdk, session.id);
               if (!recovered) continue;
               recoveredStaleSessions++;
-            } else if (observations.length > 0) {
+            } else if (
+              observations.length > 0 ||
+              retainedRawSessionIds.has(session.id)
+            ) {
               logger.warn("Stale session has no compressed observations", {
                 sessionId: session.id,
               });
@@ -203,6 +210,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
             } else {
               try {
                 await kv.delete(KV.observations(session.id), o.id);
+                await kv.delete(KV.rawPayloads, o.id);
                 stats.lowImportanceObs++;
               } catch (err) {
                 logger.warn("Eviction delete failed", {
@@ -248,6 +256,7 @@ export function registerEvictFunction(sdk: ISdk, kv: StateKV): void {
             for (const o of toEvict) {
               try {
                 await kv.delete(KV.observations(o.sessionId), o.id);
+                await kv.delete(KV.rawPayloads, o.id);
                 stats.capEvictions++;
               } catch (err) {
                 logger.warn("Eviction delete failed", {
