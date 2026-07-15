@@ -5,7 +5,6 @@ import type { ISdk } from "iii-sdk";
 import type {
   CompressedObservation,
   Crystal,
-  Lesson,
   RawObservation,
   Session,
 } from "../types.js";
@@ -18,6 +17,7 @@ import { buildSyntheticCompression } from "./compress-synthetic.js";
 import { getSearchIndex } from "./search.js";
 import { logger } from "../logger.js";
 import { isAfter, laterTimestamp } from "../state/timestamp-compare.js";
+import { saveLesson } from "./lesson-state.js";
 
 export const MAX_FILES_DEFAULT = 200;
 export const MAX_FILES_UPPER_BOUND = 1000;
@@ -114,49 +114,20 @@ async function deriveCrystalAndLessons(
   const lessonEntries = Array.from(lessonMatches.values()).slice(0, 20);
   const lessonIds: string[] = [];
   for (const content of lessonEntries) {
-    // Content-addressed ID so re-importing the same JSONL does not
-    // duplicate lessons. fingerprintId hashes the normalized content,
-    // giving a stable lesson_xxx for identical text.
-    const lessonId = fingerprintId("lesson", content.trim().toLowerCase());
     try {
-      const existing = await kv.get<Lesson>(KV.lessons, lessonId);
-      if (existing) {
-        const existingSources = existing.sourceIds || [];
-        const mergedSources = existingSources.includes(sessionId)
-          ? existingSources
-          : [...existingSources, sessionId];
-        const existingTags = existing.tags || [];
-        const mergedTags = existingTags.includes("auto-import")
-          ? existingTags
-          : [...existingTags, "auto-import"];
-        const merged: Lesson = {
-          ...existing,
-          sourceIds: mergedSources,
-          tags: mergedTags,
-          reinforcements: (existing.reinforcements || 0) + 1,
-          updatedAt: createdAt,
-          lastReinforcedAt: createdAt,
-        };
-        await kv.set(KV.lessons, lessonId, merged);
-      } else {
-        const lesson: Lesson = {
-          id: lessonId,
-          content,
-          context: firstPrompt || project,
-          confidence: 0.4,
-          reinforcements: 0,
-          source: "consolidation",
-          sourceIds: [sessionId],
-          project,
-          tags: ["auto-import"],
-          createdAt,
-          updatedAt: createdAt,
-          decayRate: 0.05,
-        };
-        await kv.set(KV.lessons, lessonId, lesson);
-      }
-      lessonIds.push(lessonId);
-    } catch {}
+      const result = await saveLesson(kv, {
+        content,
+        context: firstPrompt || project,
+        confidence: 0.4,
+        project,
+        tags: ["auto-import"],
+        source: "consolidation",
+        sourceIds: [sessionId],
+      });
+      if (result.success) lessonIds.push(result.lesson.id);
+    } catch {
+      continue;
+    }
   }
 
   // Content-addressed on sessionId so re-importing the same session
