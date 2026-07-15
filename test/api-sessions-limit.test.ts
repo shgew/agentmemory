@@ -40,7 +40,7 @@ function mockSdk() {
       },
     ),
     registerTrigger: vi.fn(),
-    trigger: vi.fn(),
+    trigger: vi.fn(async () => ({ context: "" })),
     getFunction: (id: string) => functions.get(id),
   };
 }
@@ -98,6 +98,116 @@ describe("api::sessions limit + recency", () => {
     for (const old of ["s0", "s1", "s2", "s3", "s4"]) {
       expect(ids.has(old)).toBe(true);
     }
+  });
+
+  it("stores parentID as parentSessionId on session start", async () => {
+    const fn = sdk.getFunction("api::session::start")!;
+    await fn({
+      body: {
+        sessionId: "child-session",
+        project: "/tmp/p",
+        cwd: "/tmp/p",
+        parentID: "parent-session",
+      },
+      headers: {},
+      query_params: {},
+    });
+
+    const stored = await kv.get<Session & { parentSessionId?: string }>(
+      KV.sessions,
+      "child-session",
+    );
+    expect(stored?.parentSessionId).toBe("parent-session");
+  });
+
+  it("excludes child sessions from default listing", async () => {
+    await kv.set(KV.sessions, "parent-session", session("parent-session", 1));
+    await kv.set(KV.sessions, "child-session", {
+      ...session("child-session", 2),
+      parentSessionId: "parent-session",
+    });
+
+    const fn = sdk.getFunction("api::sessions")!;
+    const res = (await fn(reqWithLimit())) as SessionsResponse;
+
+    expect(res.body.sessions.map((item) => item.id)).toEqual(["parent-session"]);
+  });
+
+  it("includes child sessions when includeSubagents=true", async () => {
+    await kv.set(KV.sessions, "parent-session", session("parent-session", 1));
+    await kv.set(KV.sessions, "child-session", {
+      ...session("child-session", 2),
+      parentSessionId: "parent-session",
+    });
+
+    const fn = sdk.getFunction("api::sessions")!;
+    const res = (await fn({
+      ...reqWithLimit(),
+      query_params: { includeSubagents: "true" },
+    })) as SessionsResponse;
+
+    expect(res.body.sessions.map((item) => item.id)).toEqual([
+      "child-session",
+      "parent-session",
+    ]);
+  });
+
+  it("skips forced full consolidation and auto-crystallize for child sessions", async () => {
+    await kv.set(KV.sessions, "child-session", {
+      ...session("child-session", 2),
+      parentSessionId: "parent-session",
+    });
+
+    const pipeline = sdk.getFunction("api::consolidate-pipeline")!;
+    const crystals = sdk.getFunction("api::auto-crystallize")!;
+    const request = {
+      body: { sessionId: "child-session", tier: "all", force: true },
+      headers: {},
+      query_params: {},
+    };
+    const pipelineResponse = await pipeline(request);
+    const crystalResponse = await crystals(request);
+
+    expect(pipelineResponse.body).toMatchObject({
+      success: true,
+      skipped: true,
+      reason: "subagent_session",
+    });
+    expect(crystalResponse.body).toMatchObject({
+      success: true,
+      skipped: true,
+      reason: "subagent_session",
+    });
+    expect(sdk.trigger).not.toHaveBeenCalledWith(
+      expect.objectContaining({ function_id: "mem::consolidate-pipeline" }),
+    );
+    expect(sdk.trigger).not.toHaveBeenCalledWith(
+      expect.objectContaining({ function_id: "mem::auto-crystallize" }),
+    );
+  });
+
+  it("keeps legacy forced consolidation full when sessionId is missing", async () => {
+    const pipeline = sdk.getFunction("api::consolidate-pipeline")!;
+    const crystals = sdk.getFunction("api::auto-crystallize")!;
+    await pipeline({
+      body: { tier: "all", force: true },
+      headers: {},
+      query_params: {},
+    });
+    await crystals({
+      body: { olderThanDays: 7 },
+      headers: {},
+      query_params: {},
+    });
+
+    expect(sdk.trigger).toHaveBeenCalledWith({
+      function_id: "mem::consolidate-pipeline",
+      payload: { tier: "all", force: true },
+    });
+    expect(sdk.trigger).toHaveBeenCalledWith({
+      function_id: "mem::auto-crystallize",
+      payload: { olderThanDays: 7 },
+    });
   });
 
   it("honors an explicit limit", async () => {

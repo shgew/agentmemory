@@ -119,6 +119,13 @@ function asNonEmptyString(value: unknown): string | null {
   return trimmed ? trimmed : null;
 }
 
+async function isSubagentSession(kv: StateKV, value: unknown): Promise<boolean> {
+  const sessionId = asNonEmptyString(value);
+  if (!sessionId) return false;
+  const session = await kv.get<Session>(KV.sessions, sessionId);
+  return Boolean(session?.parentSessionId);
+}
+
 function parseOptionalFiniteNumber(value: unknown): number | undefined | null {
   if (value === undefined || value === null) return undefined;
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
@@ -597,6 +604,7 @@ export function registerApiTriggers(
         };
       }
       const title = typeof body.title === "string" ? body.title.trim() : undefined;
+      const parentSessionId = asNonEmptyString(body.parentID);
       // allow session/start to override AGENT_ID from request body
       // (multi-agent runtimes that route many roles through one server
       // process). Falls back to the AGENT_ID env on the server.
@@ -612,6 +620,7 @@ export function registerApiTriggers(
         startedAt: new Date().toISOString(),
         status: "active",
         observationCount: 0,
+        ...(parentSessionId ? { parentSessionId } : {}),
         ...(title ? { summary: title.slice(0, 200) } : {}),
         ...(title ? { firstPrompt: title.slice(0, 200) } : {}),
         ...(agentId ? { agentId } : {}),
@@ -903,6 +912,7 @@ export function registerApiTriggers(
       if (authErr) return authErr;
       const rawLimit = parseOptionalInt(req.query_params?.["limit"]);
       const sessions = await kv.list<Session>(KV.sessions);
+      const includeSubagents = req.query_params?.["includeSubagents"] === "true";
       const normalizedAgentId =
         typeof req.query_params?.["agentId"] === "string"
           ? req.query_params["agentId"].trim()
@@ -914,9 +924,12 @@ export function registerApiTriggers(
         ? undefined
         : explicitAgentId ??
           (isAgentScopeIsolated() ? getAgentId() : undefined);
-      const filtered = filterAgentId
+      const agentFiltered = filterAgentId
         ? sessions.filter((s) => s.agentId === filterAgentId)
         : sessions;
+      const filtered = includeSubagents
+        ? agentFiltered
+        : agentFiltered.filter((session) => !session.parentSessionId);
       const recencyKey = (s: Session): string =>
         [s.updatedAt, s.endedAt, s.lastCheckpointAt, s.startedAt].reduce(
           (acc: string, t) => (typeof t === "string" && t > acc ? t : acc),
@@ -1836,8 +1849,15 @@ export function registerApiTriggers(
     async (req: ApiRequest<{ tier?: string }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const body = (req.body ?? {}) as Record<string, unknown>;
       try {
-        const result = await sdk.trigger({ function_id: "mem::consolidate-pipeline", payload: req.body || {},
+        if (await isSubagentSession(kv, body.sessionId)) {
+          return {
+            status_code: 200,
+            body: { success: true, skipped: true, reason: "subagent_session" },
+          };
+        }
+        const result = await sdk.trigger({ function_id: "mem::consolidate-pipeline", payload: body,
          });
         return { status_code: 200, body: result };
       } catch {
@@ -3222,8 +3242,14 @@ export function registerApiTriggers(
   sdk.registerFunction("api::auto-crystallize",  async (req: ApiRequest) => {
     const denied = checkAuth(req, secret);
     if (denied) return denied;
-    const body = req.body as Record<string, unknown>;
-    const result = await sdk.trigger({ function_id: "mem::auto-crystallize", payload: body || {} });
+    const body = (req.body ?? {}) as Record<string, unknown>;
+    if (await isSubagentSession(kv, body.sessionId)) {
+      return {
+        status_code: 200,
+        body: { success: true, skipped: true, reason: "subagent_session" },
+      };
+    }
+    const result = await sdk.trigger({ function_id: "mem::auto-crystallize", payload: body });
     return { status_code: 200, body: result };
   });
   sdk.registerTrigger({ type: "http", function_id: "api::auto-crystallize", config: { api_path: "/agentmemory/crystals/auto", http_method: "POST" } });

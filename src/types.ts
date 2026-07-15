@@ -1,5 +1,6 @@
 export interface Session {
   id: string;
+  parentSessionId?: string;
   project: string;
   cwd: string;
   startedAt: string;
