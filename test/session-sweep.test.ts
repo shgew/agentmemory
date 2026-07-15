@@ -568,6 +568,28 @@ describe("Session Sweep - restart safety", () => {
     expect(triggerIdx).toBeLessThan(updateIdx);
   });
 
+  it("stale child session gets summary-only consolidation before finalization", async () => {
+    registerSuccessStubs();
+    const sessionId = "ses_child_sweep";
+    await kv.set(SESSIONS_SCOPE, sessionId, makeSession({
+      id: sessionId,
+      parentSessionId: "ses_parent",
+      startedAt: new Date(Date.now() - 10 * 60 * 60 * 1000).toISOString(),
+    }));
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: [sessionId] },
+    })) as { swept: string[]; failed: Array<{ sessionId: string }> };
+
+    expect(result.swept).toContain(sessionId);
+    expect(result.failed).toHaveLength(0);
+    const ids = sdk.triggerCalls.map((call) => call.function_id);
+    expect(ids).toContain("mem::summarize");
+    expect(ids).not.toContain("mem::slot-reflect");
+    expect(ids).not.toContain("mem::graph-extract");
+  });
+
   it("active sweep: crashing summarize leaves KV untouched and routes session to failed", async () => {
     sdk.registerFunction("mem::summarize", async () => {
       throw new Error("simulated pipeline failure");

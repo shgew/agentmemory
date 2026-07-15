@@ -165,6 +165,7 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
                     since: currentWatermark,
                     until: currentAnchor,
                     waitForCompletion: true,
+                    summaryOnly: Boolean(current.parentSessionId),
                   },
                 });
                 await kv.update<Session>(KV.sessions, session.id, [
@@ -193,6 +194,7 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
                     since: currentWatermark,
                     until: currentAnchor,
                     waitForCompletion: true,
+                    summaryOnly: Boolean(current.parentSessionId),
                   },
                 });
                 await kv.update<Session>(KV.sessions, session.id, [
@@ -216,6 +218,7 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
                     reason: "sweep-stale",
                     until: currentAnchor,
                     waitForCompletion: true,
+                    summaryOnly: Boolean(current.parentSessionId),
                   },
                 });
               }
