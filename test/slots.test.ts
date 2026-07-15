@@ -1,6 +1,9 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { registerSlotsFunctions, DEFAULT_SLOTS, listPinnedSlots, renderPinnedContext } from "../src/functions/slots.js";
 import { KV } from "../src/state/schema.js";
+import type { Session } from "../src/types.js";
+
+const PROJECT = "test-project";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -37,11 +40,25 @@ function wire() {
 
 async function waitForSeed(kv: ReturnType<typeof mockKV>) {
   for (let i = 0; i < 20; i++) {
-    const p = await kv.list(KV.slots);
     const g = await kv.list(KV.globalSlots);
-    if (p.length + g.length >= DEFAULT_SLOTS.length) return;
+    if (g.length >= 3) return;
     await new Promise((r) => setTimeout(r, 5));
   }
+}
+
+async function seedSession(
+  kv: ReturnType<typeof mockKV>,
+  sessionId: string,
+): Promise<void> {
+  const timestamp = new Date().toISOString();
+  await kv.set(KV.sessions, sessionId, {
+    id: sessionId,
+    project: PROJECT,
+    cwd: "/tmp/test-project",
+    startedAt: timestamp,
+    status: "active",
+    observationCount: 0,
+  } satisfies Session);
 }
 
 describe("slots — primitive", () => {
@@ -53,13 +70,20 @@ describe("slots — primitive", () => {
     await waitForSeed(kv);
   });
 
-  it("seeds default slots into the right scopes on first run", async () => {
+  it("seeds global defaults at startup and project defaults on first access", async () => {
     const global = (await kv.list(KV.globalSlots)) as Array<{ label: string }>;
-    const project = (await kv.list(KV.slots)) as Array<{ label: string }>;
+    const beforeAccess = await kv.list(KV.slots);
     expect(global.map((s) => s.label).sort()).toEqual(
       ["persona", "tool_guidelines", "user_preferences"].sort(),
     );
-    expect(project.map((s) => s.label).sort().length).toBeGreaterThanOrEqual(5);
+    expect(beforeAccess).toHaveLength(0);
+
+    await handlers["mem::slot-list"]({ project: PROJECT });
+
+    const project = (await kv.list(KV.slots)) as Array<{ project?: string }>;
+    expect(project.filter((slot) => slot.project === PROJECT)).toHaveLength(
+      DEFAULT_SLOTS.filter((slot) => slot.scope === "project").length,
+    );
   });
 
   it("rejects labels with bad shape", async () => {
@@ -73,11 +97,12 @@ describe("slots — primitive", () => {
       label: "notes_todo",
       content: "hello",
       description: "scratchpad",
+      project: PROJECT,
     })) as { success: boolean; slot: { label: string; content: string } };
     expect(created.success).toBe(true);
     expect(created.slot.content).toBe("hello");
 
-    const fetched = (await handlers["mem::slot-get"]({ label: "notes_todo" })) as {
+    const fetched = (await handlers["mem::slot-get"]({ label: "notes_todo", project: PROJECT })) as {
       success: boolean;
       slot: { content: string };
     };
@@ -86,8 +111,8 @@ describe("slots — primitive", () => {
   });
 
   it("rejects duplicate create", async () => {
-    await handlers["mem::slot-create"]({ label: "scratch", content: "a" });
-    const dup = (await handlers["mem::slot-create"]({ label: "scratch", content: "b" })) as {
+    await handlers["mem::slot-create"]({ label: "scratch", content: "a", project: PROJECT });
+    const dup = (await handlers["mem::slot-create"]({ label: "scratch", content: "b", project: PROJECT })) as {
       success: boolean;
       error: string;
     };
@@ -96,10 +121,10 @@ describe("slots — primitive", () => {
   });
 
   it("append refuses writes that would blow the sizeLimit", async () => {
-    await handlers["mem::slot-create"]({ label: "tight", content: "", sizeLimit: 10 });
-    const ok = (await handlers["mem::slot-append"]({ label: "tight", text: "short" })) as { success: boolean };
+    await handlers["mem::slot-create"]({ label: "tight", content: "", sizeLimit: 10, project: PROJECT });
+    const ok = (await handlers["mem::slot-append"]({ label: "tight", text: "short", project: PROJECT })) as { success: boolean };
     expect(ok.success).toBe(true);
-    const tooBig = (await handlers["mem::slot-append"]({ label: "tight", text: "way too long for this slot" })) as {
+    const tooBig = (await handlers["mem::slot-append"]({ label: "tight", text: "way too long for this slot", project: PROJECT })) as {
       success: boolean;
       error: string;
     };
@@ -108,8 +133,8 @@ describe("slots — primitive", () => {
   });
 
   it("replace refuses content above sizeLimit", async () => {
-    await handlers["mem::slot-create"]({ label: "tiny", content: "", sizeLimit: 5 });
-    const res = (await handlers["mem::slot-replace"]({ label: "tiny", content: "exceeds" })) as {
+    await handlers["mem::slot-create"]({ label: "tiny", content: "", sizeLimit: 5, project: PROJECT });
+    const res = (await handlers["mem::slot-replace"]({ label: "tiny", content: "exceeds", project: PROJECT })) as {
       success: boolean;
       error: string;
     };
@@ -118,10 +143,10 @@ describe("slots — primitive", () => {
   });
 
   it("delete removes the slot", async () => {
-    await handlers["mem::slot-create"]({ label: "throwaway", content: "bye" });
-    const del = (await handlers["mem::slot-delete"]({ label: "throwaway" })) as { success: boolean };
+    await handlers["mem::slot-create"]({ label: "throwaway", content: "bye", project: PROJECT });
+    const del = (await handlers["mem::slot-delete"]({ label: "throwaway", project: PROJECT })) as { success: boolean };
     expect(del.success).toBe(true);
-    const get = (await handlers["mem::slot-get"]({ label: "throwaway" })) as { success: boolean };
+    const get = (await handlers["mem::slot-get"]({ label: "throwaway", project: PROJECT })) as { success: boolean };
     expect(get.success).toBe(false);
   });
 
@@ -135,10 +160,11 @@ describe("slots — primitive", () => {
       label: "persona",
       content: "project-override",
       scope: "project",
+      project: PROJECT,
     })) as { success: boolean };
     expect(createRes.success).toBe(true);
 
-    const res = (await handlers["mem::slot-get"]({ label: "persona" })) as {
+    const res = (await handlers["mem::slot-get"]({ label: "persona", project: PROJECT })) as {
       slot: { content: string };
       scope: string;
     };
@@ -150,6 +176,7 @@ describe("slots — primitive", () => {
     const tooBig = (await handlers["mem::slot-create"]({
       label: "oversize",
       sizeLimit: 99999,
+      project: PROJECT,
     })) as { success: boolean; error: string };
     expect(tooBig.success).toBe(false);
     expect(tooBig.error).toMatch(/sizeLimit must be/);
@@ -157,12 +184,14 @@ describe("slots — primitive", () => {
     const negative = (await handlers["mem::slot-create"]({
       label: "negative",
       sizeLimit: -1,
+      project: PROJECT,
     })) as { success: boolean; error: string };
     expect(negative.success).toBe(false);
 
     const nonInteger = (await handlers["mem::slot-create"]({
       label: "fractional",
       sizeLimit: 1.5,
+      project: PROJECT,
     })) as { success: boolean; error: string };
     expect(nonInteger.success).toBe(false);
   });
@@ -178,14 +207,14 @@ describe("slots — primitive", () => {
 
   it("listPinnedSlots returns only pinned slots with content", async () => {
     await handlers["mem::slot-append"]({ label: "persona", text: "helpful senior engineer" });
-    const pinned = await listPinnedSlots(kv as never);
+    const pinned = await listPinnedSlots(kv as never, PROJECT);
     expect(pinned.some((s) => s.label === "persona")).toBe(true);
     expect(pinned.every((s) => s.pinned && s.content.trim().length > 0)).toBe(true);
   });
 
   it("renderPinnedContext serialises slots into markdown", async () => {
     await handlers["mem::slot-append"]({ label: "persona", text: "senior eng" });
-    const pinned = await listPinnedSlots(kv as never);
+    const pinned = await listPinnedSlots(kv as never, PROJECT);
     const rendered = renderPinnedContext(pinned);
     expect(rendered).toContain("## persona");
     expect(rendered).toContain("senior eng");
@@ -202,6 +231,7 @@ describe("slots — reflect", () => {
   });
 
   it("no-ops when the session has no observations", async () => {
+    await seedSession(kv, "empty-session");
     const res = (await handlers["mem::slot-reflect"]({ sessionId: "empty-session" })) as {
       success: boolean;
       applied: number;
@@ -212,6 +242,7 @@ describe("slots — reflect", () => {
 
   it("keeps pending_items agent-curated (slot-reflect no longer auto-dumps TODOs) while still counting patterns", async () => {
     const sessionId = "sess_reflect";
+    await seedSession(kv, sessionId);
     const obsKey = KV.observations(sessionId);
     const base = {
       id: "obs1",
@@ -244,12 +275,12 @@ describe("slots — reflect", () => {
     expect(res.observationsReviewed).toBe(2);
     expect(res.applied).toBeGreaterThan(0);
 
-    const pending = (await handlers["mem::slot-get"]({ label: "pending_items" })) as {
+    const pending = (await handlers["mem::slot-get"]({ label: "pending_items", project: PROJECT })) as {
       slot: { content: string };
     };
     expect(pending.slot.content).toBe("");
 
-    const patterns = (await handlers["mem::slot-get"]({ label: "session_patterns" })) as {
+    const patterns = (await handlers["mem::slot-get"]({ label: "session_patterns", project: PROJECT })) as {
       slot: { content: string };
     };
     expect(patterns.slot.content).toMatch(/errors: 2/);
@@ -268,6 +299,7 @@ describe("slots — reflect windowing", () => {
 
   it("filters observations to (since, until] window before reflection", async () => {
     const sessionId = "sess_window";
+    await seedSession(kv, sessionId);
     const obsKey = KV.observations(sessionId);
     const t0 = "2026-01-01T10:00:00.000Z";
     const t1 = "2026-01-01T11:00:00.000Z";
@@ -295,7 +327,7 @@ describe("slots — reflect windowing", () => {
     expect(res.observationsReviewed).toBe(1);
     expect(res.applied).toBeGreaterThan(0);
 
-    const patterns = (await handlers["mem::slot-get"]({ label: "session_patterns" })) as {
+    const patterns = (await handlers["mem::slot-get"]({ label: "session_patterns", project: PROJECT })) as {
       slot: { content: string };
     };
     expect(patterns.slot.content).toMatch(/errors: 1/);
