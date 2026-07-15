@@ -109,6 +109,30 @@ describe("Governance Functions", () => {
     expect(remaining.length).toBe(3);
   });
 
+  it("governance-delete removes an observation and its retained raw payload", async () => {
+    await kv.set("mem:obs:ses_1", "obs_1", {
+      id: "obs_1",
+      sessionId: "ses_1",
+      title: "Edit auth",
+    });
+    await kv.set("mem:raw-payloads", "obs_1", {
+      id: "obs_1",
+      sessionId: "ses_1",
+      hookType: "post_tool_use",
+      raw: {},
+    });
+
+    const result = (await sdk.trigger("mem::governance-delete", {
+      memoryIds: ["obs_1"],
+      reason: "remove captured payload",
+    })) as { success: boolean; deleted: number };
+
+    expect(result.success).toBe(true);
+    expect(result.deleted).toBe(1);
+    expect(await kv.get("mem:obs:ses_1", "obs_1")).toBeNull();
+    expect(await kv.get("mem:raw-payloads", "obs_1")).toBeNull();
+  });
+
   it("governance-bulk deletes by type filter", async () => {
     const result = (await sdk.trigger("mem::governance-bulk", {
       type: ["pattern"],

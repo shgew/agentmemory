@@ -1,5 +1,11 @@
 import type { ISdk } from "iii-sdk";
-import type { Memory, GovernanceFilter, AuditEntry } from "../types.js";
+import type {
+  Memory,
+  GovernanceFilter,
+  AuditEntry,
+  CompressedObservation,
+  RawObservation,
+} from "../types.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit, safeAudit, queryAudit } from "./audit.js";
@@ -24,6 +30,29 @@ export function registerGovernanceFunction(sdk: ISdk, kv: StateKV): void {
         if (mem) {
           await kv.delete(KV.memories, id);
           await deleteAccessLog(kv, id);
+          getSearchIndex().remove(id);
+          vectorIndexRemove(id);
+          deleted++;
+          continue;
+        }
+
+        const raw = await kv.get<RawObservation>(KV.rawPayloads, id);
+        if (raw) {
+          const { decrementImageRef } = await import("./image-refs.js");
+          const observation = await kv.get<CompressedObservation>(
+            KV.observations(raw.sessionId),
+            id,
+          );
+          await kv.delete(KV.observations(raw.sessionId), id);
+          await kv.delete(KV.rawPayloads, id);
+          const imageRefs = new Set(
+            [observation?.imageData, observation?.imageRef, raw.imageData].filter(
+              (ref): ref is string => typeof ref === "string" && ref.length > 0,
+            ),
+          );
+          for (const imageRef of imageRefs) {
+            await decrementImageRef(kv, sdk, imageRef);
+          }
           getSearchIndex().remove(id);
           vectorIndexRemove(id);
           deleted++;
