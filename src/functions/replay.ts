@@ -52,8 +52,8 @@ function rawFromCompressed(obs: CompressedObservation): RawObservation {
     id: obs.id,
     sessionId: obs.sessionId,
     timestamp: obs.timestamp,
-    hookType: "post_tool_use",
-    toolName: undefined,
+    hookType: obs.sourceType || "post_tool_use",
+    toolName: obs.toolName,
     toolInput: undefined,
     toolOutput: undefined,
     userPrompt: obs.type === "conversation" ? obs.narrative : undefined,
@@ -198,10 +198,24 @@ async function loadObservations(
   kv: StateKV,
   sessionId: string,
 ): Promise<RawObservation[]> {
-  const rows = await kv.list<RawObservation | CompressedObservation>(
-    KV.observations(sessionId),
+  const [rows, retainedRawPayloads] = await Promise.all([
+    kv.list<RawObservation | CompressedObservation>(KV.observations(sessionId)),
+    kv.list<RawObservation>(KV.rawPayloads),
+  ]);
+  const rawById = new Map(
+    retainedRawPayloads
+      .filter((raw) => raw.sessionId === sessionId)
+      .map((raw) => [raw.id, raw]),
   );
-  return rows.map((r) => (isRawShape(r) ? r : rawFromCompressed(r as CompressedObservation)));
+  for (const row of rows) {
+    if (!rawById.has(row.id)) {
+      rawById.set(
+        row.id,
+        isRawShape(row) ? row : rawFromCompressed(row as CompressedObservation),
+      );
+    }
+  }
+  return [...rawById.values()];
 }
 
 async function findJsonlFiles(
@@ -441,6 +455,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           parsed.observations.map(async (obs) => {
             const synthetic = buildSyntheticCompression(obs);
             compressed.push(synthetic);
+            await kv.set(KV.rawPayloads, obs.id, obs);
             await kv.set(KV.observations(parsed.sessionId), obs.id, synthetic);
             searchIndex.add(synthetic);
           }),
