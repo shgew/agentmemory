@@ -49,6 +49,7 @@ function mockKV() {
       id: "obs_1",
       sessionId: "s",
       timestamp: new Date().toISOString(),
+      sourceType: "post_tool_use",
       type: "decision",
       title: "Chose sqlite storage",
       facts: ["Use sqlite for local state"],
@@ -59,6 +60,7 @@ function mockKV() {
     },
   ];
   return {
+    get: async <T>(): Promise<T | null> => null,
     list: async <T>(): Promise<T[]> => observations as unknown as T[],
   };
 }

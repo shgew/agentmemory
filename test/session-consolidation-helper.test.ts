@@ -84,6 +84,7 @@ function makeObs(id: string, sessionId: string, timestamp: string): CompressedOb
     id,
     sessionId,
     timestamp,
+    sourceType: "post_tool_use",
     type: "conversation",
     title: `obs ${id}`,
     facts: [],
@@ -143,6 +144,34 @@ describe("event::session::stopped + checkpoint pipeline", () => {
     expect(graphCall).toBeDefined();
     expect((graphCall!.payload as any).since).toBe(since);
     expect((graphCall!.payload as any).until).toBe(until);
+  });
+
+  it("summarizes child sessions without graph or slot reflection", async () => {
+    const sessionId = "ses_child_full";
+    await kv.set(KV.sessions, sessionId, {
+      id: sessionId,
+      project: "test",
+      cwd: "/tmp",
+      startedAt: "2026-01-01T09:00:00.000Z",
+      status: "active",
+      observationCount: 1,
+      parentSessionId: "ses_parent",
+    });
+    await kv.set(
+      KV.observations(sessionId),
+      "obs_child",
+      makeObs("obs_child", sessionId, "2026-01-01T10:00:00.000Z"),
+    );
+
+    await sdk.trigger({
+      function_id: "event::session::stopped",
+      payload: { sessionId, waitForCompletion: true },
+    });
+
+    const ids = sdk.calls.map((call) => call.function_id);
+    expect(ids).toContain("mem::summarize");
+    expect(ids).not.toContain("mem::slot-reflect");
+    expect(ids).not.toContain("mem::graph-extract");
   });
 
   it("event::session::checkpoint runs same consolidation as stopped via shared queue", async () => {

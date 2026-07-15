@@ -29,7 +29,7 @@ function consolidationConcurrency(): number {
 
 const consolidationLimit = consolidationConcurrency();
 
-type SessionStoppedPayload = { sessionId: string; since?: string; until?: string; waitForCompletion?: boolean; reason?: string };
+type SessionStoppedPayload = { sessionId: string; since?: string; until?: string; waitForCompletion?: boolean; reason?: string; summaryOnly?: boolean };
 type SessionStoppedQueued = { queued: true; sessionId: string; queueDepth: number };
 type QueuedSessionStopped = SessionStoppedQueued & { done: Promise<unknown> };
 
@@ -137,15 +137,20 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     since?: string;
     until?: string;
     reason?: string;
+    summaryOnly?: boolean;
   }): Promise<unknown> => {
-    const { sessionId, since, until, reason } = params;
+    const { sessionId, since, until, reason, summaryOnly } = params;
     // Idle checkpoints fire every few minutes for every active session and
     // only need the windowed graph-extract. Re-running the full-session
     // summarize on each one is the O(N^2) drain that lets the consolidation
     // backlog outpace intake. The final summary is produced on session stop
     // or end; until then the graph and raw observations stay current.
     const shouldSummarize = reason !== "idle-checkpoint";
-    const graphPromise: Promise<void> = isGraphExtractionEnabled()
+    const session = summaryOnly === undefined
+      ? await kv.get<Session>(KV.sessions, sessionId)
+      : null;
+    const runsFullConsolidation = !(summaryOnly ?? Boolean(session?.parentSessionId));
+    const graphPromise: Promise<void> = runsFullConsolidation && isGraphExtractionEnabled()
       ? (async () => {
           try {
             const observations = await kv.list<CompressedObservation>(
@@ -204,7 +209,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
       }
     }
 
-    if (!summarizeError && isReflectEnabled()) {
+    if (runsFullConsolidation && !summarizeError && isReflectEnabled()) {
       try {
         await sdk.trigger({
           function_id: "mem::slot-reflect",
@@ -231,7 +236,13 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("event::session::stopped", async (data: SessionStoppedPayload) => {
     const reason = data.reason ?? "stopped";
     const queued = enqueueSessionStopped(data.sessionId, reason, async () =>
-      runSessionConsolidation({ sessionId: data.sessionId, since: data.since, until: data.until, reason }),
+      runSessionConsolidation({
+        sessionId: data.sessionId,
+        since: data.since,
+        until: data.until,
+        reason,
+        summaryOnly: data.summaryOnly,
+      }),
     );
     return data.waitForCompletion ? queued.done : {
       queued: true,
@@ -248,7 +259,13 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("event::session::checkpoint", async (data: SessionStoppedPayload) => {
     const reason = data.reason ?? "checkpoint";
     const queued = enqueueSessionStopped(data.sessionId, reason, async () =>
-      runSessionConsolidation({ sessionId: data.sessionId, since: data.since, until: data.until, reason }),
+      runSessionConsolidation({
+        sessionId: data.sessionId,
+        since: data.since,
+        until: data.until,
+        reason,
+        summaryOnly: data.summaryOnly,
+      }),
     );
     return data.waitForCompletion ? queued.done : {
       queued: true,
