@@ -3328,6 +3328,21 @@ export function registerApiTriggers(
     const body = req.body as Record<string, unknown>;
     if (!body?.content || typeof body.content !== "string") return { status_code: 400, body: { error: "content is required" } };
     const tags = typeof body.tags === "string" ? (body.tags as string).split(",").map((t: string) => t.trim()).filter(Boolean) : Array.isArray(body.tags) ? body.tags : [];
+    let corrects: string[] | undefined;
+    if (typeof body.corrects === "string") {
+      corrects = body.corrects.split(",").map((id) => id.trim()).filter(Boolean);
+    } else if (Array.isArray(body.corrects)) {
+      corrects = [];
+      for (const id of body.corrects) {
+        if (typeof id !== "string") {
+          return { status_code: 400, body: { error: "corrects must contain lesson ids" } };
+        }
+        const trimmed = id.trim();
+        if (trimmed) corrects.push(trimmed);
+      }
+    } else if (body.corrects !== undefined) {
+      return { status_code: 400, body: { error: "corrects must contain lesson ids" } };
+    }
     const result = (await sdk.trigger({
       function_id: "mem::lesson-save",
       payload: {
@@ -3336,6 +3351,7 @@ export function registerApiTriggers(
         confidence: typeof body.confidence === "number" ? body.confidence : undefined,
         project: typeof body.project === "string" ? body.project : undefined,
         tags,
+        corrects,
         source: "manual",
       },
     })) as { action?: string };
