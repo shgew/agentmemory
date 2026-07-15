@@ -180,6 +180,9 @@ export interface ContextBlock {
   content: string;
   tokens: number;
   recency: number;
+  // Packing tier for mem::context. Higher packs first; blocks with the
+  // same priority fall back to recency. Defaults to 0 when unset.
+  priority?: number;
   sourceIds?: string[];
 }
 

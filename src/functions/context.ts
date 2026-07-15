@@ -39,6 +39,11 @@ export function registerContextFunction(
     async (data: { sessionId: string; project: string; budget?: number }) => {
       const budget = data.budget || tokenBudget;
       const blocks: ContextBlock[] = [];
+      const header = `<agentmemory-context project="${escapeXmlAttr(data.project)}">`;
+      const footer = `</agentmemory-context>`;
+      const wrapperTokens = estimateTokens(header) + estimateTokens(footer);
+      let slotBlockTokens = 0;
+      let profileBlockTokens = 0;
 
       const [pinnedSlots, profile, lessons] = await Promise.all([
         isSlotsEnabled()
@@ -52,11 +57,13 @@ export function registerContextFunction(
 
       const slotContent = renderPinnedContext(pinnedSlots);
       if (slotContent) {
+        slotBlockTokens = estimateTokens(slotContent);
         blocks.push({
           type: "memory",
           content: slotContent,
-          tokens: estimateTokens(slotContent),
+          tokens: slotBlockTokens,
           recency: Date.now(),
+          priority: 3,
         });
       }
       if (profile) {
@@ -87,11 +94,13 @@ export function registerContextFunction(
         }
         if (profileParts.length > 0) {
           const profileContent = `## Project Profile\n${profileParts.join("\n")}`;
+          profileBlockTokens = estimateTokens(profileContent);
           blocks.push({
             type: "memory",
             content: profileContent,
-            tokens: estimateTokens(profileContent),
+            tokens: profileBlockTokens,
             recency: new Date(profile.updatedAt).getTime(),
+            priority: 2,
           });
         }
       }
@@ -100,8 +109,7 @@ export function registerContextFunction(
       // Without this block, lessons sit in KV and only surface when the agent
       // thinks to call memory_lesson_recall. Ranking puts project-scoped
       // lessons ahead of global ones, then weights by confidence; we cap at
-      // 10 to keep the block bounded since the outer token-budget loop
-      // below will drop the whole block if it doesn't fit. #457.
+      // 10 before packing. #457.
       const relevantLessons = lessons
         .filter((l) => !l.deleted && (!l.project || l.project === data.project))
         .sort((a, b) => {
@@ -112,24 +120,71 @@ export function registerContextFunction(
         .slice(0, 10);
 
       if (relevantLessons.length > 0) {
-        const items = relevantLessons
-          .map(
-            (l) =>
-              `- (${l.confidence.toFixed(2)}) ${l.content}${l.context ? ` — ${l.context}` : ""}`,
-          )
-          .join("\n");
-        const lessonsContent = `## Lessons Learned\n${items}`;
-        const mostRecent = relevantLessons.reduce((acc, l) => {
-          const t = new Date(l.lastReinforcedAt || l.updatedAt).getTime();
-          return t > acc ? t : acc;
-        }, 0);
-        blocks.push({
-          type: "memory",
-          content: lessonsContent,
-          tokens: estimateTokens(lessonsContent),
-          recency: mostRecent,
-          sourceIds: relevantLessons.map((l) => l.id),
-        });
+        const lessonHeader = "## Lessons Learned";
+        const lines = relevantLessons.map(
+          (l) =>
+            `- (${l.confidence.toFixed(2)}) ${l.content}${l.context ? ` — ${l.context}` : ""}`,
+        );
+        const fullContent = `${lessonHeader}\n${lines.join("\n")}`;
+
+        // Capacity-aware packing. The lessons block used to be emitted whole,
+        // so a real corpus (up to 10 lessons of hundreds of tokens each) blew
+        // past the budget and was dropped wholesale by the packing loop below,
+        // starving lessons out of every session with recent activity. Reserve
+        // the tokens the higher-priority slots/profile blocks will actually
+        // consume, then keep the full block when it fits, else pack the
+        // highest-ranked lessons up to a soft sub-budget. #457 starvation fix.
+        let reservedBeforeLessons = wrapperTokens;
+        if (
+          slotBlockTokens > 0 &&
+          reservedBeforeLessons + slotBlockTokens <= budget
+        ) {
+          reservedBeforeLessons += slotBlockTokens;
+        }
+        if (
+          profileBlockTokens > 0 &&
+          reservedBeforeLessons + profileBlockTokens <= budget
+        ) {
+          reservedBeforeLessons += profileBlockTokens;
+        }
+        const lessonHardCap = budget - reservedBeforeLessons;
+        const lessonSoftCap = Math.min(
+          lessonHardCap,
+          Math.max(500, Math.floor(budget * 0.35)),
+        );
+
+        let included = relevantLessons;
+        let lessonsContent = fullContent;
+        if (estimateTokens(fullContent) > lessonHardCap) {
+          const chosen: Lesson[] = [];
+          const chosenLines: string[] = [];
+          let tokens = estimateTokens(lessonHeader);
+          for (let i = 0; i < relevantLessons.length; i++) {
+            const lineTokens = estimateTokens(`\n${lines[i]}`);
+            if (tokens + lineTokens > lessonSoftCap) continue;
+            chosen.push(relevantLessons[i]);
+            chosenLines.push(lines[i]);
+            tokens += lineTokens;
+          }
+          included = chosen;
+          lessonsContent =
+            chosen.length > 0 ? `${lessonHeader}\n${chosenLines.join("\n")}` : "";
+        }
+
+        if (included.length > 0 && lessonsContent) {
+          const mostRecent = included.reduce((acc, l) => {
+            const t = new Date(l.lastReinforcedAt || l.updatedAt).getTime();
+            return t > acc ? t : acc;
+          }, 0);
+          blocks.push({
+            type: "memory",
+            content: lessonsContent,
+            tokens: estimateTokens(lessonsContent),
+            recency: mostRecent,
+            priority: 1,
+            sourceIds: included.map((l) => l.id),
+          });
+        }
       }
 
       const allSessions = await kv.list<Session>(KV.sessions);
@@ -196,14 +251,17 @@ export function registerContextFunction(
         }
       }
 
-      blocks.sort((a, b) => b.recency - a.recency);
+      blocks.sort((a, b) => {
+        const pa = a.priority ?? 0;
+        const pb = b.priority ?? 0;
+        if (pb !== pa) return pb - pa;
+        return b.recency - a.recency;
+      });
 
       let usedTokens = 0;
       const selected: string[] = [];
       const accessedIds: string[] = [];
-      const header = `<agentmemory-context project="${escapeXmlAttr(data.project)}">`;
-      const footer = `</agentmemory-context>`;
-      usedTokens += estimateTokens(header) + estimateTokens(footer);
+      usedTokens += wrapperTokens;
 
       for (const block of blocks) {
         if (usedTokens + block.tokens > budget) continue;
