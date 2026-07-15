@@ -1,6 +1,6 @@
 import type { ISdk } from "iii-sdk";
 import type {
-  Session, CompressedObservation, SessionSummary, ContextBlock,
+  ContextBlock,
   ProjectProfile, MemorySlot, Lesson,
 } from "../types.js";
 import { KV } from "../state/schema.js";
@@ -9,6 +9,7 @@ import { recordAccessBatch } from "./access-tracker.js";
 import { logger } from "../logger.js";
 import { isSlotsEnabled, listPinnedSlots, renderPinnedContext } from "./slots.js";
 import { filterSupersededLessons } from "./lesson-state.js";
+import { buildSessionContextBlocks } from "./session-context.js";
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 3);
@@ -178,69 +179,7 @@ export function registerContextFunction(
         }
       }
 
-      const allSessions = await kv.list<Session>(KV.sessions);
-      const sessions = allSessions
-        .filter((s) => s.project === data.project && s.id !== data.sessionId)
-        .sort(
-          (a, b) =>
-            new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime(),
-        )
-        .slice(0, 10);
-
-      const summariesPerSession = await Promise.all(
-        sessions.map((s) =>
-          kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
-        ),
-      );
-
-      const sessionsNeedingObs: number[] = [];
-      for (let i = 0; i < sessions.length; i++) {
-        const summary = summariesPerSession[i];
-        if (summary) {
-          const content = `## ${summary.title}\n${summary.narrative}\nDecisions: ${summary.keyDecisions.join("; ")}\nFiles: ${summary.filesModified.join(", ")}`;
-          blocks.push({
-            type: "summary",
-            content,
-            tokens: estimateTokens(content),
-            recency: new Date(summary.createdAt).getTime(),
-          });
-        } else {
-          sessionsNeedingObs.push(i);
-        }
-      }
-
-      const obsResults = await Promise.all(
-        sessionsNeedingObs.map((i) =>
-          kv
-            .list<CompressedObservation>(KV.observations(sessions[i].id))
-            .catch(() => []),
-        ),
-      );
-
-      for (let j = 0; j < sessionsNeedingObs.length; j++) {
-        const i = sessionsNeedingObs[j];
-        const observations = obsResults[j];
-        const important = observations.filter(
-          (o) => o.title && o.importance >= 5,
-        );
-
-        if (important.length > 0) {
-          const top = important
-            .sort((a, b) => b.importance - a.importance)
-            .slice(0, 5);
-          const items = top
-            .map((o) => `- [${o.type}] ${o.title}: ${o.narrative}`)
-            .join("\n");
-          const content = `## Session ${sessions[i].id.slice(0, 8)} (${sessions[i].startedAt})\n${items}`;
-          blocks.push({
-            type: "observation",
-            content,
-            tokens: estimateTokens(content),
-            recency: new Date(sessions[i].startedAt).getTime(),
-            sourceIds: top.map((o) => o.id),
-          });
-        }
-      }
+      blocks.push(...(await buildSessionContextBlocks(kv, data)));
 
       blocks.sort((a, b) => {
         const pa = a.priority ?? 0;
