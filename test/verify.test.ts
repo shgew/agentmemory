@@ -5,8 +5,33 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerVerifyFunction } from "../src/functions/verify.js";
-import type { Memory, CompressedObservation, Session } from "../src/types.js";
+import type {
+  Memory,
+  CompressedObservation,
+  Lesson,
+  Session,
+} from "../src/types.js";
 import { mockKV, mockSdk } from "./helpers/mocks.js";
+
+function makeLesson(overrides: Partial<Lesson>): Lesson {
+  const now = "2026-03-01T00:00:00Z";
+  return {
+    id: overrides.id ?? "lsn_default",
+    content: overrides.content ?? "Default lesson",
+    context: overrides.context ?? "",
+    confidence: overrides.confidence ?? 0.7,
+    reinforcements: overrides.reinforcements ?? 0,
+    source: overrides.source ?? "manual",
+    sourceIds: overrides.sourceIds ?? [],
+    project: overrides.project,
+    tags: overrides.tags ?? [],
+    corrects: overrides.corrects,
+    createdAt: overrides.createdAt ?? now,
+    updatedAt: overrides.updatedAt ?? now,
+    decayRate: overrides.decayRate ?? 0.05,
+    deleted: overrides.deleted,
+  };
+}
 
 describe("Verify Function", () => {
   let sdk: ReturnType<typeof mockSdk>;
@@ -51,6 +76,7 @@ describe("Verify Function", () => {
       id: "obs_1",
       sessionId: "ses_1",
       timestamp: "2026-03-01T00:01:00Z",
+      sourceType: "post_tool_use",
       type: "decision",
       title: "Chose React over Vue",
       facts: ["React chosen for ecosystem"],
@@ -143,6 +169,7 @@ describe("Verify Function", () => {
       id: "obs_direct",
       sessionId: "ses_2",
       timestamp: "2026-03-01T00:01:00Z",
+      sourceType: "post_tool_use",
       type: "file_write",
       title: "Created index.ts",
       facts: ["Created file"],
@@ -203,5 +230,57 @@ describe("Verify Function", () => {
     expect(result.memory.version).toBe(2);
     expect(result.memory.parentId).toBe("mem_v1");
     expect(result.memory.supersedes).toEqual(["mem_v1"]);
+  });
+
+  it("verifies an obsolete lesson with its active correction chain", async () => {
+    await kv.set("mem:lessons", "lsn_v1", makeLesson({ id: "lsn_v1", project: "api" }));
+    await kv.set(
+      "mem:lessons",
+      "lsn_v2",
+      makeLesson({ id: "lsn_v2", project: "api", corrects: ["lsn_v1"] }),
+    );
+    await kv.set(
+      "mem:lessons",
+      "lsn_v3",
+      makeLesson({ id: "lsn_v3", project: "api", corrects: ["lsn_v2"] }),
+    );
+
+    const result = (await sdk.trigger("mem::verify", { id: "lsn_v1" })) as {
+      success: boolean;
+      type: string;
+      correctionChain: Array<{
+        lesson: { id: string };
+        hop: number;
+        direction: string;
+      }>;
+    };
+
+    expect(result.success).toBe(true);
+    expect(result.type).toBe("lesson");
+    expect(result.correctionChain).toEqual([
+      { lesson: expect.objectContaining({ id: "lsn_v2" }), hop: 1, direction: "correctedBy" },
+      { lesson: expect.objectContaining({ id: "lsn_v3" }), hop: 2, direction: "correctedBy" },
+    ]);
+  });
+
+  it("verifies a correcting lesson with the lessons it corrects", async () => {
+    await kv.set("mem:lessons", "lsn_v1", makeLesson({ id: "lsn_v1", project: "api" }));
+    await kv.set(
+      "mem:lessons",
+      "lsn_v2",
+      makeLesson({ id: "lsn_v2", project: "api", corrects: ["lsn_v1"] }),
+    );
+
+    const result = (await sdk.trigger("mem::verify", { id: "lsn_v2" })) as {
+      correctionChain: Array<{
+        lesson: { id: string };
+        hop: number;
+        direction: string;
+      }>;
+    };
+
+    expect(result.correctionChain).toEqual([
+      { lesson: expect.objectContaining({ id: "lsn_v1" }), hop: 1, direction: "corrects" },
+    ]);
   });
 });

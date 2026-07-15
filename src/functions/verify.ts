@@ -4,8 +4,10 @@ import { KV } from "../state/schema.js";
 import type {
   Memory,
   CompressedObservation,
+  Lesson,
   Session,
 } from "../types.js";
+import { traceLessonCorrections } from "./lesson-corrections.js";
 
 export function registerVerifyFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::verify", 
@@ -56,6 +58,24 @@ export function registerVerifyFunction(sdk: ISdk, kv: StateKV): void {
             sessionStatus: o.session?.status,
           })),
           citationCount: observations.length,
+        };
+      }
+
+      const lesson = await kv.get<Lesson>(KV.lessons, data.id);
+      if (lesson) {
+        const correctionChain = traceLessonCorrections(
+          await kv.list<Lesson>(KV.lessons),
+          lesson.id,
+        );
+        return {
+          success: true,
+          type: "lesson",
+          lesson,
+          correctionChain,
+          corrects: correctionChain.filter((link) => link.direction === "corrects"),
+          correctedBy: correctionChain.filter(
+            (link) => link.direction === "correctedBy",
+          ),
         };
       }
 
