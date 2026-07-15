@@ -121,7 +121,11 @@ function makeSemantic(fact: string, id?: string): SemanticMemory {
   };
 }
 
-function makeLesson(content: string, tags: string[]): Lesson {
+function makeLesson(
+  content: string,
+  tags: string[],
+  overrides: Partial<Lesson> = {},
+): Lesson {
   return {
     id: `lsn_${content.slice(0, 8)}`,
     content,
@@ -134,6 +138,7 @@ function makeLesson(content: string, tags: string[]): Lesson {
     createdAt: "2026-04-01T00:00:00Z",
     updatedAt: "2026-04-01T00:00:00Z",
     decayRate: 0.05,
+    ...overrides,
   };
 }
 
@@ -209,6 +214,38 @@ describe("Reflect", () => {
       expect(insights.length).toBe(2);
       expect(insights[0].title).toBeTruthy();
       expect(insights[0].sourceConceptCluster.length).toBeGreaterThan(0);
+    });
+
+    it("excludes superseded lessons from insight provenance", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Security validates request inputs"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Validation blocks security regressions"));
+      await kv.set(
+        "mem:lessons",
+        "lsn_obsolete",
+        makeLesson("Use shell exec for security tooling", ["security"], {
+          id: "lsn_obsolete",
+          confidence: 0.95,
+        }),
+      );
+      await kv.set(
+        "mem:lessons",
+        "lsn_correction",
+        makeLesson("Use execFile for security tooling", ["security"], {
+          id: "lsn_correction",
+          confidence: 0.6,
+          corrects: ["lsn_obsolete"],
+        }),
+      );
+
+      await sdk.trigger("mem::reflect", {});
+
+      const insights = await kv.list<Insight>("mem:insights");
+      expect(insights.length).toBeGreaterThan(0);
+      expect(insights.every((insight) => insight.sourceLessonIds.includes("lsn_correction"))).toBe(true);
+      expect(insights.some((insight) => insight.sourceLessonIds.includes("lsn_obsolete"))).toBe(false);
     });
 
     it("skips clusters with fewer than 3 supporting items", async () => {

@@ -14,6 +14,7 @@ import type {
 import { recordAudit } from "./audit.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 import { readGraphSnapshot } from "../state/graph-snapshot.js";
+import { filterSupersededLessons } from "./lesson-state.js";
 
 const REFLECT_CLUSTER_FP_VERSION = 1;
 
@@ -348,7 +349,7 @@ export function registerReflectFunctions(
         kv.list<Crystal>(KV.crystals).catch(() => []),
       ]);
 
-      let activeLessons = lessons.filter((l) => !l.deleted);
+      let activeLessons = filterSupersededLessons(lessons);
       if (data?.project) {
         activeLessons = activeLessons.filter((l) => l.project === data.project);
       }
