@@ -14,6 +14,16 @@ import { logger } from "../logger.js";
 import { saveImageToDisk } from "../utils/image-store.js";
 
 const postCompletionWarned = new Set<string>();
+const NOISE_HOOK_TYPES = new Set([
+  "session_status",
+  "session_updated",
+  "llm_params",
+  "messages_transform",
+  "config_loaded",
+  "file_watcher",
+]);
+const STEP_FINISH_SAMPLE_EVERY = 20;
+let stepFinishCaptureCount = 0;
 
 export function extractImage(d: unknown): string | undefined {
   if (!d) return undefined;
@@ -95,6 +105,27 @@ export function registerObserveFunction(
           error:
             "Invalid payload: sessionId, hookType, and timestamp are required",
         };
+      }
+
+      if (NOISE_HOOK_TYPES.has(payload.hookType)) {
+        return withKeyedLock(`obs:${payload.sessionId}`, async () => {
+          const session = await kv.get(KV.sessions, payload.sessionId);
+          if (session) {
+            await kv.update(KV.sessions, payload.sessionId, [
+              {
+                type: "set",
+                path: "updatedAt",
+                value: new Date().toISOString(),
+              },
+            ]);
+          }
+          return {
+            skipped: true,
+            reason: "noise_event",
+            hookType: payload.hookType,
+            sessionId: payload.sessionId,
+          };
+        });
       }
 
       const obsId = generateId("obs");
@@ -403,6 +434,15 @@ export function registerObserveFunction(
           hook: payload.hookType,
           compress: isAutoCompressEnabled() ? "llm" : "synthetic",
         });
+        if (payload.hookType === "step_finish") {
+          stepFinishCaptureCount++;
+          if (stepFinishCaptureCount % STEP_FINISH_SAMPLE_EVERY === 0) {
+            logger.info("Step-finish capture sample", {
+              captured: stepFinishCaptureCount,
+              sampleEvery: STEP_FINISH_SAMPLE_EVERY,
+            });
+          }
+        }
         return { observationId: obsId };
       });
     },
