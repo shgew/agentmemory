@@ -70,6 +70,38 @@ export function resetFollowupStatsForTests(): void {
   followupStats.agentInitiatedSearches = 0;
 }
 
+// Task 16 Item 4: retrieval-outcome telemetry mirror.
+// expandCallsWithSession is the denominator (expand calls carrying a
+// session anchor); resultsExpandedFromPriorSearch is the numerator
+// (expands that referenced at least one obsId a recent prior search
+// returned). The OTEL counter smartSearchResultExpanded is the
+// canonical export; this in-process mirror backs the diagnostic
+// readback + tests.
+const expandStats = {
+  expandCallsWithSession: 0,
+  resultsExpandedFromPriorSearch: 0,
+};
+
+export function getExpandStats(): {
+  expandCallsWithSession: number;
+  resultsExpandedFromPriorSearch: number;
+  rate: number;
+} {
+  const total = expandStats.expandCallsWithSession;
+  return {
+    ...expandStats,
+    rate:
+      total > 0
+        ? expandStats.resultsExpandedFromPriorSearch / total
+        : 0,
+  };
+}
+
+export function resetExpandStatsForTests(): void {
+  expandStats.expandCallsWithSession = 0;
+  expandStats.resultsExpandedFromPriorSearch = 0;
+}
+
 // Compact mode trims each lesson's content for at-a-glance display. The
 // full content is fetched via memory_lesson_recall when the caller needs it.
 const LESSON_CONTENT_PREVIEW_CHARS = 240;
@@ -166,6 +198,39 @@ export function registerSmartSearchFunction(
           kv,
           scoped.map((e) => e.observation.id),
         );
+
+        // Task 16 Item 4: retrieval-outcome telemetry. Best-effort and
+        // fire-and-forget — must never block or throw on the expand
+        // response path. When this expand references obsIds a PRIOR
+        // search in the same session returned, record that the earlier
+        // result set was actually used (expanded / read).
+        if (
+          data.sessionId &&
+          typeof data.sessionId === "string" &&
+          data.source !== "viewer"
+        ) {
+          const sessionIdForExpand = data.sessionId;
+          const expandedObsIds = items.map((i) => i.obsId);
+          const detection = detectExpandOutcome(
+            kv,
+            sessionIdForExpand,
+            expandedObsIds,
+          )
+            .catch((err) => {
+              logger.warn(
+                "Smart search expand-outcome telemetry failed",
+                {
+                  sessionId: sessionIdForExpand,
+                  error:
+                    err instanceof Error ? err.message : String(err),
+                },
+              );
+            })
+            .finally(() => {
+              pendingFollowups.delete(detection);
+            });
+          pendingFollowups.add(detection);
+        }
 
         const truncated = data.expandIds.length > raw.length;
         logger.info("Smart search expanded", {
@@ -392,6 +457,41 @@ async function detectFollowup(
     nextQuery: query,
     priorResultCount: priorIds.length,
     nextResultCount: currentIds.length,
+  });
+}
+
+// Task 16 Item 4: correlate an expand call with the session's most
+// recent search (KV.recentSearches, written by detectFollowup). If any
+// expanded obsId was in that prior result set, record it as a used
+// result. Best-effort; the caller wraps this in .catch so a throw here
+// never breaks the expand response.
+async function detectExpandOutcome(
+  kv: StateKV,
+  sessionId: string,
+  expandedObsIds: string[],
+): Promise<void> {
+  if (expandedObsIds.length === 0) return;
+  expandStats.expandCallsWithSession++;
+  const prior = await kv
+    .get<RecentSearch>(KV.recentSearches, sessionId)
+    .catch(() => null);
+  if (
+    !prior ||
+    !Array.isArray(prior.resultIds) ||
+    prior.resultIds.length === 0
+  ) {
+    return;
+  }
+  const priorSet = new Set(prior.resultIds);
+  const matched = expandedObsIds.filter((id) => priorSet.has(id));
+  if (matched.length === 0) return;
+  getCounters().smartSearchResultExpanded.add(matched.length);
+  expandStats.resultsExpandedFromPriorSearch++;
+  logger.info("Smart search result expanded from prior search", {
+    sessionId,
+    matched: matched.length,
+    priorResultCount: prior.resultIds.length,
+    priorQuery: prior.query,
   });
 }
 

@@ -2,7 +2,11 @@ import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { logger } from "../logger.js";
-import { getFollowupStats, type RecentSearch } from "./smart-search.js";
+import {
+  getFollowupStats,
+  getExpandStats,
+  type RecentSearch,
+} from "./smart-search.js";
 import { getFollowupWindowSeconds } from "../config.js";
 
 // #771: TTL sweep for the followup-rate diagnostic scope. `recentSearches`
@@ -58,14 +62,22 @@ export function registerRecentSearchesSweepFunction(
       agentInitiatedSearches: number;
       followupWithinWindow: number;
       rate: number;
+      // Task 16 Item 4: retrieval-outcome telemetry read-back.
+      expandCallsWithSession: number;
+      resultsExpandedFromPriorSearch: number;
+      expandRate: number;
     }> => {
       const stats = getFollowupStats();
+      const expand = getExpandStats();
       return {
         success: true,
         windowSeconds: getFollowupWindowSeconds(),
         agentInitiatedSearches: stats.agentInitiatedSearches,
         followupWithinWindow: stats.followupWithinWindow,
         rate: stats.rate,
+        expandCallsWithSession: expand.expandCallsWithSession,
+        resultsExpandedFromPriorSearch: expand.resultsExpandedFromPriorSearch,
+        expandRate: expand.rate,
       };
     },
   );

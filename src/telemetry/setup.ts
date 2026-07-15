@@ -52,6 +52,12 @@ interface Counters {
   // despite retrieval being correct). Never incremented by core in
   // live use; reserved here so dashboards keep a stable name.
   readerFailureWithEvidence: Counter;
+  // Task 16 Item 4: retrieval-outcome telemetry. Incremented when a
+  // smart-search expand call references obsIds that a PRIOR search in
+  // the same session returned — direct evidence that a returned result
+  // was actually used (expanded/read). Fills the sample gap the audit's
+  // follow-up diagnostic hit (zero usable outcome samples).
+  smartSearchResultExpanded: Counter;
 }
 
 interface Histograms {
@@ -96,6 +102,7 @@ const COUNTER_NAMES: Array<[keyof Counters, string]> = [
   ["governanceDelete", "governance.delete"],
   ["smartSearchFollowupWithinWindow", "smart_search.followup_within_window_total"],
   ["readerFailureWithEvidence", "reader_failure_with_evidence_total"],
+  ["smartSearchResultExpanded", "smart_search.result_expanded_total"],
 ];
 
 const HISTOGRAM_NAMES: Array<[keyof Histograms, string]> = [

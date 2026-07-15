@@ -10,6 +10,7 @@ import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { posix as pathPosix } from "node:path";
 
 const PROFILE_OBSERVATION_SESSION_LIMIT = 200;
 
@@ -49,6 +50,40 @@ function isFileUnderProject(file: string, project: string): boolean {
   return file === base || file.startsWith(base + "/");
 }
 
+// Canonicalize a tracked file path into a stable, portable form.
+// The audit found profiles storing a mix of absolute and relative
+// paths for the same logical file; absolute paths embed a machine-
+// specific prefix (/Users/... , /home/...) and are not portable.
+//   - normalizes separators (\\ -> /), collapses ./ ../ + dup slashes,
+//     strips a trailing slash and a leading ./
+//   - a slug project (canonical, non-path): an absolute path carrying
+//     the slug as a segment is relativized from it, stripping the
+//     machine-specific prefix so abs + rel forms of the same file
+//     converge (this is where the audit's mix actually occurs — under
+//     an absolute project root relative files are already filtered out)
+//   - absolute-project / already-relative paths pass through normalized
+// Idempotent: canonicalizeFilePath(canonicalizeFilePath(x)) === once.
+export function canonicalizeFilePath(file: unknown, project: string): string {
+  if (typeof file !== "string") return "";
+  let f = file.trim().replace(/\\/g, "/");
+  if (!f) return "";
+  f = pathPosix.normalize(f);
+  if (f.length > 1 && f.endsWith("/")) f = f.slice(0, -1);
+  if (f.startsWith("./")) f = f.slice(2);
+
+  const base = project.endsWith("/") ? project.slice(0, -1) : project;
+
+  // Absolute-ish: posix root (/...) or a Windows drive-letter (C:/...).
+  const isAbsolute = f.startsWith("/") || /^[A-Za-z]:\//.test(f);
+  if (isAbsolute && base && !base.startsWith("/")) {
+    const seg = `/${base}/`;
+    const idx = f.lastIndexOf(seg);
+    if (idx !== -1) return f.slice(idx + seg.length);
+  }
+
+  return f;
+}
+
 function addFile(
   map: Map<string, FreqEntry>,
   raw: unknown,
@@ -59,7 +94,9 @@ function addFile(
   const file = raw.trim();
   if (!file) return;
   if (!isFileUnderProject(file, project)) return;
-  bumpFreq(map, file, file, bucket);
+  const canonical = canonicalizeFilePath(file, project);
+  if (!canonical) return;
+  bumpFreq(map, canonical, canonical, bucket);
 }
 
 function extractFilesFromSubtitle(subtitle: string | undefined): string[] {
@@ -308,7 +345,7 @@ function extractConventions(
     conventions.push("TypeScript project");
   }
 
-  const srcFiles = files.filter((f) => f.file.includes("/src/")).length;
+  const srcFiles = files.filter((f) => /(^|\/)src\//.test(f.file)).length;
   if (srcFiles > files.length * 0.5) {
     conventions.push("Standard src/ directory structure");
   }

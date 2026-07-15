@@ -461,6 +461,29 @@ function parseAttrs(raw: string): Record<string, string> {
 const GRAPH_NODE_TYPE_SET = new Set<string>(GRAPH_NODE_TYPES);
 const GRAPH_EDGE_TYPE_SET = new Set<string>(GRAPH_EDGE_TYPES);
 
+// Task 16 Item 3: canonicalize a raw graph node type before it is
+// validated/stored. The audit found malformed types in the graph such
+// as " file" (leading whitespace) and "decison" (typo for "decision").
+// Trimming + lowercasing recovers whitespace/case malformations; the
+// typo map corrects near-miss spellings against the GRAPH_NODE_TYPES
+// vocabulary. Returns undefined for input that cannot be salvaged
+// (non-string / empty) so the caller drops it as before.
+const GRAPH_NODE_TYPE_TYPOS: Readonly<Record<string, string>> = {
+  decison: "decision",
+  desicion: "decision",
+  fucntion: "function",
+  funciton: "function",
+  libary: "library",
+  organisation: "organization",
+};
+
+export function normalizeGraphNodeType(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed) return undefined;
+  return GRAPH_NODE_TYPE_TYPOS[trimmed] ?? trimmed;
+}
+
 function parseGraphXml(
   xml: string,
   observationIds: string[],
@@ -482,9 +505,11 @@ function parseGraphXml(
 
   const addEntity = (rawAttrs: string, propsBlock = ""): void => {
     const attrs = parseAttrs(rawAttrs);
-    const type = attrs["type"] as GraphNode["type"] | undefined;
+    const normalizedType = normalizeGraphNodeType(attrs["type"]);
     const name = attrs["name"];
-    if (!type || !name || !GRAPH_NODE_TYPE_SET.has(type)) return;
+    if (!normalizedType || !name || !GRAPH_NODE_TYPE_SET.has(normalizedType))
+      return;
+    const type = normalizedType as GraphNode["type"];
     const properties: Record<string, string> = {};
     const propRegex = /<property\s+key="([^"]+)">([^<]*)<\/property>/g;
     let propMatch;
@@ -1204,6 +1229,93 @@ export function registerGraphFunction(
     logger.info("Graph state reset", { counts, tookMs });
     return { success: true, cleared: counts, tookMs };
   });
+
+  // Task 16 Item 3: one-shot repair for graph nodes whose `type` was
+  // written before write-time normalization existed (malformed values
+  // like " file" or "decison"). Fixes the stored node rows AND the
+  // precomputed snapshot (topNodes copies + stats.nodesByType keys,
+  // merging malformed keys into their normalized form). Idempotent: a
+  // second pass over already-normalized data updates nothing.
+  sdk.registerFunction(
+    "mem::graph-normalize-types",
+    async (data?: { dryRun?: boolean }) => {
+      const dryRun = data?.dryRun === true;
+      const started = Date.now();
+      let scanned = 0;
+      let fixed = 0;
+      const remap = new Map<string, string>();
+
+      const nodes = await kv
+        .list<GraphNode>(KV.graphNodes)
+        .catch(() => [] as GraphNode[]);
+      for (const node of nodes) {
+        if (!node || typeof node.id !== "string") continue;
+        scanned++;
+        const norm = normalizeGraphNodeType(node.type);
+        if (norm && norm !== node.type) {
+          remap.set(node.id, norm);
+          if (!dryRun) {
+            await kv.set(KV.graphNodes, node.id, {
+              ...node,
+              type: norm as GraphNode["type"],
+            });
+          }
+          fixed++;
+        }
+      }
+
+      // Snapshot repair runs under the graph:merge lock so a concurrent
+      // extract cannot lose these fixes (same guard extract/vacuum use).
+      let snapshotUpdated = false;
+      await withKeyedLock("graph:merge", async () => {
+        const snap = await readGraphSnapshot(kv).catch(() => null);
+        if (!snap) return;
+        let snapChanged = false;
+        for (const n of snap.topNodes) {
+          const norm = remap.get(n.id) ?? normalizeGraphNodeType(n.type);
+          if (norm && norm !== n.type) {
+            n.type = norm as GraphNode["type"];
+            snapChanged = true;
+          }
+        }
+        const newByType: Record<string, number> = {};
+        let byTypeChanged = false;
+        for (const [ty, count] of Object.entries(snap.stats.nodesByType)) {
+          const norm = normalizeGraphNodeType(ty) ?? ty;
+          if (norm !== ty) byTypeChanged = true;
+          newByType[norm] = (newByType[norm] ?? 0) + count;
+        }
+        if (byTypeChanged) {
+          snap.stats.nodesByType = newByType;
+          snapChanged = true;
+        }
+        if (snapChanged && !dryRun) {
+          await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+        }
+        snapshotUpdated = snapChanged;
+      });
+
+      if (!dryRun && (fixed > 0 || snapshotUpdated)) {
+        await recordAudit(
+          kv,
+          "consolidate",
+          "mem::graph-normalize-types",
+          [],
+          { scanned, fixed, snapshotUpdated },
+        );
+      }
+
+      const tookMs = Date.now() - started;
+      logger.info("Graph node-type normalization", {
+        scanned,
+        fixed,
+        snapshotUpdated,
+        dryRun,
+        tookMs,
+      });
+      return { success: true, dryRun, scanned, fixed, snapshotUpdated, tookMs };
+    },
+  );
 
   // Physical-delete pass for the graph pruning queue. Reads the bounded
   // KV.graphTombstones scope (the ONLY kv.list here, and it stays a tiny

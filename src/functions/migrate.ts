@@ -13,6 +13,7 @@ import type {
 } from "../types.js";
 import { logger } from "../logger.js";
 import { recordAudit } from "./audit.js";
+import { canonicalizeFilePath } from "./profile.js";
 
 export const DEFAULT_CANONICAL_PROJECT_MAP: Readonly<Record<string, string>> = {};
 
@@ -75,12 +76,22 @@ function isAllowedPath(dbPath: string): boolean {
   return ALLOWED_DIRS.some((dir) => resolved.startsWith(dir + "/"));
 }
 
+// Audit functionId stamped on every unscoped-memory backfill so an
+// operator can trace which memory was scoped and on what evidence.
+const BACKFILL_FUNCTION_ID = "mem::backfill-unscoped-memories";
+
 // Infer memory project from the majority project of its associated sessions.
 // Returns { updated, skipped } — safe to run repeatedly (idempotent).
 export async function inferMemoryProjects(
   kv: StateKV,
   dryRun = false,
-): Promise<{ updated: number; skipped: number; ambiguous: number }> {
+): Promise<{
+  updated: number;
+  skipped: number;
+  ambiguous: number;
+  backfilledIds: string[];
+  unresolvedIds: string[];
+}> {
   const memories = await kv.list<Memory>(KV.memories);
   const sessionCache = new Map<string, Session | null>();
 
@@ -94,6 +105,10 @@ export async function inferMemoryProjects(
   let updated = 0;
   let skipped = 0;
   let ambiguous = 0;
+  const backfilledIds: string[] = [];
+  // Memories that could NOT be confidently scoped. Reported back
+  // explicitly so they are never silently left unscoped without signal.
+  const unresolvedIds: string[] = [];
 
   for (const memory of memories) {
     if (memory.project) {
@@ -104,6 +119,7 @@ export async function inferMemoryProjects(
     const sessionIds = memory.sessionIds ?? [];
     if (sessionIds.length === 0) {
       ambiguous++;
+      unresolvedIds.push(memory.id);
       continue;
     }
 
@@ -115,6 +131,7 @@ export async function inferMemoryProjects(
 
     if (projects.length === 0) {
       ambiguous++;
+      unresolvedIds.push(memory.id);
       continue;
     }
 
@@ -128,18 +145,170 @@ export async function inferMemoryProjects(
     // that was genuinely built from sessions across multiple projects.
     if (topCount <= projects.length / 2 && sorted.length > 1) {
       ambiguous++;
+      unresolvedIds.push(memory.id);
       continue;
     }
 
     if (!dryRun) {
       memory.project = topProject;
       await kv.set(KV.memories, memory.id, memory);
+      // Audit trail: one row per backfill so an operator can trace
+      // exactly which unscoped memory was assigned which project and
+      // on what evidence (session vote count).
+      await recordAudit(
+        kv,
+        "canonicalize_projects",
+        BACKFILL_FUNCTION_ID,
+        [memory.id],
+        {
+          project: topProject,
+          votes: topCount,
+          sessionIds,
+          backfilledFromUnscoped: true,
+        },
+      );
     }
+    backfilledIds.push(memory.id);
     updated++;
   }
 
-  logger.info("inferMemoryProjects complete", { updated, skipped, ambiguous, dryRun });
-  return { updated, skipped, ambiguous };
+  logger.info("inferMemoryProjects complete", {
+    updated,
+    skipped,
+    ambiguous,
+    unresolved: unresolvedIds.length,
+    dryRun,
+  });
+  return { updated, skipped, ambiguous, backfilledIds, unresolvedIds };
+}
+
+// Operator-facing wrapper around inferMemoryProjects. Finds memories
+// with no project scope, assigns one from the majority project of the
+// memory's linked sessions, records an audit trail per backfill, and
+// reports back the ids it could NOT confidently scope (rather than
+// silently leaving them unscoped with no signal). Idempotent.
+export async function backfillUnscopedMemories(
+  kv: StateKV,
+  dryRun = false,
+): Promise<{
+  success: true;
+  dryRun: boolean;
+  updated: number;
+  skipped: number;
+  ambiguous: number;
+  backfilledIds: string[];
+  unresolvedIds: string[];
+  unresolved: number;
+}> {
+  const result = await inferMemoryProjects(kv, dryRun);
+  if (result.unresolvedIds.length > 0) {
+    // Explicit MISLEADING-SUCCESS guard: these memories remain unscoped
+    // by design because no confident project could be inferred. Surface
+    // them loudly instead of reporting a clean success.
+    logger.warn("backfillUnscopedMemories: memories left unscoped", {
+      count: result.unresolvedIds.length,
+      unresolvedIds: result.unresolvedIds,
+      dryRun,
+    });
+  }
+  return {
+    success: true,
+    dryRun,
+    updated: result.updated,
+    skipped: result.skipped,
+    ambiguous: result.ambiguous,
+    backfilledIds: result.backfilledIds,
+    unresolvedIds: result.unresolvedIds,
+    unresolved: result.unresolvedIds.length,
+  };
+}
+
+// One-shot migration for Task 16 Item 2: normalize file paths already
+// stored on ProjectProfile.topFiles into the portable canonical form
+// (see canonicalizeFilePath). Two forms of the same file merge and
+// their frequencies sum. Idempotent: a second pass over already-
+// canonical profiles updates nothing (STALE STATE safe).
+export async function canonicalizeProfilePaths(
+  kv: StateKV,
+  dryRun = false,
+): Promise<{
+  success: true;
+  dryRun: boolean;
+  profilesScanned: number;
+  profilesUpdated: number;
+  pathsNormalized: number;
+}> {
+  const profiles = await kv.list<ProjectProfile>(KV.profiles);
+  let profilesUpdated = 0;
+  let pathsNormalized = 0;
+  const touchedIds: string[] = [];
+
+  for (const profile of profiles) {
+    if (
+      !profile ||
+      !profile.project ||
+      !Array.isArray(profile.topFiles)
+    ) {
+      continue;
+    }
+    const merged = new Map<string, number>();
+    let changed = false;
+    for (const entry of profile.topFiles) {
+      const raw = entry?.file;
+      const canonical = canonicalizeFilePath(raw, profile.project);
+      if (!canonical) {
+        // Unrelatable / empty path carried no usable value: drop it.
+        changed = true;
+        continue;
+      }
+      if (canonical !== raw) changed = true;
+      const freq =
+        typeof entry?.frequency === "number" ? entry.frequency : 0;
+      merged.set(canonical, (merged.get(canonical) ?? 0) + freq);
+    }
+    // A merge (two entries collapsed to one) is also a change.
+    if (merged.size !== profile.topFiles.length) changed = true;
+    if (!changed) continue;
+
+    profilesUpdated++;
+    pathsNormalized += profile.topFiles.length;
+    if (!dryRun) {
+      const topFiles = [...merged.entries()]
+        .map(([file, frequency]) => ({ file, frequency }))
+        .sort((a, b) => b.frequency - a.frequency);
+      await kv.set(KV.profiles, profile.project, { ...profile, topFiles });
+      touchedIds.push(profile.project);
+    }
+  }
+
+  if (!dryRun && touchedIds.length > 0) {
+    await recordAudit(
+      kv,
+      "canonicalize_projects",
+      "mem::migrate",
+      touchedIds,
+      {
+        step: "canonicalize-profile-paths",
+        profilesUpdated,
+        pathsNormalized,
+      },
+    );
+  }
+
+  logger.info("canonicalizeProfilePaths complete", {
+    profilesScanned: profiles.length,
+    profilesUpdated,
+    pathsNormalized,
+    dryRun,
+  });
+
+  return {
+    success: true,
+    dryRun,
+    profilesScanned: profiles.length,
+    profilesUpdated,
+    pathsNormalized,
+  };
 }
 
 function emptyScopeReport(): ScopeReport {
@@ -378,6 +547,15 @@ export async function canonicalizeProjects(
 }
 
 export function registerMigrateFunction(sdk: ISdk, kv: StateKV): void {
+  sdk.registerFunction(
+    "mem::backfill-unscoped-memories",
+    async (data?: { dryRun?: boolean }) => {
+      const dryRun = data?.dryRun ?? false;
+      logger.info("Backfill unscoped memories", { dryRun });
+      return backfillUnscopedMemories(kv, dryRun);
+    },
+  );
+
   sdk.registerFunction("mem::migrate",
     async (data: { dbPath?: string; step?: string; dryRun?: boolean; mapping?: Record<string, string> }) => {
       // In-place KV migration steps (no SQLite dependency).
@@ -396,6 +574,12 @@ export function registerMigrateFunction(sdk: ISdk, kv: StateKV): void {
           dryRun,
           mapping: data.mapping,
         });
+      }
+
+      if (data.step === "canonicalize-profile-paths") {
+        const dryRun = data.dryRun ?? false;
+        logger.info("Migration step: canonicalize-profile-paths", { dryRun });
+        return canonicalizeProfilePaths(kv, dryRun);
       }
 
       if (!data.dbPath) {
