@@ -1,9 +1,10 @@
+/// <reference types="node" />
+
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { HybridSearch } from "../src/state/hybrid-search.js";
 import { SearchIndex } from "../src/state/search-index.js";
 import type {
   CompressedObservation,
-  EmbeddingProvider,
   GraphNode,
   GraphSnapshot,
   HybridSearchResult,
@@ -17,6 +18,7 @@ function makeObs(
     id: "obs_1",
     sessionId: "ses_1",
     timestamp: new Date().toISOString(),
+    sourceType: "test",
     type: "file_edit",
     title: "Edit auth middleware",
     subtitle: "JWT validation",
@@ -186,6 +188,89 @@ describe("HybridSearch", () => {
     expect(results[0].observation.id).toBe("mem_abc");
     expect(results[0].observation.narrative).toBe("Test memory for search");
     expect(results[0].observation.concepts).toEqual(["test", "search"]);
+  });
+
+  it("enriches a graph-only candidate whose retrieval result has no sessionId", async () => {
+    const anchor = makeObs({
+      id: "obs_anchor",
+      sessionId: "ses_anchor",
+      title: "Project Asterion launch",
+      narrative: "Synthetic graph anchor",
+      concepts: ["asterion"],
+    });
+    const graphOnly = makeObs({
+      id: "obs_graph_only",
+      sessionId: "ses_target",
+      title: "Decorrelated jitter stabilized queue workers",
+      narrative: "Queue starvation stopped after retry timing changed",
+      concepts: ["retry-jitter", "queue-starvation"],
+    });
+    bm25.add(anchor);
+    bm25.add(graphOnly);
+    await kv.set("mem:obs:ses_anchor", anchor.id, anchor);
+    await kv.set("mem:obs:ses_target", graphOnly.id, graphOnly);
+
+    const snapshot: GraphSnapshot = {
+      version: 1,
+      topNodes: [
+        {
+          id: "gn_anchor",
+          type: "project",
+          name: "Asterion",
+          properties: {},
+          sourceObservationIds: [anchor.id],
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+        {
+          id: "gn_target",
+          type: "concept",
+          name: "Queue mitigation",
+          properties: {},
+          sourceObservationIds: [graphOnly.id],
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      topEdges: [
+        {
+          id: "ge_link",
+          type: "related_to",
+          sourceNodeId: "gn_anchor",
+          targetNodeId: "gn_target",
+          weight: 1,
+          sourceObservationIds: [anchor.id, graphOnly.id],
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      topDegrees: { gn_anchor: 1, gn_target: 1 },
+      stats: {
+        totalNodes: 2,
+        totalEdges: 1,
+        nodesByType: { project: 1, concept: 1 },
+        edgesByType: { related_to: 1 },
+      },
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      dirty: false,
+    };
+    await kv.set("mem:graph:snapshot", "current", snapshot);
+
+    const hybrid = new HybridSearch(
+      bm25,
+      null,
+      null,
+      kv as never,
+      0.4,
+      0,
+      0.3,
+      false,
+      true,
+    );
+    const results = await hybrid.search("Project Asterion", 10);
+
+    const recovered = results.find(
+      (result) => result.observation.id === graphOnly.id,
+    );
+    expect(recovered?.sessionId).toBe(graphOnly.sessionId);
+    expect(recovered?.graphScore).toBeGreaterThan(0);
   });
 });
 

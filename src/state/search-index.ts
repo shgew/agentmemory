@@ -51,6 +51,10 @@ export class SearchIndex {
     return this.entries.has(id);
   }
 
+  getSessionId(obsId: string): string | undefined {
+    return this.entries.get(obsId)?.sessionId;
+  }
+
   remove(id: string): void {
     const entry = this.entries.get(id);
     if (!entry) return;

@@ -189,7 +189,7 @@ export class HybridSearch {
           bm25Rank: Infinity,
           vectorRank: Infinity,
           graphRank: i + 1,
-          sessionId: r.sessionId,
+          sessionId: r.sessionId || this.bm25.getSessionId(r.obsId) || "",
           bm25Score: 0,
           vectorScore: 0,
           graphScore: r.score,
@@ -297,10 +297,15 @@ export class HybridSearch {
     const sliced = results.slice(0, limit);
     const observations = await Promise.all(
       sliced.map(async (r) => {
-        const obs = await this.kv
-          .get<CompressedObservation>(KV.observations(r.sessionId), r.obsId)
-          .catch(() => null);
-        if (obs) return obs;
+        const sessionId = r.sessionId || this.bm25.getSessionId(r.obsId);
+        const obs = sessionId
+          ? await this.kv
+              .get<CompressedObservation>(KV.observations(sessionId), r.obsId)
+              .catch(() => null)
+          : null;
+        if (obs) {
+          return { observation: obs, sessionId: sessionId || r.sessionId };
+        }
         // Fallback: indexed entry may originate from mem::remember, which
         // writes to KV.memories with a synthetic sessionId ("memory" or the
         // memory's first associated session). Coerce the Memory record into
@@ -308,20 +313,25 @@ export class HybridSearch {
         const mem = await this.kv
           .get<Memory>(KV.memories, r.obsId)
           .catch(() => null);
-        return mem ? memoryToObservation(mem) : null;
+        return mem
+          ? {
+              observation: memoryToObservation(mem),
+              sessionId: sessionId || r.sessionId,
+            }
+          : null;
       }),
     );
     const enriched: HybridSearchResult[] = [];
     for (let i = 0; i < sliced.length; i++) {
-      const obs = observations[i];
-      if (obs) {
+      const result = observations[i];
+      if (result) {
         enriched.push({
-          observation: obs,
+          observation: result.observation,
           bm25Score: sliced[i].bm25Score,
           vectorScore: sliced[i].vectorScore,
           graphScore: sliced[i].graphScore,
           combinedScore: sliced[i].combinedScore,
-          sessionId: sliced[i].sessionId,
+          sessionId: result.sessionId,
           graphContext: sliced[i].graphContext,
         });
       }
