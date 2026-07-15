@@ -11,6 +11,7 @@ import type {
   Memory,
   SessionSummary,
   ExportData,
+  RawObservation,
 } from "../src/types.js";
 
 function mockKV() {
@@ -65,6 +66,7 @@ const testObs: CompressedObservation = {
   id: "obs_1",
   sessionId: "ses_1",
   timestamp: "2026-02-01T10:00:00Z",
+  sourceType: "post_tool_use",
   type: "file_edit",
   title: "Edit auth",
   facts: ["Added check"],
@@ -72,6 +74,16 @@ const testObs: CompressedObservation = {
   concepts: ["auth"],
   files: ["src/auth.ts"],
   importance: 7,
+};
+
+const testRawPayload: RawObservation = {
+  id: "obs_1",
+  sessionId: "ses_1",
+  timestamp: "2026-02-01T10:00:00Z",
+  hookType: "post_tool_use",
+  toolName: "Edit",
+  toolInput: { file_path: "src/auth.ts" },
+  raw: { tool_name: "Edit" },
 };
 
 const testMemory: Memory = {
@@ -112,6 +124,7 @@ describe("Export/Import Functions", () => {
 
     await kv.set("mem:sessions", "ses_1", testSession);
     await kv.set("mem:obs:ses_1", "obs_1", testObs);
+    await kv.set("mem:raw-payloads", "obs_1", testRawPayload);
     await kv.set("mem:memories", "mem_1", testMemory);
     await kv.set("mem:summaries", "ses_1", testSummary);
   });
@@ -124,6 +137,7 @@ describe("Export/Import Functions", () => {
     expect(result.sessions.length).toBe(1);
     expect(result.sessions[0].id).toBe("ses_1");
     expect(result.observations["ses_1"].length).toBe(1);
+    expect(result.rawPayloads).toEqual([testRawPayload]);
     expect(result.memories.length).toBe(1);
     expect(result.summaries.length).toBe(1);
   });
@@ -215,12 +229,14 @@ describe("Export/Import Functions", () => {
       success: boolean;
       sessions: number;
       observations: number;
+      rawPayloads: number;
       memories: number;
     };
 
     expect(importResult.success).toBe(true);
     expect(importResult.sessions).toBe(1);
     expect(importResult.observations).toBe(1);
+    expect(importResult.rawPayloads).toBe(1);
     expect(importResult.memories).toBe(1);
 
     const reExported = (await freshSdk.trigger(
@@ -229,6 +245,7 @@ describe("Export/Import Functions", () => {
     )) as ExportData;
     expect(reExported.sessions.length).toBe(exported.sessions.length);
     expect(reExported.memories.length).toBe(exported.memories.length);
+    expect(reExported.rawPayloads).toEqual(exported.rawPayloads);
   });
 
   it("import rejects unsupported version", async () => {

@@ -21,8 +21,8 @@ import type {
   Facet,
   Lesson,
   Insight,
-  ExportPagination,
   AccessLogExport,
+  RawObservation,
 } from "../types.js";
 import { normalizeAccessLog } from "./access-tracker.js";
 import { KV } from "../state/schema.js";
@@ -60,6 +60,12 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           observations[sessionId] = obs;
         }
       }
+      const exportedSessionIds = new Set(
+        paginatedSessions.map((session) => session.id),
+      );
+      const rawPayloads = (
+        await kv.list<RawObservation>(KV.rawPayloads).catch(() => [])
+      ).filter((raw) => exportedSessionIds.has(raw.sessionId));
 
       const profiles: ProjectProfile[] = [];
       const uniqueProjects = [...new Set(paginatedSessions.map((s) => s.project))];
@@ -113,6 +119,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         exportedAt: new Date().toISOString(),
         sessions: paginatedSessions,
         observations,
+        rawPayloads: rawPayloads.length > 0 ? rawPayloads : undefined,
         memories,
         summaries,
         profiles: profiles.length > 0 ? profiles : undefined,
@@ -190,6 +197,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       const MAX_OBS_PER_SESSION = 5_000;
       const MAX_TOTAL_OBSERVATIONS = 500_000;
       const MAX_ACCESS_LOGS = 50_000;
+      const MAX_RAW_PAYLOADS = 500_000;
 
       if (!Array.isArray(importData.sessions)) {
         return { success: false, error: "sessions must be an array" };
@@ -206,6 +214,12 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         Array.isArray(importData.observations)
       ) {
         return { success: false, error: "observations must be an object" };
+      }
+      if (
+        importData.rawPayloads !== undefined &&
+        !Array.isArray(importData.rawPayloads)
+      ) {
+        return { success: false, error: "rawPayloads must be an array" };
       }
 
       if (importData.sessions.length > MAX_SESSIONS) {
@@ -254,10 +268,17 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           error: `Too many total observations (max ${MAX_TOTAL_OBSERVATIONS})`,
         };
       }
+      if ((importData.rawPayloads?.length ?? 0) > MAX_RAW_PAYLOADS) {
+        return {
+          success: false,
+          error: `Too many raw payloads (max ${MAX_RAW_PAYLOADS})`,
+        };
+      }
 
       const stats = {
         sessions: 0,
         observations: 0,
+        rawPayloads: 0,
         memories: 0,
         summaries: 0,
         skipped: 0,
@@ -273,6 +294,11 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           for (const o of obs) {
             await kv.delete(KV.observations(session.id), o.id);
           }
+        }
+        for (const raw of await kv
+          .list<RawObservation>(KV.rawPayloads)
+          .catch(() => [])) {
+          await kv.delete(KV.rawPayloads, raw.id);
         }
         const existingMem = await kv.list<Memory>(KV.memories);
         for (const m of existingMem) {
@@ -363,6 +389,20 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           await kv.set(KV.observations(sessionId), o.id, o);
           stats.observations++;
         }
+      }
+
+      for (const raw of importData.rawPayloads ?? []) {
+        if (strategy === "skip") {
+          const existing = await kv
+            .get<RawObservation>(KV.rawPayloads, raw.id)
+            .catch(() => null);
+          if (existing) {
+            stats.skipped++;
+            continue;
+          }
+        }
+        await kv.set(KV.rawPayloads, raw.id, raw);
+        stats.rawPayloads++;
       }
 
       for (const memory of importData.memories) {
