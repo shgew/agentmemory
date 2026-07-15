@@ -452,8 +452,8 @@ export const AgentmemoryCapturePlugin: Plugin = async () => {
           return;
         }
         await post("/session/end", { sessionId: sid });
-        void post("/crystals/auto", { olderThanDays: 7 }, HEAVY_TIMEOUT_MS);
-        void post("/consolidate-pipeline", { tier: "all", force: true }, HEAVY_TIMEOUT_MS);
+        void post("/crystals/auto", { sessionId: sid, olderThanDays: 7 }, HEAVY_TIMEOUT_MS);
+        void post("/consolidate-pipeline", { sessionId: sid, tier: "all", force: true }, HEAVY_TIMEOUT_MS);
         if (sid === activeSessionId) activeSessionId = null;
         stashedFiles.delete(sid);
         startContextCache.delete(sid);

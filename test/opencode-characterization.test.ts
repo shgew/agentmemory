@@ -71,15 +71,16 @@ describe("characterization: session lifecycle bus events", () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(async () => { await teardownPlugin(); });
 
-  it("session.created posts /session/start with sessionId", async () => {
+  it("session.created posts /session/start with sessionId and parentID", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
-      event: { type: "session.created", properties: { info: { id: "s_char_created", title: "T", parentID: null, version: "1" } } } as any,
+      event: { type: "session.created", properties: { info: { id: "s_char_created", title: "T", parentID: "s_char_parent", version: "1" } } } as any,
     });
     const start = findPost(calls, "/session/start");
     expect(start).toBeDefined();
     expect(start!.body.sessionId).toBe("s_char_created");
     expect(start!.body.title).toBe("T");
+    expect(start!.body.parentID).toBe("s_char_parent");
   });
 
   it("session.status idle posts /session/checkpoint and observes session_status", async () => {
@@ -182,8 +183,12 @@ describe("characterization: session lifecycle bus events", () => {
     const end = findPost(calls, "/session/end");
     expect(end).toBeDefined();
     expect(end!.body.sessionId).toBe("s_char_deleted");
-    expect(findPost(calls, "/crystals/auto")).toBeDefined();
-    expect(findPost(calls, "/consolidate-pipeline")).toBeDefined();
+    const crystals = findPost(calls, "/crystals/auto");
+    const pipeline = findPost(calls, "/consolidate-pipeline");
+    expect(crystals).toBeDefined();
+    expect(crystals!.body.sessionId).toBe("s_char_deleted");
+    expect(pipeline).toBeDefined();
+    expect(pipeline!.body.sessionId).toBe("s_char_deleted");
   });
 
   it("session.error observes post_tool_failure with tool_name=session.error", async () => {
