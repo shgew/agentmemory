@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 export const KV = {
   sessions: "mem:sessions",
   observations: (sessionId: string) => `mem:obs:${sessionId}`,
+  rawPayloads: "mem:raw-payloads",
   memories: "mem:memories",
   summaries: "mem:summaries",
   config: "mem:config",

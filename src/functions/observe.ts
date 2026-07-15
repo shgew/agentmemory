@@ -225,7 +225,7 @@ export function registerObserveFunction(
 
         try {
 
-          await kv.set(KV.observations(payload.sessionId), obsId, raw);
+          await kv.set(KV.rawPayloads, obsId, raw);
 
         } catch (error) {
           if (raw.imageData) {
