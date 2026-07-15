@@ -1119,12 +1119,19 @@ export function registerMcpEndpoints(
             const lessonTags = typeof args.tags === "string" && args.tags.trim()
               ? args.tags.split(",").map((t: string) => t.trim()).filter(Boolean)
               : [];
+            if (args.corrects !== undefined && typeof args.corrects !== "string") {
+              return { status_code: 400, body: { error: "corrects must be a string" } };
+            }
+            const corrects = typeof args.corrects === "string" && args.corrects.trim()
+              ? args.corrects.split(",").map((id: string) => id.trim()).filter(Boolean)
+              : undefined;
             const lessonSaveResult = await sdk.trigger({ function_id: "mem::lesson-save", payload: {
               content: args.content,
               context: args.context || "",
               confidence: args.confidence,
               project: args.project,
               tags: lessonTags,
+              corrects,
               source: "manual",
             } });
             return { status_code: 200, body: { content: [{ type: "text", text: JSON.stringify(lessonSaveResult, null, 2) }] } };

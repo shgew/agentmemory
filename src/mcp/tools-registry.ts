@@ -202,13 +202,13 @@ export const CORE_TOOLS: McpToolDef[] = [
   },
   {
     name: "memory_relations",
-    description: "Query the memory relationship graph.",
+    description: "Query memory relationships or a lesson correction chain.",
     inputSchema: {
       type: "object",
       properties: {
         memoryId: {
           type: "string",
-          description: "Memory ID to find relations for",
+          description: "Memory ID or lesson ID to find relations for",
         },
         maxHops: {
           type: "number",
@@ -754,13 +754,13 @@ export const V061_TOOLS: McpToolDef[] = [
   {
     name: "memory_verify",
     description:
-      "Verify a memory or observation by tracing its citation chain back to source observations and session context. Returns provenance information including confidence scores.",
+      "Verify a memory, lesson, or observation by tracing its citation or correction chain and source context.",
     inputSchema: {
       type: "object",
       properties: {
         id: {
           type: "string",
-          description: "Memory ID or observation ID to verify",
+          description: "Memory ID, lesson ID, or observation ID to verify",
         },
       },
       required: ["id"],
@@ -772,7 +772,7 @@ export const V070_TOOLS: McpToolDef[] = [
   {
     name: "memory_lesson_save",
     description:
-      "Save a lesson learned from this session. Lessons have confidence scores that strengthen when reinforced and decay when not used. Duplicate content auto-strengthens the existing lesson.",
+      "Save or correct a lesson. Same-project exact and near-duplicate content strengthens the existing lesson; corrected lessons are superseded in recall.",
     inputSchema: {
       type: "object",
       properties: {
@@ -790,6 +790,10 @@ export const V070_TOOLS: McpToolDef[] = [
         },
         project: { type: "string", description: "Project this lesson is about" },
         tags: { type: "string", description: "Comma-separated tags" },
+        corrects: {
+          type: "string",
+          description: "Comma-separated lesson IDs this lesson corrects",
+        },
       },
       required: ["content"],
     },
