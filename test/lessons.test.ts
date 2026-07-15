@@ -200,9 +200,9 @@ describe("Lessons", () => {
 
   describe("mem::lesson-list", () => {
     beforeEach(async () => {
-      await sdk.trigger("mem::lesson-save", { content: "Lesson A", confidence: 0.9, project: "/app" });
-      await sdk.trigger("mem::lesson-save", { content: "Lesson B", confidence: 0.3, project: "/app" });
-      await sdk.trigger("mem::lesson-save", { content: "Lesson C", confidence: 0.7, source: "crystal" });
+      await sdk.trigger("mem::lesson-save", { content: "Database indexing strategy", confidence: 0.9, project: "/app" });
+      await sdk.trigger("mem::lesson-save", { content: "Input validation boundaries", confidence: 0.3, project: "/app" });
+      await sdk.trigger("mem::lesson-save", { content: "Deployment rollback procedure", confidence: 0.7, source: "crystal" });
     });
 
     it("lists all lessons sorted by confidence", async () => {
@@ -275,10 +275,10 @@ describe("Lessons", () => {
 
   describe("mem::lesson-decay-sweep", () => {
     it("decays old lessons incrementally", async () => {
-      const saved = (await sdk.trigger("mem::lesson-save", {
+      await sdk.trigger("mem::lesson-save", {
         content: "Old lesson",
         confidence: 0.8,
-      })) as { lesson: Lesson };
+      });
 
       const lessons = await kv.list<Lesson>("mem:lessons");
       const lesson = lessons[0];

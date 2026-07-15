@@ -1,88 +1,30 @@
 import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
-import { KV, fingerprintId } from "../state/schema.js";
+import { KV } from "../state/schema.js";
 import type { Lesson } from "../types.js";
-import { recordAudit } from "./audit.js";
-
-function reinforceLesson(lesson: Lesson): void {
-  const now = new Date().toISOString();
-  lesson.reinforcements++;
-  lesson.confidence = Math.min(
-    1.0,
-    lesson.confidence + 0.1 * (1 - lesson.confidence),
-  );
-  lesson.lastReinforcedAt = now;
-  lesson.updatedAt = now;
-}
+import { recordAudit, safeAudit } from "./audit.js";
+import {
+  filterSupersededLessons,
+  reinforceLesson,
+  saveLesson,
+  type LessonSaveInput,
+} from "./lesson-state.js";
 
 export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::lesson-save", 
-    async (data: {
-      content: string;
-      context?: string;
-      confidence?: number;
-      project?: string;
-      tags?: string[];
-      source?: "crystal" | "manual" | "consolidation";
-      sourceIds?: string[];
-    }) => {
-      if (!data.content?.trim()) {
-        return { success: false, error: "content is required" };
-      }
+    async (data: LessonSaveInput) => {
+      const result = await saveLesson(kv, data);
+      if (!result.success) return result;
 
-      const fp = fingerprintId("lsn", data.content.trim().toLowerCase());
-      const existing = await kv.get<Lesson>(KV.lessons, fp);
+      await safeAudit(
+        kv,
+        result.action === "created" ? "lesson_save" : "lesson_strengthen",
+        "mem::lesson-save",
+        [result.lesson.id],
+        result.action === "strengthened" ? { match: result.match } : {},
+      );
 
-      if (existing && !existing.deleted) {
-        reinforceLesson(existing);
-        if (data.context && !existing.context) {
-          existing.context = data.context;
-        }
-        await kv.set(KV.lessons, existing.id, existing);
-
-        try {
-          await recordAudit(kv, "lesson_strengthen", "mem::lesson-save", [
-            existing.id,
-          ]);
-        } catch {}
-
-        return {
-          success: true,
-          action: "strengthened",
-          lesson: existing,
-        };
-      }
-
-      const confidence =
-        typeof data.confidence === "number" &&
-        data.confidence >= 0 &&
-        data.confidence <= 1
-          ? data.confidence
-          : 0.5;
-
-      const now = new Date().toISOString();
-      const lesson: Lesson = {
-        id: fp,
-        content: data.content.trim(),
-        context: data.context?.trim() || "",
-        confidence,
-        reinforcements: 0,
-        source: data.source || "manual",
-        sourceIds: data.sourceIds || [],
-        project: data.project,
-        tags: data.tags || [],
-        createdAt: now,
-        updatedAt: now,
-        decayRate: 0.05,
-      };
-
-      await kv.set(KV.lessons, lesson.id, lesson);
-
-      try {
-        await recordAudit(kv, "lesson_save", "mem::lesson-save", [lesson.id]);
-      } catch {}
-
-      return { success: true, action: "created", lesson };
+      return result;
     },
   );
 
@@ -101,11 +43,9 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
       const minConfidence = data.minConfidence ?? 0.1;
       const limit = data.limit ?? 10;
 
-      let lessons = await kv.list<Lesson>(KV.lessons);
+      let lessons = filterSupersededLessons(await kv.list<Lesson>(KV.lessons));
 
-      lessons = lessons.filter(
-        (l) => !l.deleted && l.confidence >= minConfidence,
-      );
+      lessons = lessons.filter((l) => l.confidence >= minConfidence);
 
       if (data.project) {
         lessons = lessons.filter((l) => l.project === data.project);
@@ -133,12 +73,10 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
 
       scored.sort((a, b) => b.score - a.score);
 
-      try {
-        await recordAudit(kv, "lesson_recall", "mem::lesson-recall", [], {
-          query: data.query,
-          resultCount: scored.length,
-        });
-      } catch {}
+      await safeAudit(kv, "lesson_recall", "mem::lesson-recall", [], {
+        query: data.query,
+        resultCount: scored.length,
+      });
 
       return {
         success: true,
@@ -159,11 +97,9 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
     }) => {
       const limit = data.limit ?? 50;
       const minConfidence = data.minConfidence ?? 0;
-      let lessons = await kv.list<Lesson>(KV.lessons);
+      let lessons = filterSupersededLessons(await kv.list<Lesson>(KV.lessons));
 
-      lessons = lessons.filter(
-        (l) => !l.deleted && l.confidence >= minConfidence,
-      );
+      lessons = lessons.filter((l) => l.confidence >= minConfidence);
 
       if (data.project) {
         lessons = lessons.filter((l) => l.project === data.project);
@@ -193,11 +129,9 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
 
       await kv.set(KV.lessons, lesson.id, lesson);
 
-      try {
-        await recordAudit(kv, "lesson_strengthen", "mem::lesson-strengthen", [
-          lesson.id,
-        ]);
-      } catch {}
+      await safeAudit(kv, "lesson_strengthen", "mem::lesson-strengthen", [
+        lesson.id,
+      ]);
 
       return { success: true, lesson };
     },

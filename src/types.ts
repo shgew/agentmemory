@@ -851,6 +851,7 @@ export interface Lesson {
   sourceIds: string[];
   project?: string;
   tags: string[];
+  corrects?: string[];
   createdAt: string;
   updatedAt: string;
   lastReinforcedAt?: string;
