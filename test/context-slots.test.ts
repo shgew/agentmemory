@@ -2,6 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { registerContextFunction } from "../src/functions/context.js";
 import { KV } from "../src/state/schema.js";
 
+declare const process: { env: Record<string, string | undefined> };
+const env = process.env;
+
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
   return {
@@ -46,9 +49,12 @@ async function seedPinnedSlot(
   label: string,
   content: string,
   scope: "project" | "global" = "global",
+  updatedAt = new Date().toISOString(),
 ) {
   const target = scope === "global" ? KV.globalSlots : KV.slots;
-  await kv.set(target, label, {
+  const project = "/tmp/proj";
+  const key = scope === "global" ? label : `${project}:${label}`;
+  await kv.set(target, key, {
     label,
     content,
     description: "",
@@ -56,19 +62,20 @@ async function seedPinnedSlot(
     pinned: true,
     readOnly: false,
     scope,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
+    ...(scope === "project" ? { project } : {}),
+    createdAt: updatedAt,
+    updatedAt,
   });
 }
 
 describe("mem::context — pinned slot injection", () => {
-  const ORIGINAL_SLOTS_ENV = process.env["AGENTMEMORY_SLOTS"];
+  const ORIGINAL_SLOTS_ENV = env["AGENTMEMORY_SLOTS"];
 
   afterEach(() => {
     if (ORIGINAL_SLOTS_ENV === undefined) {
-      delete process.env["AGENTMEMORY_SLOTS"];
+      delete env["AGENTMEMORY_SLOTS"];
     } else {
-      process.env["AGENTMEMORY_SLOTS"] = ORIGINAL_SLOTS_ENV;
+      env["AGENTMEMORY_SLOTS"] = ORIGINAL_SLOTS_ENV;
     }
   });
 
@@ -77,7 +84,7 @@ describe("mem::context — pinned slot injection", () => {
     let handler: ContextHandler;
 
     beforeEach(() => {
-      process.env["AGENTMEMORY_SLOTS"] = "true";
+      env["AGENTMEMORY_SLOTS"] = "true";
       kv = mockKV();
       handler = wireContext(kv);
     });
@@ -109,6 +116,43 @@ describe("mem::context — pinned slot injection", () => {
       expect(guidelinesIdx).toBeGreaterThan(-1);
       expect(prefsIdx).toBeGreaterThan(-1);
       expect(guidelinesIdx).toBeLessThan(prefsIdx);
+    });
+
+    it("emits one block per slot ordered by updatedAt then label", async () => {
+      await seedPinnedSlot(
+        kv,
+        "z_old",
+        "OLD-SLOT",
+        "global",
+        "2026-01-01T00:00:00.000Z",
+      );
+      await seedPinnedSlot(
+        kv,
+        "b_new",
+        "NEW-SLOT-B",
+        "global",
+        "2026-01-02T00:00:00.000Z",
+      );
+      await seedPinnedSlot(
+        kv,
+        "a_new",
+        "NEW-SLOT-A",
+        "global",
+        "2026-01-02T00:00:00.000Z",
+      );
+
+      const result = await handler({
+        sessionId: "ses_order",
+        project: "/tmp/proj",
+      });
+
+      expect(result.blocks).toBe(3);
+      expect(result.context.indexOf("NEW-SLOT-A")).toBeLessThan(
+        result.context.indexOf("NEW-SLOT-B"),
+      );
+      expect(result.context.indexOf("NEW-SLOT-B")).toBeLessThan(
+        result.context.indexOf("OLD-SLOT"),
+      );
     });
 
     it("skips unpinned slots even when they have content", async () => {
@@ -159,7 +203,7 @@ describe("mem::context — pinned slot injection", () => {
 
   describe("when AGENTMEMORY_SLOTS is off", () => {
     it("does not include any slot content", async () => {
-      delete process.env["AGENTMEMORY_SLOTS"];
+      delete env["AGENTMEMORY_SLOTS"];
       const kv = mockKV();
       const handler = wireContext(kv);
 

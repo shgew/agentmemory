@@ -3,10 +3,14 @@ import { registerContextFunction } from "../src/functions/context.js";
 import { KV } from "../src/state/schema.js";
 import type {
   Lesson,
+  ProjectProfile,
   Session,
   SessionSummary,
   MemorySlot,
 } from "../src/types.js";
+
+declare const process: { env: Record<string, string | undefined> };
+const env = process.env;
 
 // Regression coverage for the deployed-budget lessons starvation:
 // at TOKEN_BUDGET=5000 the whole "## Lessons Learned" block was dropped
@@ -61,6 +65,7 @@ async function seedSlot(
   kv: ReturnType<typeof mockKV>,
   label: string,
   content: string,
+  scope: "project" | "global" = "global",
 ) {
   const slot: MemorySlot = {
     label,
@@ -69,11 +74,14 @@ async function seedSlot(
     sizeLimit: 20000,
     pinned: true,
     readOnly: false,
-    scope: "global",
+    scope,
+    ...(scope === "project" ? { project: PROJECT } : {}),
     createdAt: NOW,
     updatedAt: NOW,
   };
-  await kv.set(KV.globalSlots, label, slot);
+  const target = scope === "project" ? KV.slots : KV.globalSlots;
+  const key = scope === "project" ? `${PROJECT}:${label}` : label;
+  await kv.set(target, key, slot);
 }
 
 async function seedLesson(
@@ -129,17 +137,17 @@ async function seedSessionWithSummary(
 }
 
 describe("mem::context — lessons survive the deployed token budget", () => {
-  const ORIGINAL_SLOTS_ENV = process.env["AGENTMEMORY_SLOTS"];
+  const ORIGINAL_SLOTS_ENV = env["AGENTMEMORY_SLOTS"];
 
   beforeEach(() => {
-    process.env["AGENTMEMORY_SLOTS"] = "true";
+    env["AGENTMEMORY_SLOTS"] = "true";
   });
 
   afterEach(() => {
     if (ORIGINAL_SLOTS_ENV === undefined) {
-      delete process.env["AGENTMEMORY_SLOTS"];
+      delete env["AGENTMEMORY_SLOTS"];
     } else {
-      process.env["AGENTMEMORY_SLOTS"] = ORIGINAL_SLOTS_ENV;
+      env["AGENTMEMORY_SLOTS"] = ORIGINAL_SLOTS_ENV;
     }
   });
 
@@ -149,7 +157,7 @@ describe("mem::context — lessons survive the deployed token budget", () => {
 
     // Load-bearing pinned slots (~1.6k tokens) must stay first.
     await seedSlot(kv, "tool_guidelines", "SLOT-GUIDE " + "g".repeat(2400));
-    await seedSlot(kv, "project_context", "SLOT-CTX " + "p".repeat(2400));
+    await seedSlot(kv, "project_context", "SLOT-CTX " + "p".repeat(2400), "project");
 
     // Days-old lessons — the block sorts behind everything from today.
     for (let i = 0; i < 4; i++) {
@@ -181,7 +189,7 @@ describe("mem::context — lessons survive the deployed token budget", () => {
     const handler = wireContext(kv, 5000);
 
     await seedSlot(kv, "tool_guidelines", "SLOT-GUIDE " + "g".repeat(2400));
-    await seedSlot(kv, "project_context", "SLOT-CTX " + "p".repeat(2400));
+    await seedSlot(kv, "project_context", "SLOT-CTX " + "p".repeat(2400), "project");
 
     // 10 large lessons -> a monolithic block far bigger than the whole
     // budget. It must be trimmed to a reserved sub-budget, not skipped.
@@ -206,5 +214,44 @@ describe("mem::context — lessons survive the deployed token budget", () => {
     expect(matched.length).toBeGreaterThan(0);
     // Total budget respected.
     expect(result.tokens).toBeLessThanOrEqual(5000);
+  });
+
+  it("packs small slots, profile, and lessons when an oversized slot cannot fit", async () => {
+    const kv = mockKV();
+    const handler = wireContext(kv, 2000);
+
+    await seedSlot(kv, "oversized", "OVERSIZED-SLOT " + "o".repeat(7000));
+    await seedSlot(kv, "small_a", "SMALL-SLOT-A");
+    await seedSlot(kv, "small_b", "SMALL-SLOT-B");
+    await kv.set(KV.profiles, PROJECT, {
+      project: PROJECT,
+      topConcepts: [{ concept: "PROFILE-MARKER", frequency: 3 }],
+      topFiles: [],
+      conventions: [],
+      commonErrors: [],
+      recentActivity: [],
+      sessionCount: 0,
+      totalObservations: 0,
+      updatedAt: NOW,
+    } satisfies ProjectProfile);
+    await seedLesson(kv, {
+      id: "budget-lesson",
+      content: "BUDGET-LESSON-MARKER " + "l".repeat(300),
+      project: PROJECT,
+      confidence: 0.9,
+    });
+
+    const result = await handler({
+      sessionId: "ses_current",
+      project: PROJECT,
+    });
+
+    expect(result.context).not.toContain("OVERSIZED-SLOT");
+    expect(result.context).toContain("SMALL-SLOT-A");
+    expect(result.context).toContain("SMALL-SLOT-B");
+    expect(result.context).toContain("PROFILE-MARKER");
+    expect(result.context).toContain("Lessons Learned");
+    expect(result.context).toContain("BUDGET-LESSON-MARKER");
+    expect(result.tokens).toBeLessThanOrEqual(2000);
   });
 });

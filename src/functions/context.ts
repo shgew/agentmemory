@@ -42,12 +42,12 @@ export function registerContextFunction(
       const header = `<agentmemory-context project="${escapeXmlAttr(data.project)}">`;
       const footer = `</agentmemory-context>`;
       const wrapperTokens = estimateTokens(header) + estimateTokens(footer);
-      let slotBlockTokens = 0;
+      const slotBlocks: ContextBlock[] = [];
       let profileBlockTokens = 0;
 
       const [pinnedSlots, profile, lessons] = await Promise.all([
         isSlotsEnabled()
-          ? listPinnedSlots(kv).catch(() => [] as MemorySlot[])
+          ? listPinnedSlots(kv, data.project).catch(() => [] as MemorySlot[])
           : Promise.resolve([] as MemorySlot[]),
         kv
           .get<ProjectProfile>(KV.profiles, data.project)
@@ -55,16 +55,17 @@ export function registerContextFunction(
         kv.list<Lesson>(KV.lessons).catch(() => [] as Lesson[]),
       ]);
 
-      const slotContent = renderPinnedContext(pinnedSlots);
-      if (slotContent) {
-        slotBlockTokens = estimateTokens(slotContent);
-        blocks.push({
+      for (const slot of pinnedSlots) {
+        const slotContent = renderPinnedContext([slot]);
+        const slotBlock: ContextBlock = {
           type: "memory",
           content: slotContent,
-          tokens: slotBlockTokens,
-          recency: Date.now(),
+          tokens: estimateTokens(slotContent),
+          recency: new Date(slot.updatedAt).getTime(),
           priority: 3,
-        });
+        };
+        slotBlocks.push(slotBlock);
+        blocks.push(slotBlock);
       }
       if (profile) {
         const profileParts = [];
@@ -135,11 +136,9 @@ export function registerContextFunction(
         // consume, then keep the full block when it fits, else pack the
         // highest-ranked lessons up to a soft sub-budget. #457 starvation fix.
         let reservedBeforeLessons = wrapperTokens;
-        if (
-          slotBlockTokens > 0 &&
-          reservedBeforeLessons + slotBlockTokens <= budget
-        ) {
-          reservedBeforeLessons += slotBlockTokens;
+        for (const slotBlock of slotBlocks) {
+          if (reservedBeforeLessons + slotBlock.tokens > budget) continue;
+          reservedBeforeLessons += slotBlock.tokens;
         }
         if (
           profileBlockTokens > 0 &&
