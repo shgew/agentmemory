@@ -119,7 +119,7 @@ function emptySnapshot(): GraphSnapshot {
   };
 }
 
-function buildSnapshotFromArrays(
+export function buildSnapshotFromArrays(
   nodes: GraphNode[],
   edges: GraphEdge[],
 ): GraphSnapshot {
