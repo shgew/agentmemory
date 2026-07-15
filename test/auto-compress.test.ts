@@ -79,10 +79,11 @@ describe("mem::observe auto-compress gate (#138)", () => {
     // test that sets the env var can be undermined by cached module
     // state from an earlier test (and vice versa).
     vi.resetModules();
-    delete process.env["AGENTMEMORY_AUTO_COMPRESS"];
+    vi.unstubAllEnvs();
+    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "");
   });
   afterEach(() => {
-    delete process.env["AGENTMEMORY_AUTO_COMPRESS"];
+    vi.unstubAllEnvs();
   });
 
   it("default (AGENTMEMORY_AUTO_COMPRESS unset): does NOT fire mem::compress", async () => {
@@ -132,7 +133,7 @@ describe("mem::observe auto-compress gate (#138)", () => {
   });
 
   it("AGENTMEMORY_AUTO_COMPRESS=true: fires mem::compress exactly once", async () => {
-    process.env["AGENTMEMORY_AUTO_COMPRESS"] = "true";
+    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "true");
     const { registerObserveFunction } = await import(
       "../src/functions/observe.js"
     );
@@ -147,7 +148,7 @@ describe("mem::observe auto-compress gate (#138)", () => {
   });
 
   it("AGENTMEMORY_AUTO_COMPRESS=false explicitly: does NOT fire mem::compress", async () => {
-    process.env["AGENTMEMORY_AUTO_COMPRESS"] = "false";
+    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "false");
     const { registerObserveFunction } = await import(
       "../src/functions/observe.js"
     );
@@ -208,7 +209,7 @@ describe("buildSyntheticCompression", () => {
       raw: {},
     });
     expect(synth.files).toContain("/app/src/bar.ts");
-    expect(synth.files).toContain("foo");
+    expect(synth.files).not.toContain("foo");
     expect(synth.type).toBe("file_edit");
   });
 

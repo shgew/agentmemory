@@ -480,6 +480,8 @@ export function registerMigrateFunction(sdk: ISdk, kv: StateKV): void {
             id: row.id || generateId("mig"),
             sessionId,
             timestamp: row.created_at || new Date().toISOString(),
+            sourceType: row.source_type || row.hook_type || "migration",
+            toolName: row.tool_name || undefined,
             type: row.type || "other",
             title: row.title || row.summary || "Migrated observation",
             subtitle: row.subtitle,

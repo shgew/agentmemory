@@ -33,7 +33,7 @@ export interface RawObservation {
   id: string;
   sessionId: string;
   timestamp: string;
-  hookType: HookType;
+  hookType: string;
   toolName?: string;
   toolInput?: unknown;
   toolOutput?: unknown;
@@ -49,6 +49,8 @@ export interface CompressedObservation {
   id: string;
   sessionId: string;
   timestamp: string;
+  sourceType: string;
+  toolName?: string;
   type: ObservationType;
   title: string;
   subtitle?: string;
@@ -133,7 +135,7 @@ export type HookType =
   | "session_end";
 
 export interface HookPayload {
-  hookType: HookType;
+  hookType: string;
   sessionId: string;
   project: string;
   cwd: string;

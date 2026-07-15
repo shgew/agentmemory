@@ -22,6 +22,11 @@ import { scoreCompression } from "../eval/quality.js";
 import { compressWithRetry } from "../eval/self-correct.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { logger } from "../logger.js";
+import {
+  extractObservationFiles,
+  inferObservationType,
+  observationImportance,
+} from "./compress-synthetic.js";
 
 const VALID_TYPES = new Set<string>([
   "file_read",
@@ -43,7 +48,10 @@ const VALID_TYPES = new Set<string>([
 
 function parseCompressionXml(
   xml: string,
-): Omit<CompressedObservation, "id" | "sessionId" | "timestamp"> | null {
+): Omit<
+  CompressedObservation,
+  "id" | "sessionId" | "timestamp" | "sourceType" | "toolName"
+> | null {
   const rawType = getXmlTag(xml, "type");
   const title = getXmlTag(xml, "title");
   if (!rawType || !title) return null;
@@ -155,12 +163,21 @@ export function registerCompressFunction(
         }
 
         const qualityScore = scoreCompression(parsed);
+        const type = inferObservationType(data.raw, parsed.type);
+        const files = [
+          ...new Set([...extractObservationFiles(data.raw), ...parsed.files]),
+        ];
 
         const compressed: CompressedObservation = {
           id: data.observationId,
           sessionId: data.sessionId,
           timestamp: data.raw.timestamp,
           ...parsed,
+          sourceType: data.raw.hookType,
+          ...(data.raw.toolName ? { toolName: data.raw.toolName } : {}),
+          type,
+          files,
+          importance: observationImportance(data.raw, type),
           confidence: qualityScore / 100,
           ...(hasImage ? { modality: data.raw.modality } : {}),
           ...(imageDescription ? { imageDescription } : {}),
