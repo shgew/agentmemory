@@ -1,22 +1,14 @@
 import type { ISdk } from "iii-sdk";
 import type {
-  Session,
-  CompressedObservation,
-  SessionSummary,
-  ContextBlock,
-  ProjectProfile,
-  MemorySlot,
-  Lesson,
+  Session, CompressedObservation, SessionSummary, ContextBlock,
+  ProjectProfile, MemorySlot, Lesson,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { recordAccessBatch } from "./access-tracker.js";
 import { logger } from "../logger.js";
-import {
-  isSlotsEnabled,
-  listPinnedSlots,
-  renderPinnedContext,
-} from "./slots.js";
+import { isSlotsEnabled, listPinnedSlots, renderPinnedContext } from "./slots.js";
+import { filterSupersededLessons } from "./lesson-state.js";
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 3);
@@ -111,8 +103,8 @@ export function registerContextFunction(
       // thinks to call memory_lesson_recall. Ranking puts project-scoped
       // lessons ahead of global ones, then weights by confidence; we cap at
       // 10 before packing. #457.
-      const relevantLessons = lessons
-        .filter((l) => !l.deleted && (!l.project || l.project === data.project))
+      const relevantLessons = filterSupersededLessons(lessons)
+        .filter((l) => !l.project || l.project === data.project)
         .sort((a, b) => {
           const scoreA = (a.project === data.project ? 1.5 : 1) * a.confidence;
           const scoreB = (b.project === data.project ? 1.5 : 1) * b.confidence;

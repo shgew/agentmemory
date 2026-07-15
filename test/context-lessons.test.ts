@@ -54,6 +54,7 @@ function makeLesson(over: Partial<Lesson> = {}): Lesson {
     sourceIds: over.sourceIds ?? [],
     project: over.project,
     tags: over.tags ?? [],
+    corrects: over.corrects,
     createdAt: over.createdAt ?? now,
     updatedAt: over.updatedAt ?? now,
     lastReinforcedAt: over.lastReinforcedAt,
@@ -165,6 +166,32 @@ describe("mem::context — lessons auto-injection (#457)", () => {
     });
 
     expect(result.context).not.toContain("tombstoned-lesson");
+  });
+
+  it("replaces superseded advice with its active correction", async () => {
+    const obsolete = await seedLesson(kv, {
+      id: "lsn_obsolete",
+      content: "always set allocator arenas globally",
+      project: "/tmp/proj",
+      confidence: 0.95,
+    });
+    await seedLesson(kv, {
+      id: "lsn_correction",
+      content: "measure allocator fragmentation before tuning arenas",
+      project: "/tmp/proj",
+      confidence: 0.5,
+      corrects: [obsolete.id],
+    });
+
+    const result = await handler({
+      sessionId: "ses_supersession",
+      project: "/tmp/proj",
+    });
+
+    expect(result.context).toContain(
+      "measure allocator fragmentation before tuning arenas",
+    );
+    expect(result.context).not.toContain("always set allocator arenas globally");
   });
 
   it("caps at the top 10 lessons by confidence", async () => {
