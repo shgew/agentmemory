@@ -16,6 +16,7 @@ import {
 } from "../functions/graph-retrieval.js";
 import { extractEntitiesFromQuery } from "../functions/query-expansion.js";
 import { rerank } from "./reranker.js";
+import { isGraphSearchEnabled } from "../config.js";
 
 const RRF_K = 60;
 
@@ -31,6 +32,7 @@ export class HybridSearch {
     private vectorWeight = 0.6,
     private graphWeight = 0.3,
     private rerankEnabled = process.env.RERANK_ENABLED === "true",
+    private graphSearchEnabled = isGraphSearchEnabled(),
   ) {
     this.graphRetrieval = new GraphRetrieval(kv);
   }
@@ -97,31 +99,36 @@ export class HybridSearch {
       }
     }
 
-    const entities =
-      entityHints && entityHints.length > 0
-        ? entityHints
-        : extractEntitiesFromQuery(query);
     let graphResults: GraphRetrievalResult[] = [];
-    if (entities.length > 0) {
-      try {
-        graphResults = await this.graphRetrieval.searchByEntities(
-          entities,
-          2,
-          limit,
-        );
-      } catch {
-        // graph search is best-effort
+    // GRAPH_SEARCH_ENABLED is a TRUE bypass: when off, the graph snapshot is
+    // never read and GraphRetrieval never runs, so no graph stream enters RRF
+    // fusion (distinct from graphWeight=0, which still traverses then zeroes).
+    if (this.graphSearchEnabled) {
+      const entities =
+        entityHints && entityHints.length > 0
+          ? entityHints
+          : extractEntitiesFromQuery(query);
+      if (entities.length > 0) {
+        try {
+          graphResults = await this.graphRetrieval.searchByEntities(
+            entities,
+            2,
+            limit,
+          );
+        } catch {
+          // graph search is best-effort
+        }
       }
-    }
 
-    const topVectorObs = vectorResults.slice(0, 5).map((r) => r.obsId);
-    if (topVectorObs.length > 0) {
-      try {
-        const expansionResults =
-          await this.graphRetrieval.expandFromChunks(topVectorObs, 1, 5);
-        graphResults = [...graphResults, ...expansionResults];
-      } catch {
-        // expansion is best-effort
+      const topVectorObs = vectorResults.slice(0, 5).map((r) => r.obsId);
+      if (topVectorObs.length > 0) {
+        try {
+          const expansionResults =
+            await this.graphRetrieval.expandFromChunks(topVectorObs, 1, 5);
+          graphResults = [...graphResults, ...expansionResults];
+        } catch {
+          // expansion is best-effort
+        }
       }
     }
 

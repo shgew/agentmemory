@@ -2,6 +2,7 @@ import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId } from "../state/schema.js";
 import type { Action, ActionEdge, Crystal, MemoryProvider } from "../types.js";
+import { isAutoCrystallizeEnabled } from "../config.js";
 
 interface CrystalDigest {
   narrative: string;
@@ -151,6 +152,14 @@ export function registerCrystallizeFunction(
       project?: string;
       dryRun?: boolean;
     }) => {
+      // Server-side kill switch: the automatic entry point is gated behind
+      // AUTO_CRYSTALLIZE_ENABLED. When off, skip explicitly (never a silent
+      // success) before touching any KV / provider state so a skip is
+      // distinguishable from "ran and found nothing". Manual mem::crystallize
+      // above is intentionally NOT gated.
+      if (!isAutoCrystallizeEnabled()) {
+        return { skipped: true, reason: "AUTO_CRYSTALLIZE_ENABLED=false" };
+      }
       const olderThanDays = data.olderThanDays ?? 7;
       const dryRun = data.dryRun ?? false;
       const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;

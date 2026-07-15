@@ -5,13 +5,15 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 vi.mock("../src/config.js", () => ({
-  getConsolidationDecayDays: () => 30,
+getConsolidationDecayDays: () => 30,
   isConsolidationEnabled: vi.fn(() => true),
+  isInsightSynthesisEnabled: vi.fn(() => true),
+  isProceduralExtractionEnabled: vi.fn(() => true),
 }));
 
 import { registerConsolidationPipelineFunction } from "../src/functions/consolidation-pipeline.js";
 import { registerReflectFunctions } from "../src/functions/reflect.js";
-import { isConsolidationEnabled } from "../src/config.js";
+import { isConsolidationEnabled, isInsightSynthesisEnabled, isProceduralExtractionEnabled } from "../src/config.js";
 import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory } from "../src/types.js";
 
 function mockKV() {
@@ -119,10 +121,14 @@ describe("Consolidation Pipeline", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
 
-  beforeEach(() => {
-    sdk = mockSdk();
+beforeEach(() => {
+sdk = mockSdk();
     kv = mockKV();
-  });
+    // Existing tests assume the reflect + procedural tiers run; default the
+    // new kill-switch flags to enabled here and let the skip-tests override.
+    vi.mocked(isInsightSynthesisEnabled).mockReturnValue(true);
+    vi.mocked(isProceduralExtractionEnabled).mockReturnValue(true);
+});
 
   it("pipeline skips semantic when fewer than 5 summaries", async () => {
     const provider = {
@@ -405,5 +411,110 @@ describe("Consolidation Pipeline", () => {
 
     const wm = await kv.get("mem:config", "reflect:last-success:global");
     expect(wm).toBeNull();
+  });
+
+  // ── Kill-switch flags: INSIGHT_SYNTHESIS_ENABLED / PROCEDURAL_EXTRACTION_ENABLED ──
+
+  it("BASELINE: reflect + procedural tiers run with force:true and no flag gating", async () => {
+    // Pins current behavior. With both flags enabled (the default the mock
+    // uses for legacy tests) the forced tier=all pipeline attempts reflect
+    // and procedural. This documents the pre-kill-switch contract.
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<procedures><procedure name="Baseline Flow" trigger="when x"><step>do y</step></procedure></procedures>`,
+      ),
+    };
+    const reflectFn = vi.fn().mockResolvedValue({ success: true, fullPassComplete: true });
+    sdk.registerFunction("mem::reflect", reflectFn);
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 3; i++) {
+      await kv.set("mem:memories", `mem_${i}`, makePattern(i));
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "all",
+      force: true,
+    })) as { success: boolean; results: Record<string, unknown> };
+
+    expect(result.success).toBe(true);
+    // reflect tier ran (mem::reflect invoked, not flag-skipped)
+    expect(reflectFn).toHaveBeenCalled();
+    const reflect = result.results.reflect as { skipped?: boolean };
+    expect(reflect.skipped).toBeUndefined();
+    // procedural tier ran (provider.summarize invoked, produced a procedure)
+    const procedural = result.results.procedural as { newProcedures?: number };
+    expect(procedural.newProcedures).toBe(1);
+  });
+
+  it("reflect tier skips with explicit reason when INSIGHT_SYNTHESIS_ENABLED is off, even with force:true", async () => {
+    vi.mocked(isInsightSynthesisEnabled).mockReturnValue(false);
+    vi.mocked(isProceduralExtractionEnabled).mockReturnValue(true);
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<procedures><procedure name="Flow" trigger="when x"><step>do y</step></procedure></procedures>`,
+      ),
+    };
+    const reflectFn = vi.fn().mockResolvedValue({ success: true, fullPassComplete: true });
+    sdk.registerFunction("mem::reflect", reflectFn);
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 3; i++) {
+      await kv.set("mem:memories", `mem_${i}`, makePattern(i));
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "all",
+      force: true,
+    })) as { success: boolean; results: Record<string, unknown> };
+
+    // reflect tier is an explicit skip, NOT a reflect invocation
+    expect(result.results.reflect).toEqual({
+      skipped: true,
+      reason: "INSIGHT_SYNTHESIS_ENABLED=false",
+    });
+    expect(reflectFn).not.toHaveBeenCalled();
+    // the skip must NOT falsely advance the reflect watermark
+    const wm = await kv.get("mem:config", "reflect:last-success:global");
+    expect(wm).toBeNull();
+    // procedural tier is independent of the insight flag and still runs
+    const procedural = result.results.procedural as { newProcedures?: number };
+    expect(procedural.newProcedures).toBe(1);
+  });
+
+  it("procedural tier skips with explicit reason when PROCEDURAL_EXTRACTION_ENABLED is off, even with force:true", async () => {
+    vi.mocked(isProceduralExtractionEnabled).mockReturnValue(false);
+    vi.mocked(isInsightSynthesisEnabled).mockReturnValue(true);
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<procedures><procedure name="Flow" trigger="when x"><step>do y</step></procedure></procedures>`,
+      ),
+    };
+    const reflectFn = vi.fn().mockResolvedValue({ success: true, fullPassComplete: true });
+    sdk.registerFunction("mem::reflect", reflectFn);
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 3; i++) {
+      await kv.set("mem:memories", `mem_${i}`, makePattern(i));
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "all",
+      force: true,
+    })) as { success: boolean; results: Record<string, unknown> };
+
+    // procedural tier is an explicit skip, provider never invoked for extraction
+    expect(result.results.procedural).toEqual({
+      skipped: true,
+      reason: "PROCEDURAL_EXTRACTION_ENABLED=false",
+    });
+    expect(provider.summarize).not.toHaveBeenCalled();
+    // reflect tier is independent of the procedural flag and still runs
+    expect(reflectFn).toHaveBeenCalled();
+    const reflect = result.results.reflect as { skipped?: boolean };
+    expect(reflect.skipped).toBeUndefined();
   });
 });

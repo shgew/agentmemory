@@ -163,6 +163,48 @@ process.on("unhandledRejection", (reason) => {
   );
 });
 
+// Graph function registration. Read/query + maintenance graph APIs
+// (mem::graph-query, mem::graph-stats, mem::graph-snapshot-rebuild, ...) plus
+// the extract function are all registered by registerGraphFunction. Graph
+// *production* (automatic extraction on session events) is gated separately by
+// isGraphExtractionEnabled() in triggers/events.ts, so read/query APIs can stay
+// available even when extraction is frozen. buildGraphProvider is a thunk so
+// the graph-specific provider (and its fallback chain) is only constructed when
+// extraction is actually enabled.
+export function registerGraphFunctions(
+  sdk: Parameters<typeof registerGraphFunction>[0],
+  kv: Parameters<typeof registerGraphFunction>[1],
+  defaultProvider: Parameters<typeof registerGraphFunction>[2],
+  buildGraphProvider: () => {
+    provider: Parameters<typeof registerGraphFunction>[2];
+    model: string;
+    baseModel: string;
+  },
+): void {
+  // Read/query + maintenance graph APIs register UNCONDITIONALLY so existing
+  // graph data stays queryable even when extraction is frozen. Only the
+  // extract function's provider (and the auto-extraction event trigger, gated
+  // separately in triggers/events.ts) depends on GRAPH_EXTRACTION_ENABLED.
+  const extractionEnabled = isGraphExtractionEnabled();
+  if (extractionEnabled) {
+    const built = buildGraphProvider();
+    registerGraphFunction(sdk, kv, built.provider);
+    bootLog(
+      built.model === built.baseModel
+        ? `Knowledge graph: extraction enabled`
+        : `Knowledge graph: extraction enabled (graph model ${built.model})`,
+    );
+  } else {
+    // Extraction frozen: register the same graph functions with the default
+    // provider so read/query still work. The extract fn is registered but its
+    // automatic production path stays gated in triggers/events.ts.
+    registerGraphFunction(sdk, kv, defaultProvider);
+    bootLog(
+      `Knowledge graph: extraction frozen (GRAPH_EXTRACTION_ENABLED=false); read/query APIs registered, existing graph data stays queryable`,
+    );
+  }
+}
+
 async function main() {
   const config = loadConfig();
   const embeddingConfig = loadEmbeddingConfig();
@@ -277,19 +319,18 @@ async function main() {
     );
   }
 
-  if (isGraphExtractionEnabled()) {
+  registerGraphFunctions(sdk, kv, provider, () => {
     const graphProviderConfig = resolveGraphProviderConfig(config.provider);
     const graphProvider =
       fallbackConfig.providers.length > 0
         ? createFallbackProvider(graphProviderConfig, fallbackConfig)
         : createProvider(graphProviderConfig);
-    registerGraphFunction(sdk, kv, graphProvider);
-    bootLog(
-      graphProviderConfig.model === config.provider.model
-        ? `Knowledge graph: extraction enabled`
-        : `Knowledge graph: extraction enabled (graph model ${graphProviderConfig.model})`,
-    );
-  }
+    return {
+      provider: graphProvider,
+      model: graphProviderConfig.model,
+      baseModel: config.provider.model,
+    };
+  });
 
   registerConsolidationPipelineFunction(sdk, kv, provider);
   bootLog(`Consolidation pipeline: registered (CONSOLIDATION_ENABLED=${isConsolidationEnabled() ? "true" : "false"})`);
@@ -725,7 +766,13 @@ async function main() {
   process.on("SIGTERM", shutdown);
 }
 
-main().catch((err) => {
-  console.error(`[agentmemory] Fatal:`, err);
-  process.exit(1);
-});
+// main() boots the worker as a side effect of importing this module (cli.ts
+// does `await import("./index.js")`; `npm run dev` runs it directly). Skip the
+// auto-boot under vitest so the exported registrars can be unit-tested without
+// connecting to the iii engine. Production never sets VITEST.
+if (!process.env.VITEST) {
+  main().catch((err) => {
+    console.error(`[agentmemory] Fatal:`, err);
+    process.exit(1);
+  });
+}

@@ -1,7 +1,14 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { HybridSearch } from "../src/state/hybrid-search.js";
 import { SearchIndex } from "../src/state/search-index.js";
-import type { CompressedObservation, EmbeddingProvider } from "../src/types.js";
+import type {
+  CompressedObservation,
+  EmbeddingProvider,
+  GraphNode,
+  GraphSnapshot,
+  HybridSearchResult,
+} from "../src/types.js";
+import { GraphRetrieval } from "../src/functions/graph-retrieval.js";
 
 function makeObs(
   overrides: Partial<CompressedObservation> = {},
@@ -179,5 +186,173 @@ describe("HybridSearch", () => {
     expect(results[0].observation.id).toBe("mem_abc");
     expect(results[0].observation.narrative).toBe("Test memory for search");
     expect(results[0].observation.concepts).toEqual(["test", "search"]);
+  });
+});
+
+// Deliverable #2: GRAPH_SEARCH_ENABLED is a TRUE bypass of graph consumption
+// in hybrid search (distinct from graphWeight=0, which still traverses the
+// snapshot before multiplying the contribution out). When the flag is
+// unset/false the snapshot must never be read, GraphRetrieval must never run,
+// and no graph stream may enter RRF fusion.
+describe("HybridSearch graph consumption kill switch (GRAPH_SEARCH_ENABLED)", () => {
+  const originalFlag = process.env.GRAPH_SEARCH_ENABLED;
+  let bm25: SearchIndex;
+
+  function graphSnapshotWithReactNode(): GraphSnapshot {
+    const node: GraphNode = {
+      id: "gn_react",
+      type: "library",
+      name: "React",
+      properties: {},
+      sourceObservationIds: ["obs_1"],
+      createdAt: new Date().toISOString(),
+    };
+    return {
+      version: 1,
+      topNodes: [node],
+      topEdges: [],
+      topDegrees: { [node.id]: 0 },
+      stats: {
+        totalNodes: 1,
+        totalEdges: 0,
+        nodesByType: { library: 1 },
+        edgesByType: {},
+      },
+      updatedAt: new Date().toISOString(),
+      dirty: false,
+    };
+  }
+
+  // Seeds the observation + (optionally) a graph snapshot and counts reads of
+  // the snapshot scope, so a test can prove the snapshot loader was never hit.
+  function mockKVWithSnapshot(
+    obs: CompressedObservation,
+    snapshot: GraphSnapshot | null,
+  ) {
+    const store = new Map<string, Map<string, unknown>>();
+    store.set(`mem:obs:${obs.sessionId}`, new Map([[obs.id, obs]]));
+    if (snapshot) {
+      store.set("mem:graph:snapshot", new Map([["current", snapshot]]));
+    }
+    let snapshotReads = 0;
+    const kv = {
+      get: async <T>(scope: string, key: string): Promise<T | null> => {
+        if (scope === "mem:graph:snapshot") snapshotReads++;
+        return (store.get(scope)?.get(key) as T) ?? null;
+      },
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (!store.has(scope)) store.set(scope, new Map());
+        store.get(scope)!.set(key, data);
+        return data;
+      },
+      delete: async (scope: string, key: string): Promise<void> => {
+        store.get(scope)?.delete(key);
+      },
+      list: async <T>(scope: string): Promise<T[]> => {
+        const entries = store.get(scope);
+        return entries ? (Array.from(entries.values()) as T[]) : [];
+      },
+    };
+    return { kv, snapshotReads: () => snapshotReads };
+  }
+
+  const project = (rs: HybridSearchResult[]) =>
+    rs.map((r) => ({
+      id: r.observation.id,
+      bm25Score: r.bm25Score,
+      vectorScore: r.vectorScore,
+      graphScore: r.graphScore,
+      combinedScore: r.combinedScore,
+    }));
+
+  beforeEach(() => {
+    bm25 = new SearchIndex();
+    bm25.add(makeObs({ id: "obs_1", sessionId: "ses_1" }));
+    delete process.env.GRAPH_SEARCH_ENABLED;
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    if (originalFlag === undefined) delete process.env.GRAPH_SEARCH_ENABLED;
+    else process.env.GRAPH_SEARCH_ENABLED = originalFlag;
+  });
+
+  it("never loads the snapshot or runs GraphRetrieval when the flag is unset/false", async () => {
+    const obs = makeObs({ id: "obs_1", sessionId: "ses_1" });
+    const { kv, snapshotReads } = mockKVWithSnapshot(
+      obs,
+      graphSnapshotWithReactNode(),
+    );
+    const searchSpy = vi.spyOn(GraphRetrieval.prototype, "searchByEntities");
+    const expandSpy = vi.spyOn(GraphRetrieval.prototype, "expandFromChunks");
+
+    const hybrid = new HybridSearch(bm25, null, null, kv as never);
+    const results = await hybrid.search("React auth");
+
+    // The snapshot's "React" node points at obs_1; if graph consumption ran it
+    // would score obs_1 via the graph stream. The flag-off path must bypass it.
+    expect(searchSpy).not.toHaveBeenCalled();
+    expect(expandSpy).not.toHaveBeenCalled();
+    expect(snapshotReads()).toBe(0);
+    expect(results[0].observation.id).toBe("obs_1");
+    expect(results[0].graphScore).toBe(0);
+  });
+
+  it("returns results identical to a BM25+vector-only baseline when the flag is off", async () => {
+    const obs = makeObs({ id: "obs_1", sessionId: "ses_1" });
+    // subject: snapshot present that WOULD contribute a graph score.
+    const subjectKv = mockKVWithSnapshot(
+      obs,
+      graphSnapshotWithReactNode(),
+    ).kv;
+    // baseline: no snapshot at all -> BM25 (+vector, none here) only.
+    const baselineKv = mockKVWithSnapshot(obs, null).kv;
+
+    const subject = await new HybridSearch(
+      bm25,
+      null,
+      null,
+      subjectKv as never,
+    ).search("React auth");
+    const baseline = await new HybridSearch(
+      bm25,
+      null,
+      null,
+      baselineKv as never,
+    ).search("React auth");
+
+    expect(project(subject)).toEqual(project(baseline));
+  });
+
+  it("consults the graph when GRAPH_SEARCH_ENABLED=true (existing behavior preserved)", async () => {
+    process.env.GRAPH_SEARCH_ENABLED = "true";
+    const obs = makeObs({ id: "obs_1", sessionId: "ses_1" });
+    const { kv, snapshotReads } = mockKVWithSnapshot(
+      obs,
+      graphSnapshotWithReactNode(),
+    );
+    const searchSpy = vi.spyOn(GraphRetrieval.prototype, "searchByEntities");
+
+    const hybrid = new HybridSearch(bm25, null, null, kv as never);
+    const results = await hybrid.search("React auth");
+
+    expect(searchSpy).toHaveBeenCalled();
+    expect(snapshotReads()).toBeGreaterThan(0);
+    const obs1 = results.find((r) => r.observation.id === "obs_1");
+    expect(obs1).toBeDefined();
+    expect(obs1!.graphScore).toBeGreaterThan(0);
+  });
+
+  it("does not crash and serves a no-graph path when the snapshot is stale/missing (STALE STATE)", async () => {
+    process.env.GRAPH_SEARCH_ENABLED = "true";
+    const obs = makeObs({ id: "obs_1", sessionId: "ses_1" });
+    // Flag flipped on but no snapshot present yet (stale/missing state).
+    const { kv } = mockKVWithSnapshot(obs, null);
+
+    const hybrid = new HybridSearch(bm25, null, null, kv as never);
+    const results = await hybrid.search("React auth");
+
+    expect(results[0].observation.id).toBe("obs_1");
+    expect(results[0].graphScore).toBe(0);
   });
 });

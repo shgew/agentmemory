@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -353,6 +353,17 @@ describe("Crystallize Functions", () => {
   });
 
   describe("mem::auto-crystallize", () => {
+    // These tests exercise the real crystallization work of the automatic
+    // entry point, which is now gated behind AUTO_CRYSTALLIZE_ENABLED. Enable
+    // the flag so the enabled-path behavior is characterized here; the
+    // "kill switch" block below covers the disabled path.
+    beforeEach(() => {
+      process.env.AUTO_CRYSTALLIZE_ENABLED = "true";
+    });
+    afterEach(() => {
+      delete process.env.AUTO_CRYSTALLIZE_ENABLED;
+    });
+
     it("returns group summaries in dryRun mode", async () => {
       const action = makeAction({
         id: "act_dry",
@@ -517,6 +528,84 @@ describe("Crystallize Functions", () => {
       expect(result.success).toBe(true);
       expect(result.groupCount).toBe(0);
       expect(result.crystalIds).toEqual([]);
+    });
+  });
+
+  // Kill switch: AUTO_CRYSTALLIZE_ENABLED gates ONLY the automatic entry
+  // point (mem::auto-crystallize). Manual mem::crystallize is never gated.
+  // Baseline (pinned by the "mem::auto-crystallize" block above): with no
+  // flag set today the auto path does real crystallization work. These tests
+  // pin the NEW behavior — with the flag unset/false the auto path must skip.
+  describe("mem::auto-crystallize kill switch", () => {
+    afterEach(() => {
+      delete process.env.AUTO_CRYSTALLIZE_ENABLED;
+    });
+
+    it("returns an explicit skip shape when AUTO_CRYSTALLIZE_ENABLED is unset", async () => {
+      delete process.env.AUTO_CRYSTALLIZE_ENABLED;
+      const action = makeAction({ id: "act_ks1", status: "done", project: "proj" });
+      await kv.set("mem:actions", action.id, action);
+
+      const result = (await sdk.trigger("mem::auto-crystallize", {})) as Record<
+        string,
+        unknown
+      >;
+
+      expect(result).toEqual({
+        skipped: true,
+        reason: "AUTO_CRYSTALLIZE_ENABLED=false",
+      });
+      // MISLEADING SUCCESS OUTPUT guard: the skip must not look like a run.
+      expect(result.success).toBeUndefined();
+      expect(result.crystalIds).toBeUndefined();
+      expect(result.groupCount).toBeUndefined();
+    });
+
+    it("skips when AUTO_CRYSTALLIZE_ENABLED is the string \"false\"", async () => {
+      process.env.AUTO_CRYSTALLIZE_ENABLED = "false";
+      const action = makeAction({ id: "act_ks2", status: "done", project: "proj" });
+      await kv.set("mem:actions", action.id, action);
+
+      const result = (await sdk.trigger("mem::auto-crystallize", {})) as Record<
+        string,
+        unknown
+      >;
+
+      expect(result).toEqual({
+        skipped: true,
+        reason: "AUTO_CRYSTALLIZE_ENABLED=false",
+      });
+    });
+
+    it("writes no crystals and invokes no provider work when skipped", async () => {
+      delete process.env.AUTO_CRYSTALLIZE_ENABLED;
+      const action = makeAction({ id: "act_ks3", status: "done", project: "proj" });
+      await kv.set("mem:actions", action.id, action);
+
+      await sdk.trigger("mem::auto-crystallize", {});
+
+      const crystals = await kv.list("mem:crystals");
+      expect(crystals).toEqual([]);
+      // No crystallization work means the LLM provider is never touched, so a
+      // skip is distinguishable from "ran and found nothing to crystallize".
+      expect(provider.summarize).not.toHaveBeenCalled();
+      // STALE STATE guard: the skipped action stays un-crystallized.
+      const untouched = await kv.get<Action>("mem:actions", "act_ks3");
+      expect(untouched!.crystallizedInto).toBeUndefined();
+    });
+
+    it("leaves manual mem::crystallize fully functional while the auto flag is off", async () => {
+      delete process.env.AUTO_CRYSTALLIZE_ENABLED;
+      const action = makeAction({ id: "act_ks_manual", status: "done" });
+      await kv.set("mem:actions", action.id, action);
+
+      const result = (await sdk.trigger("mem::crystallize", {
+        actionIds: ["act_ks_manual"],
+      })) as { success: boolean; crystal: Crystal };
+
+      expect(result.success).toBe(true);
+      expect(result.crystal.id).toMatch(/^crys_/);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
     });
   });
 });

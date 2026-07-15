@@ -333,6 +333,14 @@ export function getGraphBatchSize(): number {
   return safeParseInt(getMergedEnv()["GRAPH_EXTRACTION_BATCH_SIZE"], 10);
 }
 
+// Server-side kill switch for automatic lesson crystallization. Gates ONLY
+// the mem::auto-crystallize entry point (the plugin's fire-and-forget
+// /agentmemory/crystals/auto call). Manual mem::crystallize is never gated.
+// OFF by default so the automatic path stays opt-in.
+export function isAutoCrystallizeEnabled(): boolean {
+  return getMergedEnv()["AUTO_CRYSTALLIZE_ENABLED"] === "true";
+}
+
 // window for the smart-search followup-rate diagnostic. A second
 // search arriving within this many seconds (with disjoint results)
 // counts as a "follow-up" — a directional signal that the first result
@@ -466,4 +474,30 @@ export function loadFallbackConfig(): FallbackConfig {
       return true;
     });
   return { providers };
+}
+
+// Kill switch for the consolidation pipeline's reflect tier (insight
+// synthesis via mem::reflect). OFF by default: the forced session.deleted
+// pipeline (force:true) still consults this, so a false value hard-disables
+// automatic insight synthesis. Direct/manual mem::reflect is unaffected.
+export function isInsightSynthesisEnabled(): boolean {
+  return getMergedEnv()["INSIGHT_SYNTHESIS_ENABLED"] === "true";
+}
+
+// Kill switch for the consolidation pipeline's procedural-extraction tier.
+// OFF by default and honored even under force:true. Manual skill consumers
+// (mem::skill-list / mem::skill-match) are separate and unaffected.
+export function isProceduralExtractionEnabled(): boolean {
+  return getMergedEnv()["PROCEDURAL_EXTRACTION_ENABLED"] === "true";
+}
+
+// Kill switch for graph *consumption* in hybrid search. OFF by default, and
+// deliberately decoupled from GRAPH_EXTRACTION_ENABLED: extraction can be
+// frozen while previously-built graph data stays queryable, and graph search
+// can be disabled without touching extraction. Follows the exact same pattern
+// as isGraphExtractionEnabled (exact-match "true" only). When false,
+// HybridSearch never loads the graph snapshot and never runs GraphRetrieval —
+// a true bypass, not a graphWeight=0 that still traverses then multiplies out.
+export function isGraphSearchEnabled(): boolean {
+  return getMergedEnv()["GRAPH_SEARCH_ENABLED"] === "true";
 }

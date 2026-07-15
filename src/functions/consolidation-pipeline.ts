@@ -15,7 +15,12 @@ import {
   buildProceduralExtractionPrompt,
 } from "../prompts/consolidation.js";
 import { recordAudit } from "./audit.js";
-import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
+import {
+  getConsolidationDecayDays,
+  isConsolidationEnabled,
+  isInsightSynthesisEnabled,
+  isProceduralExtractionEnabled,
+} from "../config.js";
 import { logger } from "../logger.js";
 
 function applyDecay(
@@ -133,7 +138,16 @@ export function registerConsolidationPipelineFunction(
         }
       }
 
-      if (tier === "all" || tier === "reflect") {
+      if ((tier === "all" || tier === "reflect") && !isInsightSynthesisEnabled()) {
+        // Kill switch overrides force: even the session.deleted forced
+        // pipeline must not run insight synthesis when disabled. Skipping
+        // here (before any watermark read/write) leaves the reflect
+        // watermark untouched so a later enabled run is not falsely gated.
+        results.reflect = {
+          skipped: true,
+          reason: "INSIGHT_SYNTHESIS_ENABLED=false",
+        };
+      } else if (tier === "all" || tier === "reflect") {
         const REFLECT_GATE_MS = 24 * 60 * 60 * 1000;
         const reflectWatermarkKey = `reflect:last-success:${data?.project || "global"}`;
         let reflectGated = false;
@@ -177,7 +191,17 @@ export function registerConsolidationPipelineFunction(
         }
       }
 
-      if (tier === "all" || tier === "procedural") {
+      if (
+        (tier === "all" || tier === "procedural") &&
+        !isProceduralExtractionEnabled()
+      ) {
+        // Kill switch overrides force. Manual skill consumers
+        // (mem::skill-list / mem::skill-match) are separate and unaffected.
+        results.procedural = {
+          skipped: true,
+          reason: "PROCEDURAL_EXTRACTION_ENABLED=false",
+        };
+      } else if (tier === "all" || tier === "procedural") {
         const memories = await kv.list<Memory>(KV.memories);
         const patterns = memories
           .filter((m) => m.isLatest && m.type === "pattern")
