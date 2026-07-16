@@ -405,7 +405,7 @@ function extractErrorMessage(err: unknown): string {
 }
 
 export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
-  sessionCwd = pluginInput.directory || process.cwd();
+  sessionCwd = pluginInput?.directory || process.cwd();
   projectPath = resolveProject();
 
   assertHttpsOrLoopback();

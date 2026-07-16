@@ -96,6 +96,19 @@ describe("OpenCode commit-link capture", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each([
+    ["undefined", undefined],
+    ["empty object", {}],
+  ])("returns hooks when plugin input is $0", async (_label, input) => {
+    installFetchMock();
+
+    const plugin = await AgentmemoryCapturePlugin(input as any);
+    activePlugin = plugin;
+
+    expect(plugin.event).toEqual(expect.any(Function));
+    expect(plugin.config).toEqual(expect.any(Function));
+  });
+
   it("posts final HEAD metadata after a successful tool completion changes HEAD", async () => {
     installGitMock([OLD_SHA, NEW_SHA]);
     const { plugin, calls } = await loadPlugin();
