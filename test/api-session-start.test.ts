@@ -189,6 +189,21 @@ describe("api::session::start", () => {
     expect(await kv.get<Session>(KV.sessions, existing.id)).toEqual(result.body.session);
   });
 
+  it("preserves commitShas when resuming a session", async () => {
+    const existing = session({ commitShas: ["abc123", "def456"] });
+    kv.seed(KV.sessions, existing.id, existing);
+
+    const result = (await start(
+      request({ sessionId: existing.id, project: existing.project, cwd: existing.cwd }),
+    )) as StartResponse;
+
+    expect(result.body.session.commitShas).toEqual(["abc123", "def456"]);
+    expect((await kv.get<Session>(KV.sessions, existing.id))?.commitShas).toEqual([
+      "abc123",
+      "def456",
+    ]);
+  });
+
   it("repairs an under-counted session from stored observations without decreasing it", async () => {
     const existing = session({ observationCount: 1 });
     kv.seed(KV.sessions, existing.id, existing);
