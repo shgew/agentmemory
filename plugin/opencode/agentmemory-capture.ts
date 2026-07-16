@@ -45,11 +45,21 @@ type TodoPayload = { content?: string; priority?: string; status?: string };
 type QuestionOptionPayload = { label?: unknown; description?: unknown };
 type QuestionPayload = { question?: unknown; header?: unknown; options?: readonly QuestionOptionPayload[] };
 type QuestionToolPayload = { callID?: string; messageID?: string };
+export type GitCommitMetadata = {
+  readonly sha: string;
+  readonly branch?: string;
+  readonly repo?: string;
+  readonly message: string;
+  readonly author: string;
+  readonly authoredAt: string;
+  readonly files: readonly string[];
+};
 
 const API = env.AGENTMEMORY_URL || "http://localhost:3111";
 const FILE_TOOLS = new Set(["Read", "Write", "Edit", "Glob", "Grep"]);
 const FILE_KEYS = ["filePath", "file_path", "path", "file", "pattern"];
 const MAX_STASHED_FILES = 20;
+const GIT_TIMEOUT_MS = 500;
 
 const DEBUG = env.OPENCODE_AGENTMEMORY_DEBUG === "1";
 const SECRET = env.AGENTMEMORY_SECRET || "";
@@ -84,13 +94,50 @@ function resolveProject(cwd?: string): string {
 }
 
 function gitRevParse(cwd: string, arg: string): string {
-  return execFileSync("git", ["rev-parse", arg], {
-    cwd,
-    stdio: ["ignore", "pipe", "ignore"],
-    timeout: 500,
-  })
-    .toString()
-    .trim();
+  return runGit(cwd, ["rev-parse", arg]);
+}
+
+function runGit(cwd: string, args: readonly string[]): string {
+  return execFileSync("git", ["-C", cwd, ...args], {
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: GIT_TIMEOUT_MS,
+  }).toString().trim();
+}
+
+function tryGit(cwd: string, args: readonly string[]): string | null {
+  try {
+    return runGit(cwd, args);
+  } catch (error) {
+    if (DEBUG) {
+      console.error(
+        `[agentmemory] git ${args.join(" ")} failed:`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    return null;
+  }
+}
+
+export function collectGitCommitMetadata(cwd: string, sha: string): GitCommitMetadata | null {
+  const branchOutput = tryGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  if (branchOutput === null) return null;
+  const repo = tryGit(cwd, ["remote", "get-url", "origin"]);
+  const details = tryGit(cwd, ["show", "-s", "--format=%s%x00%an%x00%aI", sha]);
+  const filesOutput = tryGit(cwd, ["diff-tree", "--no-commit-id", "--name-only", "-r", sha]);
+  if (details === null || filesOutput === null) return null;
+
+  const [message, author, authoredAt] = details.split("\u0000");
+  if (message === undefined || author === undefined || authoredAt === undefined) return null;
+
+  return {
+    sha,
+    ...(branchOutput === "HEAD" ? {} : { branch: branchOutput }),
+    ...(repo ? { repo } : {}),
+    message,
+    author,
+    authoredAt,
+    files: filesOutput.split("\n").filter(Boolean),
+  };
 }
 
 function authHeaders(): Record<string, string> {
@@ -145,11 +192,46 @@ async function observe(
 let activeSessionId: string | null = null;
 let pendingConfig: Record<string, unknown> | null = null;
 let projectPath: string | null = null;
+let sessionCwd = process.cwd();
 const stashedFiles = new Map<string, Set<string>>();
 const seenSubtaskIds = new Map<string, Set<string>>();
 const seenToolCallIds = new Map<string, Set<string>>();
 const contextInjectedSessions = new Set<string>();
 const startContextCache = new Map<string, string>();
+const lastSeenHeads = new Map<string, string>();
+const commitCheckChains = new Map<string, Promise<void>>();
+
+function seedSessionHead(sessionId: string): void {
+  const head = tryGit(sessionCwd, ["rev-parse", "HEAD"]);
+  if (head) lastSeenHeads.set(sessionId, head);
+  else lastSeenHeads.delete(sessionId);
+}
+
+async function linkCommitIfHeadChanged(sessionId: string): Promise<void> {
+  const head = tryGit(sessionCwd, ["rev-parse", "HEAD"]);
+  if (!head) return;
+
+  const previousHead = lastSeenHeads.get(sessionId);
+  if (!previousHead) {
+    lastSeenHeads.set(sessionId, head);
+    return;
+  }
+  if (head === previousHead) return;
+
+  const metadata = collectGitCommitMetadata(sessionCwd, head);
+  if (!metadata) return;
+  await post("/session/commit", { ...metadata, sessionId });
+  lastSeenHeads.set(sessionId, head);
+}
+
+function enqueueCommitCheck(sessionId: string): Promise<void> {
+  const previous = commitCheckChains.get(sessionId) ?? Promise.resolve();
+  const next = previous.then(() => linkCommitIfHeadChanged(sessionId)).finally(() => {
+    if (commitCheckChains.get(sessionId) === next) commitCheckChains.delete(sessionId);
+  });
+  commitCheckChains.set(sessionId, next);
+  return next;
+}
 
 function stashFor(sid: string): Set<string> {
   let s = stashedFiles.get(sid);
@@ -322,7 +404,8 @@ function extractErrorMessage(err: unknown): string {
   return String(err ?? "");
 }
 
-export const AgentmemoryCapturePlugin: Plugin = async () => {
+export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
+  sessionCwd = pluginInput.directory || process.cwd();
   projectPath = resolveProject();
 
   assertHttpsOrLoopback();
@@ -350,6 +433,7 @@ export const AgentmemoryCapturePlugin: Plugin = async () => {
         seenToolCallIds.delete(activeSessionId);
         contextInjectedSessions.delete(activeSessionId);
         const sessionId = activeSessionId;
+        seedSessionHead(sessionId);
         const startResult: ContextResponse | null = await postJson("/session/start", {
           sessionId,
           title: info?.title ?? null,
@@ -408,6 +492,7 @@ export const AgentmemoryCapturePlugin: Plugin = async () => {
           stashedFiles.set(sid, new Set());
           contextInjectedSessions.delete(sid);
           if (!activeSessionId) activeSessionId = sid;
+          seedSessionHead(sid);
           const resumeResult: ContextResponse | null = await postJson("/session/start", {
             sessionId: sid,
             title: info?.title ?? null,
@@ -460,6 +545,8 @@ export const AgentmemoryCapturePlugin: Plugin = async () => {
         seenSubtaskIds.delete(sid);
         seenToolCallIds.delete(sid);
         contextInjectedSessions.delete(sid);
+        lastSeenHeads.delete(sid);
+        commitCheckChains.delete(sid);
       }
 
       // ── session.error ──
@@ -586,6 +673,7 @@ export const AgentmemoryCapturePlugin: Plugin = async () => {
                 ? state.attachments.map(a => a.filename || a.url)
                 : [],
             });
+            await enqueueCommitCheck(sid);
           } else if (state.status === "error") {
             const callSet = toolCallSetFor(sid);
             if (callSet.has(callId)) return;
@@ -787,6 +875,7 @@ export const AgentmemoryCapturePlugin: Plugin = async () => {
             name: event.properties.name,
             arguments: event.properties.arguments || "",
           });
+          await enqueueCommitCheck(sid);
         }
       }
 
@@ -979,6 +1068,7 @@ export const AgentmemoryCapturePlugin: Plugin = async () => {
         duration_ms: null,
         attachments: [],
       });
+      await enqueueCommitCheck(sid);
     },
 
     // ── experimental.chat.system.transform ──
@@ -1092,6 +1182,8 @@ export const AgentmemoryCapturePlugin: Plugin = async () => {
       seenToolCallIds.clear();
       contextInjectedSessions.clear();
       startContextCache.clear();
+      lastSeenHeads.clear();
+      commitCheckChains.clear();
       activeSessionId = null;
       pendingConfig = null;
     },
