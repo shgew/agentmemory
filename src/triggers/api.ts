@@ -1293,6 +1293,7 @@ export function registerApiTriggers(
       const headers = (req.headers || {}) as Record<string, string | string[] | undefined>;
       const sourceHeader = headers["x-agentmemory-source"] ?? headers["X-Agentmemory-Source"];
       const sourceFromHeader = Array.isArray(sourceHeader) ? sourceHeader[0] : sourceHeader;
+      const includeTimings = req.query_params?.["includeTimings"] === "true";
       // Whitelist payload fields explicitly — REST endpoints never pass
       // the raw request body through to sdk.trigger (AGENTS.md security
       // section). Drops unknown fields so a misbehaving client can't
@@ -1306,6 +1307,7 @@ export function registerApiTriggers(
         agentId: req.body?.agentId,
         sessionId: req.body?.sessionId,
         source: req.body?.source ?? sourceFromHeader,
+        includeTimings,
       };
       const result = await sdk.trigger({ function_id: "mem::smart-search", payload });
       return { status_code: 200, body: result };

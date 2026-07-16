@@ -1,3 +1,4 @@
+import { setImmediate } from "node:timers";
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
@@ -66,6 +67,7 @@ function makeObs(
     files: ["src/auth.ts"],
     importance: 7,
     ...overrides,
+    sourceType: overrides.sourceType ?? "test",
   };
 }
 
@@ -86,6 +88,7 @@ describe("Smart Search Function", () => {
         observation: obs1,
         bm25Score: 0.8,
         vectorScore: 0,
+        graphScore: 0,
         combinedScore: 0.8,
         sessionId: "ses_1",
       },
@@ -93,6 +96,7 @@ describe("Smart Search Function", () => {
         observation: obs2,
         bm25Score: 0.3,
         vectorScore: 0,
+        graphScore: 0,
         combinedScore: 0.3,
         sessionId: "ses_1",
       },
@@ -129,6 +133,37 @@ describe("Smart Search Function", () => {
     expect(result.results[0]).not.toHaveProperty("narrative");
   });
 
+  it("returns stage timings only when requested", async () => {
+    const timed = (await sdk.trigger("mem::smart-search", {
+      query: "auth",
+      includeTimings: true,
+    })) as {
+      timings?: {
+        totalMs: number;
+        vectorSearchMs: number;
+        bm25SearchMs: number;
+        lessonSearchMs: number;
+        projectResolutionMs: number;
+        rankingRrfFusionMs: number;
+        responseSerializationMs: number;
+      };
+    };
+    const normal = (await sdk.trigger("mem::smart-search", {
+      query: "auth",
+    })) as { timings?: unknown };
+
+    expect(timed.timings).toEqual({
+      totalMs: expect.any(Number),
+      vectorSearchMs: expect.any(Number),
+      bm25SearchMs: expect.any(Number),
+      lessonSearchMs: expect.any(Number),
+      projectResolutionMs: expect.any(Number),
+      rankingRrfFusionMs: expect.any(Number),
+      responseSerializationMs: expect.any(Number),
+    });
+    expect(normal.timings).toBeUndefined();
+  });
+
   it("expand mode returns full observations for given IDs", async () => {
     const result = (await sdk.trigger("mem::smart-search", {
       expandIds: ["obs_1"],
@@ -147,7 +182,7 @@ describe("Smart Search Function", () => {
 
     expect(result.mode).toBe("compact");
     expect(result.error).toBe("query is required");
-    expect((result as { results: unknown[] }).results).toEqual([]);
+    expect((result as unknown as { results: unknown[] }).results).toEqual([]);
   });
 
   it("respects limit parameter in compact mode", async () => {
@@ -196,7 +231,7 @@ describe("Smart Search Function", () => {
 
   describe("lesson inclusion (#lesson-visibility)", () => {
     it("compact mode returns lessons array alongside observation results", async () => {
-      sdk.registerFunction("mem::lesson-recall", async (payload: any) => ({
+      sdk.registerFunction("mem::lesson-recall", async (_payload: any) => ({
         success: true,
         lessons: [
           { id: "lsn_a", content: "always rebase before push", confidence: 0.9, createdAt: "2026-04-01T00:00:00Z", project: "p", tags: ["git"], score: 0.81 },

@@ -425,8 +425,8 @@ async function main() {
     graphWeight,
   );
 
-  registerSmartSearchFunction(sdk, kv, (query, limit) =>
-    hybridSearch.search(query, limit),
+  registerSmartSearchFunction(sdk, kv, (query, limit, timings) =>
+    hybridSearch.search(query, limit, timings),
   );
   registerRecentSearchesSweepFunction(sdk, kv);
 
@@ -547,6 +547,7 @@ async function main() {
           id: memory.id,
           sessionId: memory.sessionIds?.[0] ?? "memory",
           timestamp: memory.createdAt,
+          sourceType: "memory",
           type: "decision",
           title: memory.title,
           facts: [memory.content],

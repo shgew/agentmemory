@@ -19,6 +19,7 @@ import {
 } from "../config.js";
 import { logger } from "../logger.js";
 import { getCounters } from "../telemetry/setup.js";
+import type { HybridSearchTimings } from "../state/hybrid-search.js";
 
 // #771: smart-search followup-rate diagnostic. Stored per session as
 // the most recent search payload, used to detect whether the next
@@ -30,6 +31,13 @@ export interface RecentSearch {
   query: string;
   resultIds: string[];
   at: number;
+}
+
+interface SmartSearchTimings extends HybridSearchTimings {
+  lessonSearchMs: number;
+  projectResolutionMs: number;
+  responseSerializationMs: number;
+  totalMs: number;
 }
 
 // Module-scope counter mirror so `mem::diagnostic::followup-stats` can
@@ -109,7 +117,11 @@ const LESSON_CONTENT_PREVIEW_CHARS = 240;
 export function registerSmartSearchFunction(
   sdk: ISdk,
   kv: StateKV,
-  searchFn: (query: string, limit: number) => Promise<HybridSearchResult[]>,
+  searchFn: (
+    query: string,
+    limit: number,
+    timings?: HybridSearchTimings,
+  ) => Promise<HybridSearchResult[]>,
 ): void {
   sdk.registerFunction("mem::smart-search",
     async (data: {
@@ -129,6 +141,7 @@ export function registerSmartSearchFunction(
       // #771: marks viewer-originated searches so the diagnostic
       // ignores them — only agent-initiated re-queries should count.
       source?: string;
+      includeTimings?: boolean;
     }) => {
 
       // Compute the agent filter once, up front. Both the expandIds
@@ -247,7 +260,20 @@ export function registerSmartSearchFunction(
         return { mode: "compact", results: [], error: "query is required" };
       }
 
+      const query = data.query;
       const limit = Math.max(1, Math.min(data.limit ?? 20, 100));
+      const requestStartedAt = data.includeTimings ? performance.now() : 0;
+      const timings: SmartSearchTimings | undefined = data.includeTimings
+        ? {
+            bm25SearchMs: 0,
+            vectorSearchMs: 0,
+            rankingRrfFusionMs: 0,
+            lessonSearchMs: 0,
+            projectResolutionMs: 0,
+            responseSerializationMs: 0,
+            totalMs: 0,
+          }
+        : undefined;
       // Lesson recall stays capped: lessons are denser than raw
       // observations so 10 covers most recall flows.
       const lessonLimit = Math.min(limit, 10);
@@ -266,11 +292,21 @@ export function registerSmartSearchFunction(
       const overFetchLimit =
         filterAgentId || projectFilter ? Math.min(limit * 3, 300) : limit;
 
+      const lessonSearch = includeLessons
+        ? (async () => {
+            const lessonSearchStartedAt = timings ? performance.now() : 0;
+            try {
+              return await recallLessons(sdk, query, lessonLimit, data.project);
+            } finally {
+              if (timings) {
+                timings.lessonSearchMs = performance.now() - lessonSearchStartedAt;
+              }
+            }
+          })()
+        : Promise.resolve([]);
       const [hybridResults, lessons] = await Promise.all([
-        searchFn(data.query, overFetchLimit),
-        includeLessons
-          ? recallLessons(sdk, data.query, lessonLimit, data.project)
-          : Promise.resolve([]),
+        searchFn(query, overFetchLimit, timings),
+        lessonSearch,
       ]);
 
       const agentScoped = filterAgentId
@@ -279,6 +315,7 @@ export function registerSmartSearchFunction(
 
       let projectScoped = agentScoped;
       if (projectFilter) {
+        const projectResolutionStartedAt = timings ? performance.now() : 0;
         const uniqueSessionIds = [
           ...new Set(agentScoped.map((r) => r.sessionId)),
         ];
@@ -306,6 +343,10 @@ export function registerSmartSearchFunction(
             ({ project }) => project === null || project === projectFilter,
           )
           .map(({ r }) => r);
+        if (timings) {
+          timings.projectResolutionMs =
+            performance.now() - projectResolutionStartedAt;
+        }
       }
 
       const filteredHybrid = projectScoped.slice(0, limit);
@@ -348,7 +389,7 @@ export function registerSmartSearchFunction(
         // prior-row writes — the second call's lock body queues
         // behind the first's. Other sessions run in parallel.
         const sessionIdForFollowup = data.sessionId;
-        const queryForFollowup = data.query;
+        const queryForFollowup = query;
         const compactForFollowup = compact;
         const detection = withKeyedLock(
           `recent-searches:${sessionIdForFollowup}`,
@@ -373,7 +414,7 @@ export function registerSmartSearchFunction(
       }
 
       logger.info("Smart search compact", {
-        query: data.query,
+        query,
         results: compact.length,
         lessons: lessons.length,
       });
@@ -381,8 +422,17 @@ export function registerSmartSearchFunction(
         mode: "compact";
         results: CompactSearchResult[];
         lessons?: CompactLessonResult[];
+        timings?: SmartSearchTimings;
       } = { mode: "compact", results: compact };
       if (includeLessons) response.lessons = lessons;
+      if (timings) {
+        response.timings = timings;
+        const responseSerializationStartedAt = performance.now();
+        JSON.stringify(response);
+        timings.responseSerializationMs =
+          performance.now() - responseSerializationStartedAt;
+        timings.totalMs = performance.now() - requestStartedAt;
+      }
       return response;
     },
   );
