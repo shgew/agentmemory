@@ -114,7 +114,10 @@ function summaryXml(): string {
 }
 
 function makeProvider(gate?: Promise<void>, entered?: () => void) {
-  const provider = {
+  const provider: MemoryProvider & {
+    summarizeCalls: number;
+    shouldFail: boolean;
+  } = {
     name: "test",
     summarizeCalls: 0,
     shouldFail: false,
@@ -126,7 +129,7 @@ function makeProvider(gate?: Promise<void>, entered?: () => void) {
       if (provider.shouldFail) throw new Error("simulated summarize failure");
       return summaryXml();
     },
-  } satisfies MemoryProvider & { summarizeCalls: number; shouldFail: boolean };
+  };
   return provider;
 }
 
