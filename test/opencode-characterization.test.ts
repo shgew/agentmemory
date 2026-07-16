@@ -83,38 +83,31 @@ describe("characterization: session lifecycle bus events", () => {
     expect(start!.body.parentID).toBe("s_char_parent");
   });
 
-  it("session.status idle posts /session/checkpoint and observes session_status", async () => {
+  it("session.status idle posts only /session/checkpoint", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
       event: { type: "session.status", properties: { sessionID: "s_char_idle", status: { type: "idle", attempt: 0, message: "done" } } } as any,
     });
     expect(findPost(calls, "/session/checkpoint")).toBeDefined();
-    const obs = findObserve(calls, "session_status");
-    expect(obs).toBeDefined();
-    expect(obs!.body.data.status_type).toBe("idle");
+    expect(findObserve(calls, "session_status")).toBeUndefined();
   });
 
-  it("session.status busy observes session_status WITHOUT checkpoint", async () => {
+  it("session.status busy does not post", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
       event: { type: "session.status", properties: { sessionID: "s_char_busy", status: { type: "busy" } } } as any,
     });
     expect(findPost(calls, "/session/checkpoint")).toBeUndefined();
-    const obs = findObserve(calls, "session_status");
-    expect(obs).toBeDefined();
-    expect(obs!.body.data.status_type).toBe("busy");
+    expect(findObserve(calls, "session_status")).toBeUndefined();
   });
 
-  it("session.status retry observes session_status WITHOUT checkpoint", async () => {
+  it("session.status retry does not post", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
       event: { type: "session.status", properties: { sessionID: "s_char_retry", status: { type: "retry", attempt: 2 } } } as any,
     });
     expect(findPost(calls, "/session/checkpoint")).toBeUndefined();
-    const obs = findObserve(calls, "session_status");
-    expect(obs).toBeDefined();
-    expect(obs!.body.data.status_type).toBe("retry");
-    expect(obs!.body.data.attempt).toBe(2);
+    expect(findObserve(calls, "session_status")).toBeUndefined();
   });
 
   it("session.compacted posts /session/checkpoint and observes session_compacted", async () => {
@@ -126,7 +119,7 @@ describe("characterization: session lifecycle bus events", () => {
     expect(findObserve(calls, "session_compacted")).toBeDefined();
   });
 
-  it("session.updated after session.created (fresh sid) observes session_updated with NO resumed start", async () => {
+  it("session.updated after session.created does not restart the session", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
       event: { type: "session.created", properties: { info: { id: "s_char_fresh" } } } as any,
@@ -137,13 +130,10 @@ describe("characterization: session lifecycle bus events", () => {
     });
     const resumeStart = calls.find((c) => c.url.endsWith("/agentmemory/session/start") && c.body?.resumed === true);
     expect(resumeStart).toBeUndefined();
-    const obs = findObserve(calls, "session_updated");
-    expect(obs).toBeDefined();
-    expect(obs!.body.data.title).toBe("Updated");
-    expect(obs!.body.data.additions).toBe(3);
+    expect(findObserve(calls, "session_updated")).toBeUndefined();
   });
 
-  it("session.updated for unseen sid posts /session/start resumed:true and observes session_updated", async () => {
+  it("session.updated for unseen sid posts /session/start resumed:true", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
       event: { type: "session.updated", properties: { info: { id: "s_char_resumed", title: "Old" } } } as any,
@@ -151,7 +141,7 @@ describe("characterization: session lifecycle bus events", () => {
     const resumeStart = calls.find((c) => c.url.endsWith("/agentmemory/session/start") && c.body?.resumed === true);
     expect(resumeStart).toBeDefined();
     expect(resumeStart!.body.sessionId).toBe("s_char_resumed");
-    expect(findObserve(calls, "session_updated")).toBeDefined();
+    expect(findObserve(calls, "session_updated")).toBeUndefined();
   });
 
   it("session.diff observes session_diff with files array and summed additions/deletions", async () => {
@@ -173,9 +163,10 @@ describe("characterization: session lifecycle bus events", () => {
     expect(obs!.body.data.files).toEqual(["a.ts", "b.ts"]);
     expect(obs!.body.data.additions).toBe(5);
     expect(obs!.body.data.deletions).toBe(1);
+    expect(obs!.body.data.diffs).toBeUndefined();
   });
 
-  it("session.deleted posts /session/end + /crystals/auto + /consolidate-pipeline", async () => {
+  it("session.deleted ends only that session", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
       event: { type: "session.deleted", properties: { sessionID: "s_char_deleted" } } as any,
@@ -183,12 +174,8 @@ describe("characterization: session lifecycle bus events", () => {
     const end = findPost(calls, "/session/end");
     expect(end).toBeDefined();
     expect(end!.body.sessionId).toBe("s_char_deleted");
-    const crystals = findPost(calls, "/crystals/auto");
-    const pipeline = findPost(calls, "/consolidate-pipeline");
-    expect(crystals).toBeDefined();
-    expect(crystals!.body.sessionId).toBe("s_char_deleted");
-    expect(pipeline).toBeDefined();
-    expect(pipeline!.body.sessionId).toBe("s_char_deleted");
+    expect(findPost(calls, "/crystals/auto")).toBeUndefined();
+    expect(findPost(calls, "/consolidate-pipeline")).toBeUndefined();
   });
 
   it("session.error observes post_tool_failure with tool_name=session.error", async () => {
@@ -210,53 +197,44 @@ describe("characterization: message bus events", () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(async () => { await teardownPlugin(); });
 
-  it("message.updated assistant observes assistant_message with modelID/providerID/tokens shape", async () => {
+  it("captures only terminal assistant text parts", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
       event: {
-        type: "message.updated",
+        type: "message.part.updated",
         properties: {
-          sessionID: "s_char_assistant",
-          info: {
-            role: "assistant",
-            id: "msg_a",
-            parentID: "msg_p",
-            modelID: "claude-x",
-            providerID: "anthropic",
-            mode: "build",
-            cost: 0.02,
-            tokens: { input: 100, output: 50, reasoning: 10, cache: { read: 5, write: 2 } },
-            finish: "stop",
-            time: { created: 100, completed: 500 },
+          part: {
+            type: "text",
+            id: "part_text",
+            messageID: "msg_text",
+            sessionID: "s_char_text",
+            text: "partial",
+            time: { start: 100 },
           },
         },
       } as any,
     });
-    const obs = findObserve(calls, "assistant_message");
-    expect(obs).toBeDefined();
-    expect(obs!.body.data.modelID).toBe("claude-x");
-    expect(obs!.body.data.providerID).toBe("anthropic");
-    expect(obs!.body.data.tokens.input).toBe(100);
-    expect(obs!.body.data.tokens.output).toBe(50);
-    expect(obs!.body.data.tokens.cache_read).toBe(5);
-    expect(obs!.body.data.duration_ms).toBe(400);
-  });
-
-  it("message.updated user observes user_message", async () => {
-    const { plugin, calls } = await loadPlugin();
     await plugin.event!({
       event: {
-        type: "message.updated",
+        type: "message.part.updated",
         properties: {
-          sessionID: "s_char_user",
-          info: { role: "user", id: "msg_u", parentID: null, mode: "build", time: { created: 123 } },
+          part: {
+            type: "text",
+            id: "part_text",
+            messageID: "msg_text",
+            sessionID: "s_char_text",
+            text: "final assistant answer",
+            time: { start: 100, end: 200 },
+          },
         },
       } as any,
     });
-    const obs = findObserve(calls, "user_message");
-    expect(obs).toBeDefined();
-    expect(obs!.body.data.messageID).toBe("msg_u");
-    expect(obs!.body.data.time_created).toBe(123);
+
+    const observations = calls.filter(
+      (call) => call.body?.hookType === "assistant_message",
+    );
+    expect(observations).toHaveLength(1);
+    expect(observations[0].body.data.message).toBe("final assistant answer");
   });
 
   it("message.removed observes message_removed with messageID", async () => {
@@ -568,21 +546,6 @@ describe("characterization: tasks, commands, watcher, vcs", () => {
     expect(obs!.body.data.arguments).toBe("--env=prod");
   });
 
-  it("file.watcher.updated observes file_watcher when an active session exists", async () => {
-    const { plugin, calls } = await loadPlugin();
-    await plugin.event!({
-      event: { type: "session.created", properties: { info: { id: "s_char_watcher" } } } as any,
-    });
-    calls.length = 0;
-    await plugin.event!({
-      event: { type: "file.watcher.updated", properties: { file: "/tmp/changed.ts", event: "change" } } as any,
-    });
-    const obs = findObserve(calls, "file_watcher");
-    expect(obs).toBeDefined();
-    expect(obs!.body.data.file).toBe("/tmp/changed.ts");
-    expect(obs!.body.data.event).toBe("change");
-  });
-
   it("vcs.branch.updated observes vcs_branch_updated when an active session exists", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
@@ -617,29 +580,6 @@ describe("characterization: typed hooks", () => {
     expect(obs!.body.data.model).toBe("anthropic/claude-x");
     expect(obs!.body.data.prompt).toContain("hello world");
     expect(obs!.body.data.files).toContain("/tmp/a.ts");
-  });
-
-  it("chat.params observes llm_params with model id + provider url + temperature", async () => {
-    const { plugin, calls } = await loadPlugin();
-    await plugin["chat.params"]!(
-      {
-        sessionID: "s_char_chatparams",
-        agent: "build",
-        model: {
-          providerID: "anthropic",
-          id: "claude-x",
-          api: { url: "https://api.anthropic.com" },
-          limit: { output: 4096, context: 200000 },
-          cost: { input: 3, output: 15 },
-        },
-      } as any,
-      { temperature: 0.7, topP: 0.9 } as any,
-    );
-    const obs = findObserve(calls, "llm_params");
-    expect(obs).toBeDefined();
-    expect(obs!.body.data.model).toBe("anthropic/claude-x");
-    expect(obs!.body.data.provider_url).toBe("https://api.anthropic.com");
-    expect(obs!.body.data.temperature).toBe(0.7);
   });
 
   it("tool.execute.after observes post_tool_use", async () => {
@@ -692,21 +632,6 @@ describe("characterization: typed hooks", () => {
     expect(enrichCountAfter).toBe(enrichCountBefore);
   });
 
-  it("experimental.chat.messages.transform observes messages_transform with message_count", async () => {
-    const { plugin, calls } = await loadPlugin();
-    await plugin.event!({
-      event: { type: "session.created", properties: { info: { id: "s_char_msgtransform" } } } as any,
-    });
-    calls.length = 0;
-    await plugin["experimental.chat.messages.transform"]!(
-      {} as any,
-      { messages: [{ role: "user" }, { role: "assistant" }, { role: "user" }] } as any,
-    );
-    const obs = findObserve(calls, "messages_transform");
-    expect(obs).toBeDefined();
-    expect(obs!.body.data.message_count).toBe(3);
-  });
-
   it("experimental.session.compacting posts /context and pushes into output.context", async () => {
     const { plugin, calls } = await loadPlugin();
     const output = { context: [] as string[] };
@@ -732,54 +657,11 @@ describe("characterization: typed hooks", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// config + dispose lifecycle
+// dispose lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
-describe("characterization: config and dispose", () => {
+describe("characterization: dispose", () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(async () => { await teardownPlugin(); });
-
-  it("config with no active session stashes pendingConfig (no /observe) then fires config_loaded on session.created", async () => {
-    const { plugin, calls } = await loadPlugin();
-    await plugin.config!({
-      theme: "dark",
-      model: "anthropic/claude-x",
-      agent: { build: {}, plan: {} },
-      mcp: { agentmemory: {} },
-      provider: { anthropic: {} },
-      permission: {},
-    } as any);
-    expect(findObserve(calls, "config_loaded")).toBeUndefined();
-
-    await plugin.event!({
-      event: { type: "session.created", properties: { info: { id: "s_char_config_pending" } } } as any,
-    });
-    const obs = findObserve(calls, "config_loaded");
-    expect(obs).toBeDefined();
-    expect(obs!.body.data.theme).toBe("dark");
-  });
-
-  it("config with active session observes config_loaded with theme/model/agents/mcp_servers/providers", async () => {
-    const { plugin, calls } = await loadPlugin();
-    await plugin.event!({
-      event: { type: "session.created", properties: { info: { id: "s_char_config_active" } } } as any,
-    });
-    calls.length = 0;
-    await plugin.config!({
-      theme: "light",
-      model: "anthropic/claude-y",
-      agent: { build: {}, plan: {} },
-      mcp: { agentmemory: {} },
-      provider: { anthropic: {}, openai: {} },
-      permission: {},
-    } as any);
-    const obs = findObserve(calls, "config_loaded");
-    expect(obs).toBeDefined();
-    expect(obs!.body.data.theme).toBe("light");
-    expect(obs!.body.data.model).toBe("anthropic/claude-y");
-    expect(obs!.body.data.agents).toEqual(["build", "plan"]);
-    expect(obs!.body.data.mcp_servers).toEqual(["agentmemory"]);
-    expect(obs!.body.data.providers).toEqual(["anthropic", "openai"]);
-  });
 
   it("dispose fires /session/checkpoint for the active session and does NOT post /session/end", async () => {
     const { plugin, calls } = await loadPlugin();

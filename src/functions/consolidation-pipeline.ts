@@ -7,7 +7,7 @@ import type {
   Memory,
   MemoryProvider,
 } from "../types.js";
-import { KV, generateId } from "../state/schema.js";
+import { KV, fingerprintId, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import {
   SEMANTIC_MERGE_SYSTEM,
@@ -149,70 +149,105 @@ export function registerConsolidationPipelineFunction(
           const recentSummaries = summaries
             .sort(
               (a, b) =>
-                new Date(b.createdAt).getTime() -
-                new Date(a.createdAt).getTime(),
+                b.createdAt.localeCompare(a.createdAt) ||
+                a.sessionId.localeCompare(b.sessionId),
             )
             .slice(0, 20);
-
-          const prompt = buildSemanticMergePrompt(
-            recentSummaries.map((s) => ({
-              title: s.title,
-              narrative: s.narrative,
-              concepts: s.concepts,
-            })),
+          const semanticInputFingerprint = fingerprintId(
+            "semantic-input",
+            JSON.stringify(
+              recentSummaries.map((summary) => ({
+                sessionId: summary.sessionId,
+                createdAt: summary.createdAt,
+                observationCount: summary.observationCount,
+                title: summary.title,
+                narrative: summary.narrative,
+                concepts: summary.concepts,
+              })),
+            ),
           );
-
-          try {
-            const response = await provider.summarize(
-              SEMANTIC_MERGE_SYSTEM,
-              prompt,
+          const semanticScope =
+            project === undefined ? "global" : `project:${project}`;
+          const semanticWatermarkKey = `semantic:last-input:${semanticScope}`;
+          const semanticWatermark = data?.force
+            ? null
+            : await kv.get<{ fingerprint: string }>(
+                KV.config,
+                semanticWatermarkKey,
+              );
+          if (semanticWatermark?.fingerprint === semanticInputFingerprint) {
+            results.semantic = {
+              skipped: true,
+              reason: "summaries unchanged",
+            };
+          } else {
+            const prompt = buildSemanticMergePrompt(
+              recentSummaries.map((s) => ({
+                title: s.title,
+                narrative: s.narrative,
+                concepts: s.concepts,
+              })),
             );
 
-            const factRegex = /<fact\s+confidence="([^"]+)">([^<]+)<\/fact>/g;
-            let match;
-            let newFacts = 0;
-            const now = new Date().toISOString();
-
-            while ((match = factRegex.exec(response)) !== null) {
-              const parsedConf = parseFloat(match[1]);
-              const confidence = Number.isNaN(parsedConf) ? 0.5 : parsedConf;
-              const fact = match[2].trim();
-
-              const existing = existingSemantic.find(
-                (s) => s.fact.toLowerCase() === fact.toLowerCase(),
+            try {
+              const response = await provider.summarize(
+                SEMANTIC_MERGE_SYSTEM,
+                prompt,
               );
-              if (existing) {
-                existing.accessCount++;
-                existing.lastAccessedAt = now;
-                existing.updatedAt = now;
-                existing.confidence = Math.max(existing.confidence, confidence);
-                existing.sourceSessionIds = unionIds(
-                  existing.sourceSessionIds,
-                  recentSummaries.map((summary) => summary.sessionId),
+
+              const factRegex =
+                /<fact\s+confidence="([^"]+)">([^<]+)<\/fact>/g;
+              let match;
+              let newFacts = 0;
+              const now = new Date().toISOString();
+
+              while ((match = factRegex.exec(response)) !== null) {
+                const parsedConf = parseFloat(match[1]);
+                const confidence = Number.isNaN(parsedConf) ? 0.5 : parsedConf;
+                const fact = match[2].trim();
+
+                const existing = existingSemantic.find(
+                  (s) => s.fact.toLowerCase() === fact.toLowerCase(),
                 );
-                await kv.set(KV.semantic, existing.id, existing);
-              } else {
-                const sem: SemanticMemory = {
-                  id: generateId("sem"),
-                  fact,
-                  confidence,
-                  sourceSessionIds: recentSummaries.map((s) => s.sessionId),
-                  sourceMemoryIds: [],
-                  accessCount: 1,
-                  lastAccessedAt: now,
-                  strength: confidence,
-                  createdAt: now,
-                  updatedAt: now,
-                };
-                await kv.set(KV.semantic, sem.id, sem);
-                newFacts++;
+                if (existing) {
+                  existing.accessCount++;
+                  existing.lastAccessedAt = now;
+                  existing.updatedAt = now;
+                  existing.confidence = Math.max(
+                    existing.confidence,
+                    confidence,
+                  );
+                  existing.sourceSessionIds = unionIds(
+                    existing.sourceSessionIds,
+                    recentSummaries.map((summary) => summary.sessionId),
+                  );
+                  await kv.set(KV.semantic, existing.id, existing);
+                } else {
+                  const sem: SemanticMemory = {
+                    id: generateId("sem"),
+                    fact,
+                    confidence,
+                    sourceSessionIds: recentSummaries.map((s) => s.sessionId),
+                    sourceMemoryIds: [],
+                    accessCount: 1,
+                    lastAccessedAt: now,
+                    strength: confidence,
+                    createdAt: now,
+                    updatedAt: now,
+                  };
+                  await kv.set(KV.semantic, sem.id, sem);
+                  newFacts++;
+                }
               }
+              await kv.set(KV.config, semanticWatermarkKey, {
+                fingerprint: semanticInputFingerprint,
+              });
+              results.semantic = { newFacts, totalSummaries: summaries.length };
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              logger.error("Semantic consolidation failed", { error: msg });
+              results.semantic = { error: msg };
             }
-            results.semantic = { newFacts, totalSummaries: summaries.length };
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            logger.error("Semantic consolidation failed", { error: msg });
-            results.semantic = { error: msg };
           }
         } else {
           results.semantic = {
@@ -223,10 +258,6 @@ export function registerConsolidationPipelineFunction(
       }
 
       if ((tier === "all" || tier === "reflect") && !isInsightSynthesisEnabled()) {
-        // Kill switch overrides force: even the session.deleted forced
-        // pipeline must not run insight synthesis when disabled. Skipping
-        // here (before any watermark read/write) leaves the reflect
-        // watermark untouched so a later enabled run is not falsely gated.
         results.reflect = {
           skipped: true,
           reason: "INSIGHT_SYNTHESIS_ENABLED=false",

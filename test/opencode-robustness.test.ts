@@ -51,18 +51,8 @@ describe("OpenCode plugin: configurable timeouts", () => {
     expect(plugin).toMatch(/OPENCODE_AGENTMEMORY_TIMEOUT_MS[\s\S]*?5000/);
   });
 
-  it("reads OPENCODE_AGENTMEMORY_HEAVY_TIMEOUT_MS with a 30_000 default", () => {
-    expect(plugin).toMatch(/OPENCODE_AGENTMEMORY_HEAVY_TIMEOUT_MS[\s\S]*?30[_]?000/);
-  });
-
   it("uses TIMEOUT_MS in the default post() timeout", () => {
     expect(plugin).toMatch(/timeoutMs\s*=\s*TIMEOUT_MS/);
   });
 
-  it("uses HEAVY_TIMEOUT_MS for /crystals/auto and /consolidate-pipeline", () => {
-    const idx = plugin.indexOf('"/crystals/auto"');
-    expect(idx).toBeGreaterThan(-1);
-    const block = plugin.slice(idx, idx + 400);
-    expect(block).toMatch(/HEAVY_TIMEOUT_MS/);
-  });
 });

@@ -63,12 +63,11 @@ export class AgentSDKProvider implements MemoryProvider {
     // do not poison each other.
     if (sdkChildContext.getStore()) {
       // We are already inside a Claude Agent SDK-spawned async call
-      // tree. Spawning another one would let its plugin-hook-driven
-      // Stop loop re-enter /agentmemory/summarize and cause unbounded
-      // recursion (#149 follow-up). Degrade to empty string so callers
+      // tree. Spawning another one could recurse through inherited plugin
+      // hooks (#149 follow-up). Degrade to empty string so callers
       // short-circuit. The chunk retry path in src/functions/summarize.ts
       // treats "" as a parse failure but only the in-process re-entry
-      // path can reach this branch — legitimate concurrent siblings now
+      // path can reach this branch - legitimate concurrent siblings now
       // run with their own ALS frames.
       return ''
     }

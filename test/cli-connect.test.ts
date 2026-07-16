@@ -218,6 +218,57 @@ describe("agentmemory connect — claude-code adapter (mock filesystem)", () => 
   });
 });
 
+describe("agentmemory connect - codex hooks fallback", () => {
+  let tmpHome: string;
+  let originalHome: string | undefined;
+  let originalUserprofile: string | undefined;
+
+  beforeEach(() => {
+    tmpHome = mkdtempSync(join(tmpdir(), "am-codex-"));
+    originalHome = process.env["HOME"];
+    originalUserprofile = process.env["USERPROFILE"];
+    process.env["HOME"] = tmpHome;
+    process.env["USERPROFILE"] = tmpHome;
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    if (originalHome !== undefined) process.env["HOME"] = originalHome;
+    else delete process.env["HOME"];
+    if (originalUserprofile !== undefined) {
+      process.env["USERPROFILE"] = originalUserprofile;
+    } else {
+      delete process.env["USERPROFILE"];
+    }
+    rmSync(tmpHome, { recursive: true, force: true });
+    vi.resetModules();
+  });
+
+  it("installs hooks when MCP wiring already exists", async () => {
+    const codexDir = join(tmpHome, ".codex");
+    require("node:fs").mkdirSync(codexDir, { recursive: true });
+    writeFileSync(
+      join(codexDir, "config.toml"),
+      '[mcp_servers.agentmemory]\ncommand = "npx"\n',
+    );
+    const mod = await import("../src/cli/connect/codex.js?t=" + Date.now());
+    const adapter = (mod as { adapter: ConnectAdapter }).adapter;
+
+    const result = await adapter.install({
+      dryRun: false,
+      force: false,
+      withHooks: true,
+    });
+
+    expect(result.kind).toBe("already-wired");
+    const hooks = JSON.parse(
+      readFileSync(join(codexDir, "hooks.json"), "utf-8"),
+    ) as { hooks: Record<string, unknown> };
+    expect(hooks.hooks.Stop).toBeDefined();
+    expect(hooks.hooks.SubagentStart).toBeDefined();
+  });
+});
+
 describe("agentmemory connect — opencode adapter (#872)", () => {
   let tmpHome: string;
   let originalHome: string | undefined;

@@ -121,7 +121,7 @@ agentmemory は hooks、MCP、REST API をサポートするあらゆるエー�
 <td align="center" width="12.5%">
 <a href="https://github.com/openai/codex"><img src="https://github.com/openai.png?size=120" alt="Codex CLI" width="48" height="48" /></a><br/>
 <strong>Codex CLI</strong><br/>
-<sub>ネイティブプラグイン + 6 hooks + MCP</sub>
+<sub>ネイティブプラグイン + 7 hooks + MCP</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="../integrations/openclaw/"><img src="https://github.com/openclaw.png?size=120" alt="OpenClaw" width="48" height="48" /></a><br/>
@@ -158,7 +158,7 @@ agentmemory は hooks、MCP、REST API をサポートするあらゆるエー�
 <td align="center" width="12.5%">
 <a href="https://github.com/opencode-ai/opencode"><img src="https://github.com/opencode-ai.png?size=120" alt="OpenCode" width="48" height="48" /></a><br/>
 <strong>OpenCode</strong><br/>
-<sub>22 hooks + MCP + プラグイン</sub>
+<sub>40 キャプチャパス + MCP + プラグイン</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/cline/cline"><img src="https://github.com/cline.png?size=120" alt="Cline" width="48" height="48" /></a><br/>
@@ -428,7 +428,7 @@ npx @agentmemory/agentmemory upgrade
 ### Claude Code(1 ブロックそのまま貼り付け)
 
 ```text
-Install agentmemory: run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server. Then run `/plugin marketplace add rohitg00/agentmemory` and `/plugin install agentmemory` — the plugin registers all 12 hooks, 4 skills, AND auto-wires the `@agentmemory/mcp` stdio server via its `.mcp.json`, so you get 53 MCP tools (memory_smart_search, memory_save, memory_sessions, memory_governance_delete, etc.) without any extra config step. Verify with `curl http://localhost:3111/agentmemory/health`. The real-time viewer is at http://localhost:3113.
+Install agentmemory: run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server. Then run `/plugin marketplace add rohitg00/agentmemory` and `/plugin install agentmemory` - the plugin registers all 12 hooks, 16 skills, AND auto-wires the `@agentmemory/mcp` stdio server via its `.mcp.json`, so you get 53 MCP tools (memory_smart_search, memory_save, memory_sessions, memory_governance_delete, etc.) without any extra config step. Verify with `curl http://localhost:3111/agentmemory/health`. The real-time viewer is at http://localhost:3113.
 ```
 
 #### プラグインをインストールしない Claude Code(MCP スタンドアロン)
@@ -458,29 +458,29 @@ codex plugin add agentmemory@agentmemory
 
 Codex プラグインは Claude Code プラグインと同じ `plugin/` ディレクトリから出荷されます。以下を登録します:
 
-- `@agentmemory/mcp` を MCP サーバーとして(`AGENTMEMORY_URL` が動作中の agentmemory サーバーを指す場合は 51 ツールすべてをプロキシ、サーバーに到達できない場合はローカルで 7 ツールにフォールバック)
-- 6 つのライフサイクル hooks: `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`PreCompact`、`Stop`
-- 4 つの skills: `/recall`、`/remember`、`/session-history`、`/forget`
+- `@agentmemory/mcp` を MCP サーバーとして(`AGENTMEMORY_URL` が動作中の agentmemory サーバーを指す場合は 53 ツールすべてをプロキシ、サーバーに到達できない場合はローカルで 7 ツールにフォールバック)
+- 7 つのライフサイクル hooks: `SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`SubagentStart`、`SubagentStop`、`Stop`
+- 16 の skills: 9 つの呼び出し可能な skills と 7 つのオンデマンド参照 skills
 
-Codex の hook エンジンは hook サブプロセスに `CLAUDE_PLUGIN_ROOT` を注入する([`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs))ので、同じ hook スクリプトが両ホストで重複なく動きます。Subagent / SessionEnd / Notification / TaskCompleted / PostToolUseFailure イベントは Claude Code 専用で、Codex には登録されません。
+Codex の hook エンジンは hook サブプロセスに `CLAUDE_PLUGIN_ROOT` を注入する([`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs))ので、共有ライフサイクルスクリプトが両ホストで動きます。両ホストはエージェントの各ターン後に `Stop` をディスパッチするため、共有スクリプトはセッションを終了または要約せず `last_assistant_message` だけを記録します。`SessionEnd`、`Notification`、`TaskCompleted`、`PostToolUseFailure` は Claude Code 専用で、Codex には登録されません。
 
-#### Codex Desktop: プラグイン hooks は現在無音(回避策あり)
+#### Codex Desktop のフォールバック
 
-`CodexHooks` と `PluginHooks` はどちらも [`codex-rs/features/src/lib.rs`](https://github.com/openai/codex/blob/main/codex-rs/features/src/lib.rs) で安定版・デフォルト有効ですが、Codex Desktop ビルドは現在プラグインローカルの `hooks.json` をディスパッチしません([openai/codex#16430](https://github.com/openai/codex/issues/16430))。MCP ツールは引き続き動きますが、ライフサイクル観測だけが欠落します。
+現行の Codex リリースはプラグイン同梱 hooks とユーザー hooks を両方読み込みます。一部の Codex Desktop ビルドでプラグイン hooks がディスパッチされない問題は [openai/codex#16430](https://github.com/openai/codex/issues/16430) で追跡されています。まず `/hooks` を確認してください。agentmemory プラグインソースが表示される場合、フォールバックは不要です。
 
-上流が修正を出すまでは、同じ hook コマンドをグローバルな `~/.codex/hooks.json` にミラーしてください:
+`/hooks` に agentmemory がない場合、コマンドを `~/.codex/hooks.json` にミラーします:
 
 ```bash
 agentmemory connect codex --with-hooks
 ```
 
-これは同梱スクリプトへの絶対パスを参照する冪等なブロックを `~/.codex/hooks.json` に追加します(ユーザースコープでは `${CLAUDE_PLUGIN_ROOT}` の展開は不要)。agentmemory をアップグレードしたら同じコマンドを再実行してパスを更新してください。同じファイル内のユーザーエントリは保持され、以前の agentmemory エントリだけが置き換えられます。
+これは同梱スクリプトへの絶対パスを参照する冪等なブロックを `~/.codex/hooks.json` に追加します。agentmemory のアップグレード後に再実行するとパスが更新されます。ユーザーエントリは保持されます。プラグイン hooks が表示されたらフォールバックを削除してください。Codex は読み込んだすべてのソースから一致する hooks を実行します。
 
 <details>
 <summary><b>OpenClaw(このプロンプトを貼り付け)</b></summary>
 
 ```text
-Install agentmemory for OpenClaw. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to my OpenClaw MCP config so agentmemory is available with all 51 memory tools:
+Install agentmemory for OpenClaw. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to my OpenClaw MCP config so agentmemory is available with all 53 memory tools:
 
 {
   "mcpServers": {
@@ -505,7 +505,7 @@ Restart OpenClaw. Verify with `curl http://localhost:3111/agentmemory/health`. O
 <summary><b>Hermes Agent(このプロンプトを貼り付け)</b></summary>
 
 ```text
-Install agentmemory for Hermes. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to ~/.hermes/config.yaml so Hermes can use agentmemory as an MCP server with all 51 memory tools:
+Install agentmemory for Hermes. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to ~/.hermes/config.yaml so Hermes can use agentmemory as an MCP server with all 53 memory tools:
 
 mcp_servers:
   agentmemory:
@@ -550,9 +550,9 @@ Verify with `curl http://localhost:3111/agentmemory/health`. Open http://localho
 | **Gemini CLI** | `~/.gemini/settings.json` | `gemini mcp add agentmemory npx -y @agentmemory/mcp --scope user`(自動マージ)。 |
 | **OpenClaw** | OpenClaw MCP 設定 | 同じ `mcpServers` ブロック、または[より深いメモリプラグイン](../integrations/openclaw/)を使用。 |
 | **Codex CLI(MCP のみ)** | `.codex/config.toml` | TOML シェイプ: `codex mcp add agentmemory -- npx -y @agentmemory/mcp`、または `[mcp_servers.agentmemory]` を手動で追加。 |
-| **Codex CLI(フルプラグイン)** | Codex プラグインマーケットプレイス | `codex plugin marketplace add rohitg00/agentmemory` のあと `codex plugin add agentmemory@agentmemory`。MCP + 6 つのライフサイクル hooks(SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、PreCompact、Stop)+ 4 つの skills を登録。Codex Desktop では、[openai/codex#16430](https://github.com/openai/codex/issues/16430) が解決するまで `agentmemory connect codex --with-hooks` も実行 — そちらではプラグイン hooks が現在無音。 |
-| **OpenCode(MCP のみ)** | `opencode.json` | 異なるシェイプ — トップレベルの `mcp` キー、command は配列: `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`。 |
-| **OpenCode(フルプラグイン)** | `plugin/opencode/` | 22 個の自動キャプチャ hooks がセッションライフサイクル、メッセージ、ツール、エラーをカバー。2 つのスラッシュコマンド(`/recall`、`/remember`)。`plugin/opencode/` を OpenCode ワークスペースにコピーし、プラグインエントリを `opencode.json` に追加。完全な hook 表とギャップ分析は [`plugin/opencode/README.md`](../plugin/opencode/README.md) を参照。 |
+| **Codex CLI(フルプラグイン)** | Codex プラグインマーケットプレイス | `codex plugin marketplace add rohitg00/agentmemory` のあと `codex plugin add agentmemory@agentmemory`。MCP、7 つのライフサイクル hooks(SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、SubagentStart、SubagentStop、Stop)、16 の skills を登録。`/hooks` に agentmemory プラグインソースがない影響対象の Codex Desktop ビルドでのみ `agentmemory connect codex --with-hooks` を実行。 |
+| **OpenCode(MCP のみ)** | `opencode.jsonc` または `opencode.json` | トップレベルの `mcp` キーを使い、command は配列: `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`。 |
+| **OpenCode(フルプラグイン)** | `plugin/opencode/` | 40 の自動キャプチャパスがセッションライフサイクル、メッセージ、ツール、エラーを取得し、16 の skills をインストール。一度のコマンド `agentmemory connect opencode --with-plugin` でプラグインと skill ツリーをコピーし、既存の `opencode.jsonc` または `opencode.json` を更新。OpenCode は `plugins/` ディレクトリ内のファイルを自動検出するため、トップレベルの `plugin` 配列は不要。全 hook 表は [`plugin/opencode/README.md`](../plugin/opencode/README.md) を参照。 |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | [`integrations/pi`](../integrations/pi/) をコピーして pi を再起動。 |
 | **Hermes Agent** | `~/.hermes/config.yaml` | より深い[メモリプロバイダープラグイン](../integrations/hermes/)を使い、`memory.provider: agentmemory` を設定。 |
 | **Qwen Code** | `~/.qwen/settings.json` | `agentmemory connect qwen` が標準の `mcpServers` ブロックを書き込みます。Hook ペイロードは Claude Code とフィールド互換なので、既存の 12 hook スクリプトはそのまま動作 — 同じ `settings.json` の `hooks` セクションで配線してください。 |
@@ -838,11 +838,11 @@ npm install @xenova/transformers
 
 <h2 id="mcp-server"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/tags/light/section-mcp.svg"><img src="../assets/tags/section-mcp.svg" alt="MCP Server" height="32" /></picture></h2>
 
-53 ツール、6 リソース、3 プロンプト、4 skills — あらゆるエージェント向けで最も充実した MCP メモリツールキット。
+53 ツール、6 リソース、3 プロンプト、16 skills - あらゆるエージェント向けで最も充実した MCP メモリツールキット。
 
-> **MCP shim とフルサーバー:** 公開されている `@agentmemory/mcp` パッケージは薄い shim です。**`AGENTMEMORY_URL` 経由で動作中の agentmemory サーバーに到達できる場合に限り**、完全な 51 ツール群を公開します(プロキシモード)。サーバーに到達できない場合、shim は 7 ツールのローカルセット(`memory_save`、`memory_recall`、`memory_smart_search`、`memory_sessions`、`memory_export`、`memory_audit`、`memory_governance_delete`)にフォールバックします。`AGENTMEMORY_TOOLS=core|all` 環境変数は*サーバー側*のフラグです — shim の `env` ブロックで設定しても効果はありません。Cursor / OpenCode / Gemini CLI で 7 ツールしか見えない場合は、`npx @agentmemory/agentmemory`(または Docker スタック)を起動し、`AGENTMEMORY_URL=http://localhost:3111` を設定してください。
+> **MCP shim とフルサーバー:** 公開されている `@agentmemory/mcp` パッケージは薄い shim です。**`AGENTMEMORY_URL` 経由で動作中の agentmemory サーバーに到達できる場合に限り**、完全な 53 ツール群を公開します(プロキシモード)。サーバーに到達できない場合、shim は 7 ツールのローカルセット(`memory_save`、`memory_recall`、`memory_smart_search`、`memory_sessions`、`memory_export`、`memory_audit`、`memory_governance_delete`)にフォールバックします。`AGENTMEMORY_TOOLS=core|all` 環境変数は*サーバー側*のフラグです - shim の `env` ブロックで設定しても効果はありません。Cursor / OpenCode / Gemini CLI で 7 ツールしか見えない場合は、`npx @agentmemory/agentmemory`(または Docker スタック)を起動し、`AGENTMEMORY_URL=http://localhost:3111` を設定してください。
 
-### 51 ツール
+### 53 ツール
 
 <details>
 <summary>コアツール(常時利用可能)</summary>
@@ -863,46 +863,9 @@ npm install @xenova/transformers
 
 </details>
 
-<details>
-<summary>拡張ツール(全 51 — AGENTMEMORY_TOOLS=all を設定)</summary>
+サーバーはデフォルトで 53 個すべてのツールを公開します。完全なリストとパラメータスキーマについては、[生成された MCP ツールリファレンス](../plugin/skills/agentmemory-mcp-tools/REFERENCE.md)を参照してください。
 
-| ツール | 説明 |
-|------|-------------|
-| `memory_patterns` | 繰り返し現れるパターンを検出 |
-| `memory_timeline` | 時系列の観測 |
-| `memory_relations` | 関係グラフを照会 |
-| `memory_graph_query` | ナレッジグラフ探索 |
-| `memory_consolidate` | 4 層統合を実行 |
-| `memory_claude_bridge_sync` | MEMORY.md と同期 |
-| `memory_team_share` | チームメンバーと共有 |
-| `memory_team_feed` | 最近の共有アイテム |
-| `memory_audit` | 操作の監査証跡 |
-| `memory_governance_delete` | 監査証跡付き削除 |
-| `memory_snapshot_create` | Git バージョンスナップショット |
-| `memory_action_create` | 依存関係付き作業項目を作成 |
-| `memory_action_update` | アクションのステータス更新 |
-| `memory_frontier` | 優先度順のブロック解除済みアクション |
-| `memory_next` | 次に最も重要なアクション 1 つ |
-| `memory_lease` | 排他的アクションリース(マルチエージェント) |
-| `memory_routine_run` | ワークフロー ルーチンをインスタンス化 |
-| `memory_signal_send` | エージェント間メッセージング |
-| `memory_signal_read` | 受領確認付きでメッセージを読む |
-| `memory_checkpoint` | 外部条件ゲート |
-| `memory_mesh_sync` | インスタンス間 P2P 同期 |
-| `memory_sentinel_create` | イベント駆動ウォッチャー |
-| `memory_sentinel_trigger` | 外部からセンチネルを発火 |
-| `memory_sketch_create` | 一時的なアクショングラフ |
-| `memory_sketch_promote` | 永続化に昇格 |
-| `memory_crystallize` | アクションチェーンをコンパクト化 |
-| `memory_diagnose` | ヘルスチェック |
-| `memory_heal` | 詰まった状態を自動修復 |
-| `memory_facet_tag` | 次元:値タグ |
-| `memory_facet_query` | facet タグで照会 |
-| `memory_verify` | 出所を追跡 |
-
-</details>
-
-### 6 リソース · 3 プロンプト · 4 Skills
+### 6 リソース · 3 プロンプト · 16 Skills
 
 | 種類 | 名前 | 説明 |
 |------|------|-------------|
@@ -946,7 +909,7 @@ npx -y @agentmemory/mcp                # shim パッケージのエイリアス
 
 `agentmemory` エントリはホストの既存 `mcpServers` オブジェクトにマージし、ファイル全体を置き換えないでください。ホストの `localhost` に到達できないサンドボックスクライアントには、env ブロックに `"AGENTMEMORY_FORCE_PROXY": "1"` を追加し、`AGENTMEMORY_URL` をサンドボックスが到達できる経路に設定してください。
 
-OpenCode (`opencode.json`):
+OpenCode (`opencode.jsonc` または `opencode.json`):
 ```json
 {
   "mcp": {
@@ -955,17 +918,20 @@ OpenCode (`opencode.json`):
       "command": ["npx", "-y", "@agentmemory/mcp"],
       "enabled": true
     }
-  },
-  "plugin": ["./plugins/agentmemory-capture.ts"]
+  }
 }
 ```
 
-リポジトリからプラグインファイルをコピー:
+プラグインと skills をコピーするか、一度のインストールコマンドを実行:
 ```bash
-mkdir -p ~/.config/opencode/plugins
+agentmemory connect opencode --with-plugin
+# または手動でインストール:
+mkdir -p ~/.config/opencode/plugins ~/.config/opencode/skills
 cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
-cp plugin/opencode/commands/*.md ~/.config/opencode/commands/
+cp -R plugin/skills/* ~/.config/opencode/skills/
 ```
+
+OpenCode は `plugins/` ディレクトリから `agentmemory-capture.ts` を自動検出します。既存のトップレベル `plugin` 配列とも互換性はありますが、このインストールには不要です。
 
 ---
 
@@ -1326,7 +1292,7 @@ CONSOLIDATION_ENABLED=true
 # USER_ID=
 # TEAM_MODE=private
 
-# Tool visibility: "core" (8 tools) or "all" (51 tools)
+# Tool visibility: "core" (8 tools) or "all" (53 tools)
 # AGENTMEMORY_TOOLS=core
 ```
 
@@ -1334,7 +1300,7 @@ CONSOLIDATION_ENABLED=true
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/tags/light/section-api.svg"><img src="../assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-ポート `3111` 上の 124 エンドポイント。REST API はデフォルトで `127.0.0.1` にバインドします。`AGENTMEMORY_SECRET` が設定されている場合、保護されたエンドポイントは `Authorization: Bearer <secret>` を要求し、mesh sync エンドポイントは両ピアで `AGENTMEMORY_SECRET` を要求します。
+ポート `3111` 上の 134 エンドポイント。REST API はデフォルトで `127.0.0.1` にバインドします。`AGENTMEMORY_SECRET` が設定されている場合、保護されたエンドポイントは `Authorization: Bearer <secret>` を要求し、mesh sync エンドポイントは両ピアで `AGENTMEMORY_SECRET` を要求します。
 
 <details>
 <summary>主要エンドポイント</summary>

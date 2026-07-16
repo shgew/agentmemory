@@ -520,6 +520,37 @@ describe("mem::summarize windowing", () => {
 });
 
 describe("mem::summarize pending compression drain", () => {
+  it("reuses pending-compression work completed by the consolidation event", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const sessionId = "ses_predrained";
+    const timestamp = "2026-01-01T10:00:00.000Z";
+    await kv.set("sessions", sessionId, {
+      id: sessionId,
+      project: "test-project",
+      cwd: "/tmp",
+      startedAt: timestamp,
+      status: "active",
+      observationCount: 1,
+    } satisfies Session);
+    await kv.set(`obs:${sessionId}`, "obs_1", makeObs(1, sessionId));
+    const list = vi.spyOn(kv, "list");
+
+    registerSummarizeFunction(
+      sdk as any,
+      kv as any,
+      makeProvider([summaryXml({ title: "pre-drained" })]),
+    );
+    const handler = sdk.functions.get("mem::summarize")!;
+    const result: any = await handler({
+      sessionId,
+      pendingCompressionDrained: true,
+    });
+
+    expect(result.success).toBe(true);
+    expect(list).not.toHaveBeenCalledWith("rawPayloads");
+  });
+
   it("retries pending raw observations and remains idempotent after success", async () => {
     const sdk = mockSdk();
     const kv = mockKV();

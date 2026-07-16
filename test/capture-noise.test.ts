@@ -20,7 +20,7 @@ describe("capture noise filtering", () => {
     "config_loaded",
     "file_watcher",
   ])(
-    "drops %s after only bumping session updatedAt",
+    "drops %s without extending session lifetime",
     async (hookType) => {
       const { registerObserveFunction } = await import(
         "../src/functions/observe.js"
@@ -66,7 +66,7 @@ describe("capture noise filtering", () => {
         updatedAt: string;
       }>("mem:sessions", "ses_noise");
       expect(session?.observationCount).toBe(3);
-      expect(session?.updatedAt).not.toBe("2026-07-15T09:00:00.000Z");
+      expect(session?.updatedAt).toBe("2026-07-15T09:00:00.000Z");
       expect(dedupMap.computeHash).not.toHaveBeenCalled();
       expect(dedupMap.record).not.toHaveBeenCalled();
       expect(getSearchAddMock()).not.toHaveBeenCalled();

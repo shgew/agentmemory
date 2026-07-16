@@ -12,6 +12,14 @@ describe("idle-checkpoint poll wiring (src/index.ts)", () => {
     expect(indexSrc).toMatch(/AGENTMEMORY_IDLE_CHECKPOINT_ENABLED/);
   });
 
+  it("starts the idle-checkpoint poll only when graph extraction is enabled", () => {
+    const idleBlock = indexSrc.slice(
+      indexSrc.indexOf("const idleThresholdMs"),
+      indexSrc.indexOf("const shutdown"),
+    );
+    expect(idleBlock).toMatch(/isGraphExtractionEnabled\(\)/);
+  });
+
   it("reads the poll interval from AGENTMEMORY_IDLE_CHECKPOINT_POLL_MS", () => {
     expect(indexSrc).toMatch(/AGENTMEMORY_IDLE_CHECKPOINT_POLL_MS/);
   });

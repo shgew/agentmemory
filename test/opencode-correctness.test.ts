@@ -28,6 +28,15 @@ describe("OpenCode plugin: session/checkpoint replaces summarize debounce", () =
     expect(compactedBlock).toMatch(/post\(["']\/session\/checkpoint["']/);
   });
 
+  it("allows context re-injection before asynchronous compaction work", () => {
+    const compactedBlock = plugin.slice(
+      plugin.indexOf('if (event.type === "session.compacted")'),
+      plugin.indexOf('if (event.type === "session.updated")'),
+    );
+    expect(compactedBlock.indexOf("contextInjectedSessions.delete(sid)"))
+      .toBeLessThan(compactedBlock.indexOf('await post("/session/checkpoint"'));
+  });
+
   it("does not contain shouldSummarize, lastSummarizeAt, or SUMMARIZE_DEBOUNCE_MS", () => {
     expect(plugin).not.toMatch(/shouldSummarize/);
     expect(plugin).not.toMatch(/lastSummarizeAt/);
@@ -36,17 +45,6 @@ describe("OpenCode plugin: session/checkpoint replaces summarize debounce", () =
 
   it("does not call /summarize", () => {
     expect(plugin).not.toMatch(/post\(["']\/summarize["']/);
-  });
-});
-
-describe("OpenCode plugin: user message capture", () => {
-  it("emits an observation when message.updated fires with role user", () => {
-    const messageUpdatedBlock = plugin.slice(
-      plugin.indexOf('if (event.type === "message.updated")'),
-      plugin.indexOf('if (event.type === "message.removed")'),
-    );
-    expect(messageUpdatedBlock).toMatch(/info\.role\s*===\s*["']user["']/);
-    expect(messageUpdatedBlock).toMatch(/observe\(\s*sid\s*,\s*["']user_message["']/);
   });
 });
 

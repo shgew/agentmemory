@@ -41,7 +41,7 @@ const FEATURED: Agent[] = [
     logo: "https://github.com/openai.png",
     accent: "#10A37F",
     href: "https://github.com/openai/codex",
-    pitch: "6 hooks + MCP · native plugin",
+    pitch: "7 hooks + MCP · native plugin",
     sub: "NATIVE PLUGIN",
   },
   {

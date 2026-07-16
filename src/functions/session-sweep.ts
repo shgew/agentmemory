@@ -1,5 +1,5 @@
 import type { ISdk } from "iii-sdk";
-import type { Session } from "../types.js";
+import type { RawObservation, Session } from "../types.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { safeAudit } from "./audit.js";
@@ -29,6 +29,35 @@ interface SweepResult {
   totalCandidates: number;
   maxAgeMs: number;
   dryRun: boolean;
+}
+
+type SweepMode = "finalize" | "idle-checkpoint";
+type CheckpointKind = "idle" | "catchup" | "deferred-finalize";
+
+type SweepOutcome =
+  | { status: "skipped" }
+  | {
+      status: "swept";
+      checkpointAt: string;
+      consolidated: boolean;
+    }
+  | {
+      status: "checkpointed";
+      since: string | null;
+      checkpointAt: string;
+      kind: CheckpointKind;
+    };
+
+interface SweepPlan {
+  anchor: string;
+  watermark: string | null;
+  expectedStatus: Session["status"];
+  kind: "idle" | "catchup" | "finalize";
+  consolidated: boolean;
+  consolidation: {
+    functionId: "event::session::checkpoint" | "event::session::stopped";
+    payload: Record<string, unknown>;
+  };
 }
 
 function resolveMaxAgeMs(payload?: SweepPayload): number {
@@ -72,13 +101,29 @@ function sessionAgeMs(anchor: string, now: number): number | null {
   return now - anchorMs;
 }
 
+function eligibleAnchor(
+  session: Session,
+  mode: SweepMode,
+  maxAgeMs: number,
+): string | null {
+  if (mode === "idle-checkpoint") {
+    if (session.status !== "active") return null;
+  } else if (session.status !== "active" && session.status !== "completed") {
+    return null;
+  }
+  const anchor = activityAnchor(session);
+  if (!anchor) return null;
+  const ageMs = sessionAgeMs(anchor, Date.now());
+  return ageMs !== null && ageMs > maxAgeMs ? anchor : null;
+}
+
 export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction(
     "mem::session-sweep",
     async (data?: SweepPayload): Promise<SweepResult> =>
       withKeyedLock("session-sweep", async () => {
         const dryRun = data?.dryRun ?? false;
-        const mode: "finalize" | "idle-checkpoint" =
+        const mode: SweepMode =
           data?.mode === "idle-checkpoint" ? "idle-checkpoint" : "finalize";
         const maxAgeMs = resolveMaxAgeMs(data);
         const idFilter =
@@ -103,6 +148,31 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
         const scoped = idFilter
           ? candidates.filter((s) => idFilter.has(s.id))
           : candidates;
+
+        const rawPayloadsBySession = new Map<string, RawObservation[]>();
+        let rawPayloadsError: unknown;
+        if (
+          !dryRun &&
+          scoped.some((session) => {
+            const anchor = activityAnchor(session);
+            if (!anchor) return false;
+            const ageMs = sessionAgeMs(anchor, now);
+            return ageMs !== null && ageMs > maxAgeMs;
+          })
+        ) {
+          try {
+            const scopedIds = new Set(scoped.map((session) => session.id));
+            const rawPayloads = await kv.list<RawObservation>(KV.rawPayloads);
+            for (const raw of rawPayloads) {
+              if (!scopedIds.has(raw.sessionId)) continue;
+              const sessionPayloads = rawPayloadsBySession.get(raw.sessionId);
+              if (sessionPayloads) sessionPayloads.push(raw);
+              else rawPayloadsBySession.set(raw.sessionId, [raw]);
+            }
+          } catch (error) {
+            rawPayloadsError = error;
+          }
+        }
 
         const processSession = async (session: Session): Promise<void> => {
           const anchor = activityAnchor(session);
@@ -136,215 +206,280 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
           }
 
           try {
-            const outcome = await withKeyedLock(
-              `obs:${session.id}`,
-              async (): Promise<
-                | { status: "skipped" }
-                | {
-                    status: "swept";
-                    checkpointAt: string;
-                    consolidated: boolean;
-                  }
-                | {
-                    status: "checkpointed";
-                    since: string | null;
-                    checkpointAt: string;
-                    kind: "idle" | "catchup";
-                  }
-              > => {
-                const current = await kv.get<Session>(KV.sessions, session.id);
-                if (!current) return { status: "skipped" };
-                if (mode === "idle-checkpoint") {
-                  if (current.status !== "active") return { status: "skipped" };
-                } else if (
-                  current.status !== "active" &&
-                  current.status !== "completed"
-                ) {
-                  return { status: "skipped" };
-                }
-                const currentAnchor = activityAnchor(current);
-                if (!currentAnchor) return { status: "skipped" };
-                const currentAge = sessionAgeMs(currentAnchor, Date.now());
-                if (currentAge === null || currentAge <= maxAgeMs) {
-                  return { status: "skipped" };
-                }
-                const drain = await drainPendingCompression(
-                  sdk,
-                  kv,
-                  session.id,
+            await withKeyedLock(`session:checkpoint:${session.id}`, async () => {
+              const eligible = await withKeyedLock(
+                `obs:${session.id}`,
+                async () => {
+                  const current = await kv.get<Session>(KV.sessions, session.id);
+                  return current
+                    ? eligibleAnchor(current, mode, maxAgeMs) !== null
+                    : false;
+                },
+              );
+              if (!eligible) {
+                skipped.push(session.id);
+                return;
+              }
+              if (rawPayloadsError) throw rawPayloadsError;
+
+              const drain = await drainPendingCompression(sdk, kv, session.id, {
+                rawPayloads: rawPayloadsBySession.get(session.id) ?? [],
+              });
+              if (drain.remainingIds.length > 0) {
+                throw new Error(
+                  `pending_compression_failed: ${drain.remainingIds.length} observation(s) remain`,
                 );
-                if (drain.remainingIds.length > 0) {
-                  throw new Error(
-                    `pending_compression_failed: ${drain.remainingIds.length} observation(s) remain`,
+              }
+              const recoveredPending = drain.completed > 0;
+
+              const preparation = await withKeyedLock(
+                `obs:${session.id}`,
+                async (): Promise<{ plan: SweepPlan } | { outcome: SweepOutcome }> => {
+                  const current = await kv.get<Session>(KV.sessions, session.id);
+                  if (!current) return { outcome: { status: "skipped" } };
+                  const currentAnchor = eligibleAnchor(current, mode, maxAgeMs);
+                  if (!currentAnchor) {
+                    return { outcome: { status: "skipped" } };
+                  }
+                  const currentWatermark = effectiveWatermark(current);
+
+                  if (mode === "idle-checkpoint") {
+                    if (
+                      !recoveredPending &&
+                      currentWatermark &&
+                      !isAfter(currentAnchor, currentWatermark)
+                    ) {
+                      return { outcome: { status: "skipped" } };
+                    }
+                    const consolidation = {
+                      functionId: "event::session::checkpoint" as const,
+                      payload: {
+                        sessionId: session.id,
+                        reason: "idle-checkpoint",
+                        since: recoveredPending ? undefined : currentWatermark,
+                        until: recoveredPending ? undefined : currentAnchor,
+                        waitForCompletion: true,
+                        summaryOnly: Boolean(current.parentSessionId),
+                        pendingCompressionDrained: currentAnchor === anchor,
+                        pendingCompressionRecovered: recoveredPending,
+                      },
+                    };
+                    return {
+                      plan: {
+                        anchor: currentAnchor,
+                        watermark: currentWatermark,
+                        expectedStatus: current.status,
+                        kind: "idle",
+                        consolidated: true,
+                        consolidation,
+                      },
+                    };
+                  }
+
+                  if (current.status === "completed") {
+                    if (
+                      !recoveredPending &&
+                      currentWatermark &&
+                      !isAfter(currentAnchor, currentWatermark)
+                    ) {
+                      return { outcome: { status: "skipped" } };
+                    }
+                    const consolidation = {
+                      functionId: "event::session::checkpoint" as const,
+                      payload: {
+                        sessionId: session.id,
+                        reason: "sweep-catchup",
+                        since: recoveredPending ? undefined : currentWatermark,
+                        until: recoveredPending ? undefined : currentAnchor,
+                        waitForCompletion: true,
+                        summaryOnly: Boolean(current.parentSessionId),
+                        pendingCompressionDrained: currentAnchor === anchor,
+                        pendingCompressionRecovered: recoveredPending,
+                      },
+                    };
+                    return {
+                      plan: {
+                        anchor: currentAnchor,
+                        watermark: currentWatermark,
+                        expectedStatus: current.status,
+                        kind: "catchup",
+                        consolidated: true,
+                        consolidation,
+                      },
+                    };
+                  }
+
+                  const consolidated =
+                    recoveredPending ||
+                    !currentWatermark ||
+                    isAfter(currentAnchor, currentWatermark);
+                  const consolidation = {
+                    functionId: "event::session::stopped" as const,
+                    payload: {
+                      sessionId: session.id,
+                      reason: consolidated ? "sweep-stale" : "sweep-finalize",
+                      until:
+                        consolidated && recoveredPending
+                          ? undefined
+                          : currentAnchor,
+                      waitForCompletion: true,
+                      summaryOnly: consolidated
+                        ? Boolean(current.parentSessionId)
+                        : true,
+                      pendingCompressionDrained: currentAnchor === anchor,
+                      pendingCompressionRecovered: recoveredPending,
+                    },
+                  };
+                  return {
+                    plan: {
+                      anchor: currentAnchor,
+                      watermark: currentWatermark,
+                      expectedStatus: current.status,
+                      kind: "finalize",
+                      consolidated,
+                      consolidation,
+                    },
+                  };
+                },
+              );
+
+              if ("outcome" in preparation) {
+                skipped.push(session.id);
+                return;
+              }
+
+              const plan = preparation.plan;
+              await sdk.trigger({
+                function_id: plan.consolidation.functionId,
+                payload: plan.consolidation.payload,
+              });
+
+              const outcome = await withKeyedLock(
+                `obs:${session.id}`,
+                async (): Promise<SweepOutcome> => {
+                  const current = await kv.get<Session>(KV.sessions, session.id);
+                  if (!current || current.status !== plan.expectedStatus) {
+                    return { status: "skipped" };
+                  }
+                  const currentAnchor = activityAnchor(current);
+                  if (currentAnchor !== plan.anchor) {
+                    const currentWatermark = effectiveWatermark(current);
+                    if (
+                      !currentWatermark ||
+                      isAfter(plan.anchor, currentWatermark)
+                    ) {
+                      await kv.update<Session>(KV.sessions, session.id, [
+                        {
+                          type: "set",
+                          path: "lastCheckpointAt",
+                          value: plan.anchor,
+                        },
+                      ]);
+                    }
+                    return {
+                      status: "checkpointed",
+                      since: recoveredPending ? null : plan.watermark,
+                      checkpointAt: plan.anchor,
+                      kind:
+                        plan.kind === "finalize"
+                          ? "deferred-finalize"
+                          : plan.kind,
+                    };
+                  }
+
+                  if (plan.kind === "finalize") {
+                    const endedAt = new Date().toISOString();
+                    await kv.update<Session>(KV.sessions, session.id, [
+                      { type: "set", path: "endedAt", value: endedAt },
+                      { type: "set", path: "status", value: "completed" },
+                      {
+                        type: "set",
+                        path: "lastCheckpointAt",
+                        value: plan.anchor,
+                      },
+                    ]);
+                    return {
+                      status: "swept",
+                      checkpointAt: plan.anchor,
+                      consolidated: plan.consolidated,
+                    };
+                  }
+
+                  await kv.update<Session>(KV.sessions, session.id, [
+                    {
+                      type: "set",
+                      path: "lastCheckpointAt",
+                      value: plan.anchor,
+                    },
+                  ]);
+                  return {
+                    status: "checkpointed",
+                    since: recoveredPending ? null : plan.watermark,
+                    checkpointAt: plan.anchor,
+                    kind: plan.kind,
+                  };
+                },
+              );
+
+              if (outcome.status === "skipped") {
+                skipped.push(session.id);
+                return;
+              }
+
+              if (outcome.status === "swept") {
+                swept.push(session.id);
+                if (!outcome.consolidated) {
+                  logger.info(
+                    "Session finalize marked done, no new activity since checkpoint",
+                    { sessionId: session.id, checkpointAt: outcome.checkpointAt },
                   );
                 }
-                const recoveredPending = drain.completed > 0;
-                const currentWatermark = effectiveWatermark(current);
-
-                if (mode === "idle-checkpoint") {
-                  if (
-                    !recoveredPending &&
-                    currentWatermark &&
-                    !isAfter(currentAnchor, currentWatermark)
-                  ) {
-                    return { status: "skipped" };
-                  }
-                  await sdk.trigger({
-                    function_id: "event::session::checkpoint",
-                    payload: {
-                      sessionId: session.id,
-                      reason: "idle-checkpoint",
-                      since: recoveredPending ? undefined : currentWatermark,
-                      until: recoveredPending ? undefined : currentAnchor,
-                      waitForCompletion: true,
-                      summaryOnly: Boolean(current.parentSessionId),
-                    },
-                  });
-                  await kv.update<Session>(KV.sessions, session.id, [
-                    {
-                      type: "set",
-                      path: "lastCheckpointAt",
-                      value: currentAnchor,
-                    },
-                  ]);
-                  return {
-                    status: "checkpointed",
-                    since: recoveredPending ? null : currentWatermark,
-                    checkpointAt: currentAnchor,
-                    kind: "idle",
-                  };
-                }
-
-                if (current.status === "completed") {
-                  if (
-                    !recoveredPending &&
-                    currentWatermark &&
-                    !isAfter(currentAnchor, currentWatermark)
-                  ) {
-                    return { status: "skipped" };
-                  }
-                  await sdk.trigger({
-                    function_id: "event::session::checkpoint",
-                    payload: {
-                      sessionId: session.id,
-                      reason: "sweep-catchup",
-                      since: recoveredPending ? undefined : currentWatermark,
-                      until: recoveredPending ? undefined : currentAnchor,
-                      waitForCompletion: true,
-                      summaryOnly: Boolean(current.parentSessionId),
-                    },
-                  });
-                  await kv.update<Session>(KV.sessions, session.id, [
-                    {
-                      type: "set",
-                      path: "lastCheckpointAt",
-                      value: currentAnchor,
-                    },
-                  ]);
-                  return {
-                    status: "checkpointed",
-                    since: recoveredPending ? null : currentWatermark,
-                    checkpointAt: currentAnchor,
-                    kind: "catchup",
-                  };
-                }
-
-                const consolidated =
-                  recoveredPending ||
-                  !currentWatermark ||
-                  isAfter(currentAnchor, currentWatermark);
-                if (consolidated) {
-                  await sdk.trigger({
-                    function_id: "event::session::stopped",
-                    payload: {
-                      sessionId: session.id,
-                      reason: "sweep-stale",
-                      until: recoveredPending ? undefined : currentAnchor,
-                      waitForCompletion: true,
-                      summaryOnly: Boolean(current.parentSessionId),
-                    },
-                  });
-                } else {
-                  await sdk.trigger({
-                    function_id: "event::session::stopped",
-                    payload: {
-                      sessionId: session.id,
-                      reason: "sweep-finalize",
-                      until: currentAnchor,
-                      waitForCompletion: true,
-                      summaryOnly: true,
-                    },
-                  });
-                }
-                const endedAt = new Date().toISOString();
-                await kv.update<Session>(KV.sessions, session.id, [
-                  { type: "set", path: "endedAt", value: endedAt },
-                  { type: "set", path: "status", value: "completed" },
+                await safeAudit(
+                  kv,
+                  "session_sweep",
+                  "mem::session-sweep",
+                  [session.id],
                   {
-                    type: "set",
-                    path: "lastCheckpointAt",
-                    value: currentAnchor,
+                    reason: outcome.consolidated
+                      ? "stale_active_session_closed"
+                      : "stale_active_marked_done_no_activity",
+                    maxAgeMs,
+                    checkpointAt: outcome.checkpointAt,
                   },
-                ]);
-                return {
-                  status: "swept",
-                  checkpointAt: currentAnchor,
-                  consolidated,
-                };
-              },
-            );
-
-            if (outcome.status === "skipped") {
-              skipped.push(session.id);
-              return;
-            }
-
-            if (outcome.status === "swept") {
-              swept.push(session.id);
-              if (!outcome.consolidated) {
-                logger.info(
-                  "Session finalize marked done, no new activity since checkpoint",
-                  { sessionId: session.id, checkpointAt: outcome.checkpointAt },
+                );
+              } else {
+                checkpointed.push(session.id);
+                if (outcome.kind === "idle") {
+                  logger.info("Session idle-checkpoint fired", {
+                    sessionId: session.id,
+                    since: outcome.since,
+                    until: outcome.checkpointAt,
+                  });
+                } else if (outcome.kind === "deferred-finalize") {
+                  logger.info("Session finalize deferred by new activity", {
+                    sessionId: session.id,
+                    checkpointAt: outcome.checkpointAt,
+                  });
+                }
+                await safeAudit(
+                  kv,
+                  "session_checkpoint",
+                  "mem::session-sweep",
+                  [session.id],
+                  {
+                    reason:
+                      outcome.kind === "idle"
+                        ? "idle_checkpoint"
+                        : outcome.kind === "catchup"
+                          ? "completed_session_post_close_activity"
+                          : "stale_active_activity_advanced_during_finalize",
+                    maxAgeMs,
+                    since: outcome.since,
+                    until: outcome.checkpointAt,
+                  },
                 );
               }
-              await safeAudit(
-                kv,
-                "session_sweep",
-                "mem::session-sweep",
-                [session.id],
-                {
-                  reason: outcome.consolidated
-                    ? "stale_active_session_closed"
-                    : "stale_active_marked_done_no_activity",
-                  maxAgeMs,
-                  checkpointAt: outcome.checkpointAt,
-                },
-              );
-            } else {
-              checkpointed.push(session.id);
-              if (outcome.kind === "idle") {
-                logger.info("Session idle-checkpoint fired", {
-                  sessionId: session.id,
-                  since: outcome.since,
-                  until: outcome.checkpointAt,
-                });
-              }
-              await safeAudit(
-                kv,
-                "session_checkpoint",
-                "mem::session-sweep",
-                [session.id],
-                {
-                  reason:
-                    outcome.kind === "idle"
-                      ? "idle_checkpoint"
-                      : "completed_session_post_close_activity",
-                  maxAgeMs,
-                  since: outcome.since,
-                  until: outcome.checkpointAt,
-                },
-              );
-            }
+            });
           } catch (err) {
             failed.push({
               sessionId: session.id,

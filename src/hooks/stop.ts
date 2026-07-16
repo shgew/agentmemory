@@ -1,8 +1,6 @@
 #!/usr/bin/env node
+import { resolveProject } from "./_project.js";
 
-// Inlined — see src/hooks/sdk-guard.ts for canonical version. Kept local
-// per-hook so tsdown does not emit a shared hashed chunk that would churn
-// the diff on every rebuild.
 function isSdkChildContext(payload: unknown): boolean {
   if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
   if (!payload || typeof payload !== "object") return false;
@@ -13,16 +11,14 @@ const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
 
 function authHeaders(): Record<string, string> {
-  const h: Record<string, string> = { "Content-Type": "application/json" };
-  if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
-  return h;
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (SECRET) headers["Authorization"] = `Bearer ${SECRET}`;
+  return headers;
 }
 
 async function main() {
   let input = "";
-  for await (const chunk of process.stdin) {
-    input += chunk;
-  }
+  for await (const chunk of process.stdin) input += chunk;
 
   let data: Record<string, unknown>;
   try {
@@ -31,29 +27,38 @@ async function main() {
     return;
   }
 
-  if (isSdkChildContext(data)) {
-    // Do not summarize from inside a Claude Agent SDK child session;
-    // would re-enter agent-sdk provider and loop (see sdk-guard.ts).
-    return;
-  }
+  if (isSdkChildContext(data)) return;
 
-  const sessionId = ((data.session_id || data.sessionId) as string) || "unknown";
+  const rawSessionId = data.session_id ?? data.sessionId;
+  const sessionId =
+    typeof rawSessionId === "string" && rawSessionId.length > 0
+      ? rawSessionId
+      : "unknown";
+  const message =
+    typeof data.last_assistant_message === "string"
+      ? data.last_assistant_message.slice(0, 8000)
+      : "";
+  if (!message) return;
 
-  fetch(`${REST_URL}/agentmemory/summarize`, {
+  const cwd =
+    typeof data.cwd === "string" && data.cwd.length > 0
+      ? data.cwd
+      : process.cwd();
+
+  fetch(`${REST_URL}/agentmemory/observe`, {
     method: "POST",
     headers: authHeaders(),
-    body: JSON.stringify({ sessionId }),
-    signal: AbortSignal.timeout(120000),
+    body: JSON.stringify({
+      hookType: "assistant_message",
+      sessionId,
+      project: resolveProject(cwd),
+      cwd,
+      timestamp: new Date().toISOString(),
+      data: { message },
+    }),
+    signal: AbortSignal.timeout(3000),
   }).catch(() => {});
-
-  fetch(`${REST_URL}/agentmemory/session/end`, {
-    method: "POST",
-    headers: authHeaders(),
-    body: JSON.stringify({ sessionId }),
-    signal: AbortSignal.timeout(5000),
-  }).catch(() => {});
-
-  setTimeout(() => process.exit(0), 1500).unref();
+  setTimeout(() => process.exit(0), 500).unref();
 }
 
 main();

@@ -47,6 +47,7 @@ describe("Codex plugin manifest (developers.openai.com/codex/plugins)", () => {
     expect(manifest.name).toBe("agentmemory");
     expect(manifest.name).toMatch(/^[a-z][a-z0-9-]*$/);
     expect(manifest.version).toMatch(/^\d+\.\d+\.\d+/);
+    expect(manifest.description).toContain("7 hooks");
     expect(manifest.skills).toBeDefined();
     expect(manifest.mcpServers).toBeDefined();
     expect(manifest.hooks).toBeDefined();
@@ -92,7 +93,7 @@ describe("Codex plugin manifest (developers.openai.com/codex/plugins)", () => {
     );
   });
 
-  it("hooks.codex.json contains only events Codex supports (no Subagent / SessionEnd / Notification / TaskCompleted / PostToolUseFailure)", () => {
+  it("hooks.codex.json contains the seven Codex lifecycle events agentmemory uses", () => {
     const hooksPath = join(pluginRoot, "hooks/hooks.codex.json");
     const hooks = readJson<{ hooks: Record<string, unknown> }>(hooksPath);
     const events = Object.keys(hooks.hooks);
@@ -104,6 +105,8 @@ describe("Codex plugin manifest (developers.openai.com/codex/plugins)", () => {
       "PermissionRequest",
       "PreCompact",
       "PostCompact",
+      "SubagentStart",
+      "SubagentStop",
       "Stop",
     ]);
     for (const event of events) {
@@ -113,8 +116,23 @@ describe("Codex plugin manifest (developers.openai.com/codex/plugins)", () => {
     expect(events).toContain("UserPromptSubmit");
     expect(events).toContain("PreToolUse");
     expect(events).toContain("PostToolUse");
-    expect(events).toContain("PreCompact");
+    expect(events).toContain("SubagentStart");
+    expect(events).toContain("SubagentStop");
     expect(events).toContain("Stop");
+    expect(events).not.toContain("PreCompact");
+    expect(events).toHaveLength(7);
+  });
+
+  it("uses the shared turn-scoped Stop hook", () => {
+    const hooks = readJson<{ hooks: Record<string, HookEntry[]> }>(
+      join(pluginRoot, "hooks/hooks.codex.json"),
+    );
+    const commands = hooks.hooks.Stop?.flatMap((entry) =>
+      entry.hooks.map((handler) => handler.command),
+    );
+    expect(commands).toEqual([
+      'node "${CLAUDE_PLUGIN_ROOT}/scripts/stop.mjs"',
+    ]);
   });
 
   it("hook command scripts referenced in hooks.codex.json exist on disk", () => {

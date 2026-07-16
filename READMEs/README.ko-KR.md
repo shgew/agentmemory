@@ -121,7 +121,7 @@ agentmemory는 hooks, MCP, REST API를 지원하는 모든 에이전트와 호�
 <td align="center" width="12.5%">
 <a href="https://github.com/openai/codex"><img src="https://github.com/openai.png?size=120" alt="Codex CLI" width="48" height="48" /></a><br/>
 <strong>Codex CLI</strong><br/>
-<sub>native plugin + 6 hooks + MCP</sub>
+<sub>native plugin + 7 hooks + MCP</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="../integrations/openclaw/"><img src="https://github.com/openclaw.png?size=120" alt="OpenClaw" width="48" height="48" /></a><br/>
@@ -158,7 +158,7 @@ agentmemory는 hooks, MCP, REST API를 지원하는 모든 에이전트와 호�
 <td align="center" width="12.5%">
 <a href="https://github.com/opencode-ai/opencode"><img src="https://github.com/opencode-ai.png?size=120" alt="OpenCode" width="48" height="48" /></a><br/>
 <strong>OpenCode</strong><br/>
-<sub>22 hooks + MCP + plugin</sub>
+<sub>40개 캡처 경로 + MCP + plugin</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/cline/cline"><img src="https://github.com/cline.png?size=120" alt="Cline" width="48" height="48" /></a><br/>
@@ -428,7 +428,7 @@ npx @agentmemory/agentmemory upgrade
 ### Claude Code (블록 한 번, 붙여넣기)
 
 ```text
-Install agentmemory: run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server. Then run `/plugin marketplace add rohitg00/agentmemory` and `/plugin install agentmemory` — the plugin registers all 12 hooks, 4 skills, AND auto-wires the `@agentmemory/mcp` stdio server via its `.mcp.json`, so you get 53 MCP tools (memory_smart_search, memory_save, memory_sessions, memory_governance_delete, etc.) without any extra config step. Verify with `curl http://localhost:3111/agentmemory/health`. The real-time viewer is at http://localhost:3113.
+Install agentmemory: run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server. Then run `/plugin marketplace add rohitg00/agentmemory` and `/plugin install agentmemory` - the plugin registers all 12 hooks, 16 skills, AND auto-wires the `@agentmemory/mcp` stdio server via its `.mcp.json`, so you get 53 MCP tools (memory_smart_search, memory_save, memory_sessions, memory_governance_delete, etc.) without any extra config step. Verify with `curl http://localhost:3111/agentmemory/health`. The real-time viewer is at http://localhost:3113.
 ```
 
 #### 플러그인 설치 없이 Claude Code 사용 (MCP-독립형 경로)
@@ -457,29 +457,29 @@ codex plugin add agentmemory@agentmemory
 
 Codex 플러그인은 Claude Code 플러그인과 동일한 `plugin/` 디렉터리에서 제공됩니다. 다음을 등록합니다:
 
-- `@agentmemory/mcp`를 MCP 서버로 등록 (`AGENTMEMORY_URL`이 실행 중인 agentmemory 서버를 가리킬 때 51개 도구 모두 프록시. 도달 가능한 서버가 없으면 로컬에서 7개 도구로 폴백)
-- 6개 라이프사이클 hooks: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop`
-- 4개 skills: `/recall`, `/remember`, `/session-history`, `/forget`
+- `@agentmemory/mcp`를 MCP 서버로 등록 (`AGENTMEMORY_URL`이 실행 중인 agentmemory 서버를 가리킬 때 53개 도구 모두 프록시. 도달 가능한 서버가 없으면 로컬에서 7개 도구로 폴백)
+- 7개 라이프사이클 hooks: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SubagentStart`, `SubagentStop`, `Stop`
+- 16개 skills
 
-Codex의 hook 엔진은 hook 서브프로세스에 `CLAUDE_PLUGIN_ROOT`를 주입하므로 ([`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs) 참고), 동일한 hook 스크립트가 중복 없이 두 호스트에서 모두 동작합니다. Subagent / SessionEnd / Notification / TaskCompleted / PostToolUseFailure 이벤트는 Claude Code 전용이며 Codex에는 등록되지 않습니다.
+Codex의 hook 엔진은 hook 서브프로세스에 `CLAUDE_PLUGIN_ROOT`를 주입하므로 ([`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs) 참고), 동일한 hook 스크립트가 중복 없이 두 호스트에서 모두 동작합니다. `SessionEnd`, `Notification`, `TaskCompleted`, `PostToolUseFailure` 이벤트는 Claude Code 전용이며 Codex에는 등록되지 않습니다.
 
-#### Codex Desktop: 플러그인 hooks가 현재 동작하지 않음 (해결책 있음)
+#### Codex Desktop 폴백
 
-`CodexHooks`와 `PluginHooks`는 [`codex-rs/features/src/lib.rs`](https://github.com/openai/codex/blob/main/codex-rs/features/src/lib.rs)에서 모두 안정 + 기본 활성화 상태이지만, 현재 Codex Desktop 빌드는 플러그인-로컬 `hooks.json`을 디스패치하지 않습니다 ([openai/codex#16430](https://github.com/openai/codex/issues/16430)). MCP 도구는 여전히 동작합니다. 라이프사이클 관측만 누락됩니다.
+현재 Codex 릴리스는 플러그인에 포함된 hooks와 사용자 hooks를 함께 로드합니다. 일부 Codex Desktop 빌드는 플러그인 hooks를 디스패치하지 않았으며, [openai/codex#16430](https://github.com/openai/codex/issues/16430)에서 이 버그를 추적합니다. 먼저 `/hooks`를 확인하십시오. agentmemory 플러그인 소스가 표시되면 폴백이 필요하지 않습니다.
 
-업스트림 수정이 적용될 때까지 동일한 hook 명령을 전역 `~/.codex/hooks.json`에 미러링하십시오:
+`/hooks`에 agentmemory가 표시되지 않으면 명령을 `~/.codex/hooks.json`에 미러링하십시오:
 
 ```bash
 agentmemory connect codex --with-hooks
 ```
 
-이 명령은 번들된 스크립트의 절대 경로를 참조하는 idempotent 블록을 `~/.codex/hooks.json`에 추가합니다(사용자 스코프에서 `${CLAUDE_PLUGIN_ROOT}` 확장이 필요 없음). agentmemory를 업그레이드한 후 동일한 명령을 다시 실행하여 경로를 갱신하십시오. 동일한 파일의 사용자 항목은 보존되며, 이전 agentmemory 항목만 교체됩니다.
+이 명령은 번들된 스크립트의 절대 경로를 참조하는 idempotent 블록을 `~/.codex/hooks.json`에 추가합니다. agentmemory를 업그레이드한 후 다시 실행하여 경로를 갱신하십시오. 사용자 항목은 보존됩니다. 플러그인 hooks가 표시되면 폴백을 제거하십시오. Codex는 로드된 모든 소스에서 일치하는 hooks를 실행합니다.
 
 <details>
 <summary><b>OpenClaw (이 프롬프트를 붙여넣으세요)</b></summary>
 
 ```text
-Install agentmemory for OpenClaw. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to my OpenClaw MCP config so agentmemory is available with all 51 memory tools:
+Install agentmemory for OpenClaw. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to my OpenClaw MCP config so agentmemory is available with all 53 memory tools:
 
 {
   "mcpServers": {
@@ -504,7 +504,7 @@ Restart OpenClaw. Verify with `curl http://localhost:3111/agentmemory/health`. O
 <summary><b>Hermes Agent (이 프롬프트를 붙여넣으세요)</b></summary>
 
 ```text
-Install agentmemory for Hermes. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to ~/.hermes/config.yaml so Hermes can use agentmemory as an MCP server with all 51 memory tools:
+Install agentmemory for Hermes. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to ~/.hermes/config.yaml so Hermes can use agentmemory as an MCP server with all 53 memory tools:
 
 mcp_servers:
   agentmemory:
@@ -549,9 +549,9 @@ agentmemory 항목은 `mcpServers` 형태를 사용하는 모든 호스트(Curso
 | **Gemini CLI** | `~/.gemini/settings.json` | `gemini mcp add agentmemory npx -y @agentmemory/mcp --scope user` (자동 병합). |
 | **OpenClaw** | OpenClaw MCP config | 동일한 `mcpServers` 블록을 사용하거나, 더 깊은 [memory plugin](../integrations/openclaw/)을 사용. |
 | **Codex CLI (MCP only)** | `.codex/config.toml` | TOML 형식: `codex mcp add agentmemory -- npx -y @agentmemory/mcp`, 또는 `[mcp_servers.agentmemory]`를 수동으로 추가. |
-| **Codex CLI (full plugin)** | Codex 플러그인 마켓플레이스 | `codex plugin marketplace add rohitg00/agentmemory` 후 `codex plugin add agentmemory@agentmemory`. MCP + 6 lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, Stop) + 4 skills 등록. Codex Desktop에서는 [openai/codex#16430](https://github.com/openai/codex/issues/16430)이 머지될 때까지 `agentmemory connect codex --with-hooks`도 실행해야 합니다 — 현재 그곳에서는 플러그인 hooks가 동작하지 않습니다. |
+| **Codex CLI (full plugin)** | Codex 플러그인 마켓플레이스 | `codex plugin marketplace add rohitg00/agentmemory` 후 `codex plugin add agentmemory@agentmemory`. MCP + 7 lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, SubagentStart, SubagentStop, Stop) + 16 skills 등록. `/hooks`에 agentmemory 플러그인 소스가 표시되지 않을 때만 `agentmemory connect codex --with-hooks`를 실행하십시오. |
 | **OpenCode (MCP only)** | `opencode.json` | 다른 형식 — 최상위 `mcp` 키, 명령은 배열로: `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`. |
-| **OpenCode (full plugin)** | `plugin/opencode/` | 세션 라이프사이클, 메시지, 도구, 오류를 다루는 22개의 자동 캡처 hooks. 두 개의 슬래시 명령(`/recall`, `/remember`). `plugin/opencode/`를 OpenCode workspace에 복사한 후 `opencode.json`에 플러그인 항목을 추가하십시오. 전체 hook 표 + gap 분석은 [`plugin/opencode/README.md`](../plugin/opencode/README.md) 참고. |
+| **OpenCode (full plugin)** | `plugin/opencode/` | 40개 캡처 경로와 16개 skills를 제공합니다. 한 번에 설치하려면 `agentmemory connect opencode --with-plugin`을 실행하십시오. OpenCode는 `plugins/` 디렉터리의 파일을 자동으로 찾으므로 `plugin` 배열이 필요하지 않습니다. 전체 표는 [`plugin/opencode/README.md`](../plugin/opencode/README.md) 참고. |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | [`integrations/pi`](../integrations/pi/)를 복사하고 pi를 재시작. |
 | **Hermes Agent** | `~/.hermes/config.yaml` | `memory.provider: agentmemory`로 더 깊은 [memory provider plugin](../integrations/hermes/) 사용. |
 | **Qwen Code** | `~/.qwen/settings.json` | `agentmemory connect qwen`이 표준 `mcpServers` 블록을 기록. Hook 페이로드는 Claude Code와 필드 호환이므로, 기존 12-hook 스크립트가 수정 없이 동작합니다 — 동일한 `settings.json`의 `hooks` 섹션에서 연결. |
@@ -819,11 +819,11 @@ npm install @xenova/transformers
 
 <h2 id="mcp-server"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/tags/light/section-mcp.svg"><img src="../assets/tags/section-mcp.svg" alt="MCP 서버" height="32" /></picture></h2>
 
-53개 도구, 6개 리소스, 3개 프롬프트, 4개 skills — 모든 에이전트를 위한 가장 포괄적인 MCP 메모리 툴킷.
+53개 도구, 6개 리소스, 3개 프롬프트, 16개 skills - 모든 에이전트를 위한 가장 포괄적인 MCP 메모리 툴킷.
 
-> **MCP shim 대 전체 서버:** 게시된 `@agentmemory/mcp` 패키지는 얇은 shim입니다. `AGENTMEMORY_URL`을 통해 실행 중인 agentmemory 서버에 도달할 수 있을 때 **만** 전체 51-도구 표면을 노출합니다(프록시 모드). 도달 가능한 서버가 없으면 shim은 7-도구 로컬 세트(`memory_save`, `memory_recall`, `memory_smart_search`, `memory_sessions`, `memory_export`, `memory_audit`, `memory_governance_delete`)로 폴백합니다. `AGENTMEMORY_TOOLS=core|all` 환경 변수는 *서버 측* 플래그입니다 — shim의 `env` 블록에 설정해도 효과가 없습니다. Cursor / OpenCode / Gemini CLI에서 도구가 7개만 보인다면 `npx @agentmemory/agentmemory`(또는 Docker 스택)를 시작하고 `AGENTMEMORY_URL=http://localhost:3111`을 설정하십시오.
+> **MCP shim 대 전체 서버:** 게시된 `@agentmemory/mcp` 패키지는 얇은 shim입니다. `AGENTMEMORY_URL`을 통해 실행 중인 agentmemory 서버에 도달할 수 있을 때 **만** 전체 53-도구 표면을 노출합니다(프록시 모드). 도달 가능한 서버가 없으면 shim은 7-도구 로컬 세트(`memory_save`, `memory_recall`, `memory_smart_search`, `memory_sessions`, `memory_export`, `memory_audit`, `memory_governance_delete`)로 폴백합니다. `AGENTMEMORY_TOOLS=core|all` 환경 변수는 *서버 측* 플래그입니다 - shim의 `env` 블록에 설정해도 효과가 없습니다. Cursor / OpenCode / Gemini CLI에서 도구가 7개만 보인다면 `npx @agentmemory/agentmemory`(또는 Docker 스택)를 시작하고 `AGENTMEMORY_URL=http://localhost:3111`을 설정하십시오.
 
-### 51개 도구
+### 53개 도구
 
 <details>
 <summary>핵심 도구 (항상 사용 가능)</summary>
@@ -844,46 +844,9 @@ npm install @xenova/transformers
 
 </details>
 
-<details>
-<summary>확장 도구 (총 51개 — AGENTMEMORY_TOOLS=all 설정)</summary>
+서버는 기본적으로 53개 도구를 모두 노출합니다. 전체 목록과 매개변수 스키마는 [생성된 MCP 도구 참조](../plugin/skills/agentmemory-mcp-tools/REFERENCE.md)를 확인하십시오.
 
-| 도구 | 설명 |
-|------|-------------|
-| `memory_patterns` | 반복 패턴 감지 |
-| `memory_timeline` | 시간순 관측 |
-| `memory_relations` | 관계 그래프 쿼리 |
-| `memory_graph_query` | 지식 그래프 순회 |
-| `memory_consolidate` | 4-tier 통합 실행 |
-| `memory_claude_bridge_sync` | MEMORY.md와 동기화 |
-| `memory_team_share` | 팀원과 공유 |
-| `memory_team_feed` | 최근 공유 항목 |
-| `memory_audit` | 작업 감사 로그 |
-| `memory_governance_delete` | 감사 로그를 남기는 삭제 |
-| `memory_snapshot_create` | Git 버전 관리 스냅샷 |
-| `memory_action_create` | 의존성이 있는 작업 항목 생성 |
-| `memory_action_update` | 작업 상태 업데이트 |
-| `memory_frontier` | 우선순위로 정렬된 차단 해제된 작업 |
-| `memory_next` | 가장 중요한 다음 작업 하나 |
-| `memory_lease` | 독점 작업 leases (멀티 에이전트) |
-| `memory_routine_run` | 워크플로우 루틴 인스턴스화 |
-| `memory_signal_send` | 에이전트 간 메시징 |
-| `memory_signal_read` | 수신 확인이 있는 메시지 읽기 |
-| `memory_checkpoint` | 외부 조건 게이트 |
-| `memory_mesh_sync` | 인스턴스 간 P2P 동기화 |
-| `memory_sentinel_create` | 이벤트 기반 워처 |
-| `memory_sentinel_trigger` | 외부에서 sentinel 발화 |
-| `memory_sketch_create` | 일시적 작업 그래프 |
-| `memory_sketch_promote` | 영구로 승격 |
-| `memory_crystallize` | 작업 체인 압축 |
-| `memory_diagnose` | 헬스 체크 |
-| `memory_heal` | 정체된 상태 자동 수정 |
-| `memory_facet_tag` | dimension:value 태그 |
-| `memory_facet_query` | facet 태그로 쿼리 |
-| `memory_verify` | 출처 추적 |
-
-</details>
-
-### 6 리소스 · 3 프롬프트 · 4 Skills
+### 6 리소스 · 3 프롬프트 · 16 Skills
 
 | 유형 | 이름 | 설명 |
 |------|------|-------------|
@@ -927,7 +890,7 @@ npx -y @agentmemory/mcp                # shim package alias
 
 파일을 교체하지 말고 호스트의 기존 `mcpServers` 객체에 `agentmemory` 항목을 병합하십시오. 호스트의 `localhost`에 도달할 수 없는 샌드박스 클라이언트의 경우 env 블록에 `"AGENTMEMORY_FORCE_PROXY": "1"`을 추가하고 `AGENTMEMORY_URL`을 샌드박스가 도달할 수 있는 경로로 설정하십시오.
 
-OpenCode (`opencode.json`):
+OpenCode (`opencode.jsonc` 또는 `opencode.json`):
 ```json
 {
   "mcp": {
@@ -936,17 +899,20 @@ OpenCode (`opencode.json`):
       "command": ["npx", "-y", "@agentmemory/mcp"],
       "enabled": true
     }
-  },
-  "plugin": ["./plugins/agentmemory-capture.ts"]
+  }
 }
 ```
 
-저장소에서 플러그인 파일을 복사하십시오:
+플러그인과 skills를 한 번에 설치하거나 저장소에서 복사하십시오:
 ```bash
-mkdir -p ~/.config/opencode/plugins
+agentmemory connect opencode --with-plugin
+# 또는 수동으로:
+mkdir -p ~/.config/opencode/plugins ~/.config/opencode/skills
 cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
-cp plugin/opencode/commands/*.md ~/.config/opencode/commands/
+cp -R plugin/skills/* ~/.config/opencode/skills/
 ```
+
+OpenCode는 `plugins/` 디렉터리의 `agentmemory-capture.ts`를 자동으로 찾습니다. 최상위 `plugin` 배열은 필요하지 않습니다.
 
 ---
 
@@ -1307,7 +1273,7 @@ CONSOLIDATION_ENABLED=true
 # USER_ID=
 # TEAM_MODE=private
 
-# Tool visibility: "core" (8 tools) or "all" (51 tools)
+# Tool visibility: "core" (8 tools) or "all" (53 tools)
 # AGENTMEMORY_TOOLS=core
 ```
 
@@ -1315,7 +1281,7 @@ CONSOLIDATION_ENABLED=true
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/tags/light/section-api.svg"><img src="../assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-`3111` 포트의 124개 엔드포인트. REST API는 기본적으로 `127.0.0.1`에 바인딩됩니다. 보호된 엔드포인트는 `AGENTMEMORY_SECRET`이 설정되었을 때 `Authorization: Bearer <secret>`를 요구하며, mesh sync 엔드포인트는 양쪽 피어 모두에서 `AGENTMEMORY_SECRET`을 요구합니다.
+`3111` 포트의 134개 엔드포인트. REST API는 기본적으로 `127.0.0.1`에 바인딩됩니다. 보호된 엔드포인트는 `AGENTMEMORY_SECRET`이 설정되었을 때 `Authorization: Bearer <secret>`를 요구하며, mesh sync 엔드포인트는 양쪽 피어 모두에서 `AGENTMEMORY_SECRET`을 요구합니다.
 
 <details>
 <summary>주요 엔드포인트</summary>

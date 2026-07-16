@@ -131,7 +131,7 @@ agentmemory works with any agent that supports hooks, MCP, or REST API. All agen
 <td align="center" width="12.5%">
 <a href="https://github.com/openai/codex"><img src="https://github.com/openai.png?size=120" alt="Codex CLI" width="48" height="48" /></a><br/>
 <strong>Codex CLI</strong><br/>
-<sub>native plugin + 6 hooks + MCP</sub>
+<sub>native plugin + 7 hooks + MCP</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/features/copilot"><img src="https://github.githubassets.com/images/modules/site/copilot/copilot.png" alt="GitHub Copilot CLI" width="48" height="48" /></a><br/>
@@ -173,7 +173,7 @@ agentmemory works with any agent that supports hooks, MCP, or REST API. All agen
 <td align="center" width="12.5%">
 <a href="https://github.com/opencode-ai/opencode"><picture><source media="(prefers-color-scheme: dark)" srcset="https://svgl.app/library/opencode-dark.svg"><img src="https://svgl.app/library/opencode.svg" alt="OpenCode" width="48" height="48" /></picture></a><br/>
 <strong>OpenCode</strong><br/>
-<sub>45 capture paths + MCP + plugin</sub>
+<sub>40 capture paths + MCP + plugin</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/cline/cline"><img src="https://github.com/cline.png?size=120" alt="Cline" width="48" height="48" /></a><br/>
@@ -543,23 +543,23 @@ codex plugin add agentmemory@agentmemory
 
 The Codex plugin ships from the same `plugin/` directory as the Claude Code plugin. It registers:
 
-      - `@agentmemory/mcp` as an MCP server (proxies all 53 tools when `AGENTMEMORY_URL` points at a running agentmemory server; falls back to 7 tools locally when no server is reachable)
-- 6 lifecycle hooks: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop`
+- `@agentmemory/mcp` as an MCP server (proxies all 53 tools when `AGENTMEMORY_URL` points at a running agentmemory server; falls back to 7 tools locally when no server is reachable)
+- 7 lifecycle hooks: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SubagentStart`, `SubagentStop`, `Stop`
 - 9 invocable skills: `/recall`, `/remember`, `/health`, `/session-history`, `/forget`, `/recap`, `/handoff`, `/commit-context`, `/commit-history`, plus 7 reference skills the agent loads on demand (MCP tools, REST API, config, agents, hooks, architecture, and the skill-authoring guide)
 
-Codex's hook engine injects `CLAUDE_PLUGIN_ROOT` into hook subprocesses (per [`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs)), so the same hook scripts work across both hosts without duplication. Subagent / SessionEnd / Notification / TaskCompleted / PostToolUseFailure events are Claude-Code-only and are not registered for Codex.
+Codex's hook engine injects `CLAUDE_PLUGIN_ROOT` into hook subprocesses (per [`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs)), so shared lifecycle scripts run on both hosts. Both hosts dispatch `Stop` after each agent turn, so the shared script records `last_assistant_message` without ending or summarizing the session. `SessionStart` forwards Codex's `source: "resume"` marker so a server-finalized session becomes active again. `SessionEnd`, `Notification`, `TaskCompleted`, and `PostToolUseFailure` are Claude-Code-only and are not registered for Codex.
 
-#### Codex Desktop: plugin hooks currently silent (workaround available)
+#### Codex Desktop fallback
 
-`CodexHooks` and `PluginHooks` are both stable + default-enabled in [`codex-rs/features/src/lib.rs`](https://github.com/openai/codex/blob/main/codex-rs/features/src/lib.rs), but Codex Desktop builds currently do not dispatch plugin-local `hooks.json` ([openai/codex#16430](https://github.com/openai/codex/issues/16430)). MCP tools still work; only the lifecycle observations are missing.
+Current Codex releases load plugin-bundled hooks alongside user hooks. Some Codex Desktop builds have failed to dispatch plugin hooks; [openai/codex#16430](https://github.com/openai/codex/issues/16430) tracks that bug. Check `/hooks` first. If it lists the agentmemory plugin source, no fallback is needed.
 
-Until upstream lands the fix, mirror the same hook commands into the global `~/.codex/hooks.json`:
+If `/hooks` does not list agentmemory, mirror the commands into `~/.codex/hooks.json`:
 
 ```bash
 agentmemory connect codex --with-hooks
 ```
 
-This adds an idempotent block to `~/.codex/hooks.json` referencing absolute paths to the bundled scripts (no `${CLAUDE_PLUGIN_ROOT}` expansion needed at user-scope). Re-run the same command after upgrading agentmemory to refresh paths. User entries in the same file are preserved; only previous agentmemory entries are replaced.
+This adds an idempotent block referencing absolute paths to the bundled scripts. Re-run the command after upgrading agentmemory to refresh paths. User entries are preserved. Remove the fallback after plugin hooks appear because Codex runs matching hooks from every loaded source.
 
 ### GitHub Copilot CLI
 
@@ -668,9 +668,9 @@ The agentmemory entry is the **same MCP server block** across every host that us
 | **GitHub Copilot CLI (full plugin)** | Copilot plugin install | `copilot plugin install rohitg00/agentmemory:plugin` for the plugin from the GitHub subdir. |
 | **OpenClaw** | OpenClaw MCP config | Same `mcpServers` block, or use the deeper [memory plugin](integrations/openclaw/). |
 | **Codex CLI (MCP only)** | `.codex/config.toml` | TOML shape: `codex mcp add agentmemory -- npx -y @agentmemory/mcp`, or add `[mcp_servers.agentmemory]` manually. |
-| **Codex CLI (full plugin)** | Codex plugin marketplace | `codex plugin marketplace add rohitg00/agentmemory` then `codex plugin add agentmemory@agentmemory`. Registers MCP + 6 lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, Stop) + 16 skills. On Codex Desktop, also run `agentmemory connect codex --with-hooks` until [openai/codex#16430](https://github.com/openai/codex/issues/16430) lands because plugin hooks are currently silent there. |
+| **Codex CLI (full plugin)** | Codex plugin marketplace | `codex plugin marketplace add rohitg00/agentmemory` then `codex plugin add agentmemory@agentmemory`. Registers MCP + 7 lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, SubagentStart, SubagentStop, Stop) + 16 skills. On affected Codex Desktop builds, run `agentmemory connect codex --with-hooks` only when `/hooks` does not list the agentmemory plugin source. |
 | **OpenCode (MCP only)** | `opencode.jsonc` or `opencode.json` | Different shape: top-level `mcp` key, command as array: `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`. |
-| **OpenCode (full plugin)** | `plugin/opencode/` | 45 auto-capture paths (one `event` dispatcher with 33 narrowed bus-event branches plus 10 typed hooks plus `dispose`): session lifecycle, messages and parts (including `message.part.removed`), tool execution (`tool.execute.before` + `tool.execute.after`), file edits + watcher, permissions (including `permission.asked` and `permission.v2.*`), todos, commands (including `command.execute.before`), git branch switches (`vcs.branch.updated`), LSP diagnostics (`lsp.client.diagnostics`), interactive questions with options summary (`question.asked` / `question.replied` / `question.rejected` v1 + v2 buses), MCP tool registry changes (`mcp.tools.changed`), MCP browser-open failures (`mcp.browser.open.failed`), installation update notifications (`installation.update-available`), PTY lifecycle (`pty.created` + `pty.exited`), compaction auto-continue (`experimental.compaction.autocontinue`, observe-only), server-side trailing-edge idle checkpoint (`AGENTMEMORY_IDLE_CHECKPOINT_MS`, default 10 min, plus a 3-min idle-checkpoint poll), plugin-reload `dispose`, base64/image sanitization, and resumed-session re-injection. Plugin source is type-narrowed against `EventV1 | EventV2` with zero blanket as-any casts. 16 skills land at `~/.config/opencode/skills/<name>/SKILL.md` - OpenCode's command registry merges them into the slash command palette as `source: "skill"`, so `/recall`, `/remember`, `/health` and the other 6 invocable skills work directly from the palette. One-shot install: `agentmemory connect opencode --with-plugin`. It copies the plugin and skill tree, then updates an existing `opencode.jsonc` or `opencode.json`. OpenCode auto-discovers files in its `plugins/` directory, so no top-level `plugin` array is needed. See [`plugin/opencode/README.md`](plugin/opencode/README.md) for the full hook table. |
+| **OpenCode (full plugin)** | `plugin/opencode/` | 40 auto-capture paths (one `event` dispatcher with 31 narrowed bus-event branches plus 7 typed hooks plus `dispose`): session lifecycle, messages and parts (including `message.part.removed`), tool execution (`tool.execute.before` + `tool.execute.after`), file edits, permissions (including `permission.asked` and `permission.v2.*`), todos, commands (including `command.execute.before`), git branch switches (`vcs.branch.updated`), LSP diagnostics (`lsp.client.diagnostics`), interactive questions with options summary (`question.asked` / `question.replied` / `question.rejected` v1 + v2 buses), MCP tool registry changes (`mcp.tools.changed`), MCP browser-open failures (`mcp.browser.open.failed`), installation update notifications (`installation.update-available`), PTY lifecycle (`pty.created` + `pty.exited`), compaction auto-continue (`experimental.compaction.autocontinue`, observe-only), server-side trailing-edge idle checkpoint (`AGENTMEMORY_IDLE_CHECKPOINT_MS`, default 10 min, plus a graph-enabled 3-min idle-checkpoint poll), plugin-reload `dispose`, base64/image sanitization, and resumed-session re-injection. Plugin source is type-narrowed against `EventV1 | EventV2` with zero blanket as-any casts. 16 skills land at `~/.config/opencode/skills/<name>/SKILL.md` - OpenCode's command registry merges them into the slash command palette as `source: "skill"`, so `/recall`, `/remember`, `/health` and the other 6 invocable skills work directly from the palette. One-shot install: `agentmemory connect opencode --with-plugin`. It copies the plugin and skill tree, then updates an existing `opencode.jsonc` or `opencode.json`. OpenCode auto-discovers files in its `plugins/` directory, so no top-level `plugin` array is needed. See [`plugin/opencode/README.md`](plugin/opencode/README.md) for the full hook table. |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | Copy [`integrations/pi`](integrations/pi/) and restart pi. |
 | **Hermes Agent** | `~/.hermes/config.yaml` | Use the deeper [memory provider plugin](integrations/hermes/) with `memory.provider: agentmemory`. |
 | **Qwen Code** | `~/.qwen/settings.json` | `agentmemory connect qwen` writes the standard `mcpServers` block. Hook payload is field-compatible with Claude Code, so the existing 12-hook scripts work without modification — wire them via the `hooks` section in the same `settings.json`. |
@@ -867,10 +867,13 @@ PostToolUse hook fires
   -> Vector embedding (6 providers + local)
   -> Index in BM25 + vector
 
-Stop / SessionEnd hook fires
-  -> Summarize session
-  -> Knowledge graph extraction (if GRAPH_EXTRACTION_ENABLED=true)
-  -> Slot reflection (if SLOT_REFLECT_ENABLED=true)
+Stop hook fires
+  - Record completed assistant turn
+
+SessionEnd hook fires
+  - Summarize session
+  - Knowledge graph extraction (if GRAPH_EXTRACTION_ENABLED=true)
+  - Slot reflection (if SLOT_REFLECT_ENABLED=true)
 
 SessionStart hook fires
   -> Load project profile (top concepts, files, patterns)
@@ -903,8 +906,8 @@ Memories decay over time (Ebbinghaus curve). Frequently accessed memories streng
 | `PostToolUseFailure` | Error context |
 | `PreCompact` | Re-injects memory before compaction |
 | `SubagentStart/Stop` | Sub-agent lifecycle |
-| `Stop` | End-of-session summary |
-| `SessionEnd` | Session complete marker |
+| `Stop` | Completed assistant turn |
+| `SessionEnd` | Session summary and complete marker |
 
 ### Key Capabilities
 
@@ -1507,8 +1510,8 @@ Create `~/.agentmemory/.env`:
 
 # Session-checkpoint idle window + poll
 # AGENTMEMORY_IDLE_CHECKPOINT_MS=600000   # Default: 600 000 ms (10 min). Trailing-edge
-                                          # idle threshold. A session is consolidated
-                                          # only after it has had NO new activity for
+                                          # idle threshold. A session's new graph window
+                                          # is extracted only after no new activity for
                                           # this long; any new observation resets the
                                           # countdown (measured from session.updatedAt,
                                           # which mem::observe bumps on every captured
@@ -1519,9 +1522,7 @@ Create `~/.agentmemory/.env`:
                                           # POST lands right after activity it almost
                                           # never fires reactively, so the background
                                           # idle-checkpoint poll (below) is the de-facto
-                                          # trigger. Set 0 to disable the gate (eager:
-                                          # every activity-bearing POST consolidates, a
-                                          # load footgun on weak LLMs). The watermark
+                                          # trigger. Set 0 to disable the gate. The watermark
                                           # no-op guard (skip when nothing changed since
                                           # lastCheckpointAt) still runs first.
                                           # Per-session and server-side only; the plugin
@@ -1534,14 +1535,13 @@ Create `~/.agentmemory/.env`:
                                           # interval between consolidations). =0 opts
                                           # back into eager firing.
 # AGENTMEMORY_IDLE_CHECKPOINT_POLL_MS=180000  # Default: 180 000 ms (3 min). Interval of
-                                          # the background poll that scans active
-                                          # sessions and fires a checkpoint-only
-                                          # consolidation for any idle past the
-                                          # threshold (keeps status=active, never marks
-                                          # done). Resuming work bumps updatedAt so the
-                                          # next poll skips the session.
-# AGENTMEMORY_IDLE_CHECKPOINT_ENABLED=true  # Default on. Set "false" to disable the
-                                          # background idle-checkpoint poll. The 6h
+                                          # the background graph-extraction poll. It
+                                          # starts only when graph extraction is enabled,
+                                          # scans active sessions, and checkpoints any
+                                          # session idle past the threshold. Resuming work
+                                          # bumps updatedAt so the next poll skips it.
+# AGENTMEMORY_IDLE_CHECKPOINT_ENABLED=true  # Set "false" to disable the background
+                                          # graph checkpoint poll. The 6h
                                           # session-sweep (SESSION_SWEEP_*) still
                                           # finalizes truly-abandoned sessions
                                           # (status=completed) regardless of this flag.

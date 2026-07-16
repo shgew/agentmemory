@@ -30,9 +30,30 @@ interface SessionCheckpointResult {
 
 interface SessionCheckpointPlan {
   anchor: string;
-  consolidation: Promise<unknown>;
+  consolidationPayload: {
+    sessionId: string;
+    reason: "idle-checkpoint";
+    since?: string;
+    until?: string;
+    waitForCompletion: true;
+    pendingCompressionDrained: boolean;
+    pendingCompressionRecovered: boolean;
+  };
   consolidationSince?: string;
   consolidationUntil?: string;
+}
+
+type SessionCheckpointEligibility =
+  | { anchor: string }
+  | { result: SessionCheckpointResult };
+
+function idleRetryAfterMs(anchor: string): number | null {
+  const idleThresholdMs = getIdleCheckpointMs();
+  if (idleThresholdMs <= 0) return null;
+  const anchorMs = new Date(anchor).getTime();
+  if (!Number.isFinite(anchorMs)) return null;
+  const retryAfterMs = idleThresholdMs - (Date.now() - anchorMs);
+  return retryAfterMs > 0 ? retryAfterMs : null;
 }
 
 export function registerSessionCheckpoint(sdk: ISdk, kv: StateKV): void {
@@ -49,21 +70,47 @@ export function registerSessionCheckpoint(sdk: ISdk, kv: StateKV): void {
       return withKeyedLock(`session:checkpoint:${sessionId}`, async () => {
         const eligibility = await withKeyedLock(
           `obs:${sessionId}`,
-          async (): Promise<SessionCheckpointResult | null> => {
+          async (): Promise<SessionCheckpointEligibility> => {
             const session = await kv.get<Session>(KV.sessions, sessionId);
             if (!session) {
-              return { success: false, error: "session_not_found" };
+              return {
+                result: { success: false, error: "session_not_found" },
+              };
             }
             if (session.status !== "active") {
-              return { success: false, error: "session_not_active" };
+              return {
+                result: { success: false, error: "session_not_active" },
+              };
             }
-            if (!(session.updatedAt ?? session.startedAt)) {
-              return { success: false, error: "session_has_no_activity" };
+            const anchor = session.updatedAt ?? session.startedAt;
+            if (!anchor) {
+              return {
+                result: { success: false, error: "session_has_no_activity" },
+              };
             }
-            return null;
+            const watermark = session.lastCheckpointAt ?? session.endedAt;
+            if (!watermark || isAfter(anchor, watermark)) {
+              const retryAfterMs = idleRetryAfterMs(anchor);
+              if (retryAfterMs !== null) {
+                logger.info("Session checkpoint deferred by idle window", {
+                  sessionId,
+                  retryAfterMs,
+                  idleThresholdMs: getIdleCheckpointMs(),
+                });
+                return {
+                  result: {
+                    success: true,
+                    throttled: true,
+                    retryAfterMs,
+                  },
+                };
+              }
+            }
+            return { anchor };
           },
         );
-        if (eligibility) return eligibility;
+        if ("result" in eligibility) return eligibility.result;
+        const drainAnchor = eligibility.anchor;
 
         let recoveredPending = false;
         try {
@@ -125,27 +172,22 @@ export function registerSessionCheckpoint(sdk: ISdk, kv: StateKV): void {
               return { result: { success: true, noOp: true } };
             }
 
-            const idleThresholdMs = getIdleCheckpointMs();
-            if (!recoveredPending && idleThresholdMs > 0) {
-              const anchorMs = new Date(anchor).getTime();
-              if (Number.isFinite(anchorMs)) {
-                const idleMs = Date.now() - anchorMs;
-                if (idleMs < idleThresholdMs) {
-                  const retryAfterMs = idleThresholdMs - idleMs;
-                  logger.info("Session checkpoint deferred by idle window", {
-                    sessionId,
-                    retryAfterMs,
-                    idleThresholdMs,
-                  });
-                  return {
-                    result: {
-                      success: true,
-                      throttled: true,
-                      retryAfterMs,
-                    },
-                  };
-                }
-              }
+            const retryAfterMs = recoveredPending
+              ? null
+              : idleRetryAfterMs(anchor);
+            if (retryAfterMs !== null) {
+              logger.info("Session checkpoint deferred by idle window", {
+                sessionId,
+                retryAfterMs,
+                idleThresholdMs: getIdleCheckpointMs(),
+              });
+              return {
+                result: {
+                  success: true,
+                  throttled: true,
+                  retryAfterMs,
+                },
+              };
             }
 
             const consolidationSince = recoveredPending
@@ -157,19 +199,18 @@ export function registerSessionCheckpoint(sdk: ISdk, kv: StateKV): void {
               since: consolidationSince,
               until: consolidationUntil,
             });
-            const consolidation = sdk.trigger({
-              function_id: "event::session::checkpoint",
-              payload: {
-                sessionId,
-                since: consolidationSince,
-                until: consolidationUntil,
-                waitForCompletion: true,
-              },
-            });
             return {
               plan: {
                 anchor,
-                consolidation,
+                consolidationPayload: {
+                  sessionId,
+                  reason: "idle-checkpoint",
+                  since: consolidationSince,
+                  until: consolidationUntil,
+                  waitForCompletion: true,
+                  pendingCompressionDrained: anchor === drainAnchor,
+                  pendingCompressionRecovered: recoveredPending,
+                },
                 consolidationSince,
                 consolidationUntil,
               },
@@ -181,13 +222,16 @@ export function registerSessionCheckpoint(sdk: ISdk, kv: StateKV): void {
 
         const {
           anchor,
-          consolidation,
+          consolidationPayload,
           consolidationSince,
           consolidationUntil,
         } = preparation.plan;
         let result: unknown;
         try {
-          result = await consolidation;
+          result = await sdk.trigger({
+            function_id: "event::session::checkpoint",
+            payload: consolidationPayload,
+          });
         } catch (error) {
           logger.error("Session checkpoint consolidation failed", {
             sessionId,

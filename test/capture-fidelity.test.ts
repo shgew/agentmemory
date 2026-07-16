@@ -56,6 +56,71 @@ describe("capture fidelity characterization", () => {
     });
   });
 
+  it("preserves assistant text through observation and synthetic compression", async () => {
+    const { registerObserveFunction } = await import(
+      "../src/functions/observe.js"
+    );
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerObserveFunction(sdk as never, kv as never);
+
+    await sdk.trigger("mem::observe", {
+      sessionId: "ses_assistant",
+      project: "agentmemory",
+      cwd: "/repo/agentmemory",
+      hookType: "assistant_message",
+      timestamp: "2026-07-15T10:00:00.000Z",
+      data: { messageID: "msg_1", message: "Fixed lifecycle ownership." },
+    });
+
+    const raw = await kv.list<RawObservation>("mem:raw-payloads");
+    const compressed = await kv.list<Record<string, unknown>>(
+      "mem:obs:ses_assistant",
+    );
+    expect(raw[0].assistantResponse).toBe("Fixed lifecycle ownership.");
+    expect(compressed[0].narrative).toContain("Fixed lifecycle ownership.");
+  });
+
+  it("preserves subagent final text through observation and synthetic compression", async () => {
+    const { registerObserveFunction } = await import(
+      "../src/functions/observe.js"
+    );
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerObserveFunction(sdk as never, kv as never);
+
+    await sdk.trigger("mem::observe", {
+      sessionId: "ses_subagent",
+      project: "agentmemory",
+      cwd: "/repo/agentmemory",
+      hookType: "subagent_stop",
+      timestamp: "2026-07-15T10:00:00.000Z",
+      data: { agent_id: "worker-1", last_message: "Found the lock race." },
+    });
+
+    const raw = await kv.list<RawObservation>("mem:raw-payloads");
+    const compressed = await kv.list<Record<string, unknown>>(
+      "mem:obs:ses_subagent",
+    );
+    expect(raw[0].assistantResponse).toBe("Found the lock race.");
+    expect(compressed[0].narrative).toContain("Found the lock race.");
+  });
+
+  it("includes assistant text in the LLM compression prompt", async () => {
+    const { buildCompressionPrompt } = await import(
+      "../src/prompts/compression.js"
+    );
+    const prompt = buildCompressionPrompt({
+      hookType: "assistant_message",
+      assistantResponse: "Final answer with the verified root cause.",
+      timestamp: "2026-07-15T10:00:00.000Z",
+    });
+
+    expect(prompt).toContain(
+      "Assistant response:\nFinal answer with the verified root cause.",
+    );
+  });
+
   it.each([
     ["post_tool_use", "Edit", 7],
     ["post_tool_use", "Bash", 7],

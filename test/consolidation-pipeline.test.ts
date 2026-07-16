@@ -249,11 +249,44 @@ sdk = mockSdk();
 
     releases[0]();
     await first;
-    await vi.waitFor(() => expect(releases).toHaveLength(2));
-    releases[1]();
-    await second;
+    const secondResult = (await second) as {
+      results: { semantic: { skipped?: boolean; reason?: string } };
+    };
 
     expect(await kv.list<SemanticMemory>("mem:semantic")).toHaveLength(1);
+    expect(provider.summarize).toHaveBeenCalledOnce();
+    expect(secondResult.results.semantic).toEqual({
+      skipped: true,
+      reason: "summaries unchanged",
+    });
+  });
+
+  it("reruns semantic consolidation when forced with unchanged summaries", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi
+        .fn()
+        .mockResolvedValue(
+          '<facts><fact confidence="0.9">Stable fact</fact></facts>',
+        ),
+    };
+    registerConsolidationPipelineFunction(
+      sdk as never,
+      kv as never,
+      provider as never,
+    );
+    for (let index = 0; index < 5; index++) {
+      await kv.set("mem:summaries", `ses_${index}`, makeSummary(index));
+    }
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" });
+    await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+      force: true,
+    });
+
+    expect(provider.summarize).toHaveBeenCalledTimes(2);
   });
 
   it("consolidates only summaries and semantic facts from the requested project", async () => {

@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/MCP-53_tools-1f6feb?style=flat-square" alt="53 MCP tools" />
-  <img src="https://img.shields.io/badge/Plugin-45_capture_paths-1f6feb?style=flat-square" alt="45 capture paths" />
+  <img src="https://img.shields.io/badge/Plugin-40_capture_paths-1f6feb?style=flat-square" alt="40 capture paths" />
   <img src="https://img.shields.io/badge/Skills-16-1f6feb?style=flat-square" alt="16 skills" />
   <img src="https://img.shields.io/badge/R@5-95.2%25-00875f?style=flat-square" alt="95.2% R@5" />
 </p>
@@ -61,7 +61,7 @@ cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
 cp -R plugin/skills/* ~/.config/opencode/skills/
 ```
 
-OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not required. Restart OpenCode or open a new session. The plugin auto-captures session lifecycle, messages, tool execution, file edits, permissions, todos, and config events.
+OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not required. Restart OpenCode or open a new session. The plugin auto-captures session lifecycle, messages, tool execution, file edits, permissions, and todos.
 
 ## What gets captured
 
@@ -71,11 +71,10 @@ OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not req
 |---|---|---|
 | Session start | `session.created` | POST /session/start |
 | Idle | `session.status` (idle) | POST /session/checkpoint |
-| Status transitions | `session.status` (idle/busy/retry) | POST /observe |
 | Compaction | `session.compacted` | POST /session/checkpoint + POST /observe |
-| Metadata updates / resume | `session.updated` | POST /observe; first sighting of a sid without a prior session.created treats it as a resume - re-fires POST /session/start to repopulate context cache and clear context-injected flag |
+| Metadata updates / resume | `session.updated` | First sighting of a session without `session.created` calls POST /session/start with `resumed: true` |
 | Code change tracking | `session.diff` | POST /observe |
-| Session delete | `session.deleted` | POST /session/end + /crystals/auto + /consolidate-pipeline |
+| Session delete | `session.deleted` | POST /session/end |
 | Session error | `session.error` | POST /observe |
 
 ### Messages and prompts
@@ -83,9 +82,7 @@ OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not req
 | Event | Hook | agentmemory API |
 |---|---|---|
 | User prompt (rich) | `chat.message` | POST /observe |
-| User message metadata | `message.updated` (user) | POST /observe |
-| Assistant response | `message.updated` (assistant) | POST /observe |
-| Transcript transforms | `experimental.chat.messages.transform` | POST /observe |
+| Assistant response | `message.part.updated` (text, completed only) | POST /observe |
 | Message removed (undo) | `message.removed` | POST /observe |
 | Message part removed | `message.part.removed` | POST /observe |
 
@@ -110,7 +107,6 @@ OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not req
 |---|---|---|
 | File tool params | `tool.execute.before` -> stash paths | - |
 | File edited | `file.edited` -> stash paths | - |
-| External file watcher event | `file.watcher.updated` | POST /observe (add/change/unlink) |
 | File part attached | `message.part.updated` (file) -> stash paths | - |
 | Enrichment inject | `experimental.chat.system.transform` | POST /enrich -> `output.system[]` |
 | Memory context inject | `experimental.chat.system.transform` | POST /context -> `output.system[]` |
@@ -171,12 +167,10 @@ OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not req
 |---|---|---|
 | Update available | `installation.update-available` | POST /observe (version) when an active session is tracked |
 
-### Model and config
+### Model and compaction
 
 | Event | Hook | agentmemory API |
 |---|---|---|
-| LLM parameters | `chat.params` | POST /observe |
-| Config loaded | `config` | POST /observe |
 | Compaction (WIP upstream) | `experimental.session.compacting` | POST /context -> `output.context[]` |
 | Compaction auto-continue | `experimental.compaction.autocontinue` | POST /observe (agent, model_id, overflow, enabled) - observe-only, does NOT modify `output.enabled` |
 | Plugin reload | `dispose` | fires fire-and-forget POST /session/checkpoint for the active session if any, then clears all session-scoped maps in-process. Does NOT post /session/end - the OpenCode session is still alive |
@@ -201,12 +195,12 @@ The plugin is built to survive busy sessions, slow networks, and unattended shut
 
 ### Server-side deduplication and trailing-edge idle checkpoint
 
-`/session/checkpoint` is idempotent on the server. Consolidation timing is trailing-edge and lives entirely server-side - the plugin posts unconditionally on idle, compaction, and dispose, and never debounces client-side (a client can close mid-window and lose the work to the daily sweep).
+`/session/checkpoint` is idempotent on the server. Graph checkpoint timing is trailing-edge and lives entirely server-side - the plugin posts unconditionally on idle, compaction, and dispose, and never debounces client-side.
 
-1. **Watermark no-op**: when nothing has been observed since `lastCheckpointAt`, the server returns `{ noOp: true }` and skips consolidation.
-2. **Trailing-edge idle gate**: the reactive POST fires `event::session::checkpoint` only when `now - updatedAt >= AGENTMEMORY_IDLE_CHECKPOINT_MS` (default 10 min; `AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS` is honored as a back-compat alias). Because an idle POST lands right after activity, `updatedAt` is fresh and the reactive path almost always returns `{ throttled: true, retryAfterMs }` without consolidating. Any new observation bumps `updatedAt` and resets the countdown. Set the threshold to `0` to disable the gate (eager: every activity-bearing POST consolidates).
+1. **Watermark no-op**: when nothing has been observed since `lastCheckpointAt`, the server returns `{ noOp: true }` and skips graph extraction.
+2. **Trailing-edge idle gate**: the reactive POST fires `event::session::checkpoint` only when `now - updatedAt >= AGENTMEMORY_IDLE_CHECKPOINT_MS` (default 10 min; `AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS` is honored as a back-compat alias). Because an idle POST lands right after activity, `updatedAt` is fresh and the reactive path almost always returns `{ throttled: true, retryAfterMs }` without graph work. Any new observation bumps `updatedAt` and resets the countdown. Set the threshold to `0` to disable the gate.
 
-The de-facto trigger is a server-side **idle-checkpoint poll** (every `AGENTMEMORY_IDLE_CHECKPOINT_POLL_MS`, default 3 min, gated by `AGENTMEMORY_IDLE_CHECKPOINT_ENABLED`): it consolidates each active session idle past the threshold and keeps it `active`. Marking a session done is reserved for the 6h `session-sweep` (truly abandoned sessions) and explicit `session.deleted` -> `/session/end`. This keeps a weak single-slot LLM from re-summarizing on every idle while still consolidating once per genuine quiet period, per session.
+When graph extraction is enabled, a server-side **idle-checkpoint poll** runs every `AGENTMEMORY_IDLE_CHECKPOINT_POLL_MS` (default 3 min, gated by `AGENTMEMORY_IDLE_CHECKPOINT_ENABLED`). It extracts the new graph window for each active session idle past the threshold and keeps the session `active`. With graph extraction disabled, the poll stays off because idle checkpoints intentionally skip session summaries. Marking a session done is reserved for the 6h `session-sweep` and explicit `session.deleted` -> `/session/end`.
 
 ### HTTPS guard
 
@@ -222,16 +216,15 @@ When `OPENCODE_AGENTMEMORY_DEBUG=1` the plugin fires a single `GET /agentmemory/
 
 ### Dispose cleanup
 
-The `dispose` hook fires when OpenCode unloads the plugin (hot reload, host shutdown). It fires a fire-and-forget POST `/session/checkpoint` for the active session if any, then clears every module-level map (`stashedFiles`, `seenSubtaskIds`, `seenToolCallIds`, `contextInjectedSessions`, `startContextCache`) and resets `activeSessionId` so a re-instantiated plugin starts clean.
+The `dispose` hook fires when OpenCode unloads the plugin (hot reload, host shutdown). It fires a fire-and-forget POST `/session/checkpoint` for the active session if any, then clears every module-level map (`stashedFiles`, `seenSubtaskIds`, `seenToolCallIds`, `contextInjectedSessions`, `startContextCache`, `lastSeenHeads`, `commitCheckChains`) and resets `activeSessionId` so a re-instantiated plugin starts clean.
 
-Abandoned-session consolidation runs only on `session.deleted` (`/session/end` + `/crystals/auto` + `/consolidate-pipeline`). If a session is closed without an explicit delete in the OpenCode UI, the server-side `session-sweep` cron handles late finalization.
+Explicit deletion calls `/session/end`. If a session is closed without deletion in the OpenCode UI, the server-side `session-sweep` cron handles late finalization. Corpus-wide crystallization and consolidation run only through their configured server schedules or explicit API calls.
 
 ### Configurable timeouts
 
 | Env var | Default | Applies to |
 |---|---|---|
-| `OPENCODE_AGENTMEMORY_TIMEOUT_MS` | `5000` | `/observe`, `/context`, `/enrich`, `/summarize`, `/session/start`, `/session/end` |
-| `OPENCODE_AGENTMEMORY_HEAVY_TIMEOUT_MS` | `30000` | `/crystals/auto` and `/consolidate-pipeline` fan-out on `session.deleted` |
+| `OPENCODE_AGENTMEMORY_TIMEOUT_MS` | `5000` | `/observe`, `/context`, `/enrich`, `/session/start`, `/session/end`, `/session/checkpoint`, `/session/commit` |
 | `OPENCODE_AGENTMEMORY_DEBUG` | unset | when `=1`, log POST failures + fire the init health probe |
 | `AGENTMEMORY_URL` | `http://localhost:3111` | inherited from shell; agentmemory server base URL |
 | `AGENTMEMORY_SECRET` | unset | inherited from shell; bearer token for protected deployments |

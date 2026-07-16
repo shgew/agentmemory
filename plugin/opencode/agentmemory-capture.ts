@@ -20,26 +20,6 @@ type SessionInfoPayload = {
     files?: unknown;
   };
 };
-type MessageTimePayload = { created?: number; completed?: number };
-type MessageInfoPayload = {
-  id?: string;
-  parentID?: unknown;
-  sessionID?: string;
-  role?: string;
-  modelID?: unknown;
-  providerID?: unknown;
-  mode?: unknown;
-  cost?: number;
-  tokens?: {
-    input?: number;
-    output?: number;
-    reasoning?: number;
-    cache?: { read?: number; write?: number };
-  };
-  error?: unknown;
-  finish?: unknown;
-  time?: MessageTimePayload;
-};
 type ToolTimePayload = { start?: number; end?: number };
 type TodoPayload = { content?: string; priority?: string; status?: string };
 type QuestionOptionPayload = { label?: unknown; description?: unknown };
@@ -60,7 +40,6 @@ const DEBUG = env.OPENCODE_AGENTMEMORY_DEBUG === "1";
 const SECRET = env.AGENTMEMORY_SECRET || "";
 
 const TIMEOUT_MS = Number(env.OPENCODE_AGENTMEMORY_TIMEOUT_MS) || 5000;
-const HEAVY_TIMEOUT_MS = Number(env.OPENCODE_AGENTMEMORY_HEAVY_TIMEOUT_MS) || 30_000;
 
 const LOOPBACK_HOSTS = new Set([
   "localhost",
@@ -344,26 +323,10 @@ function extractFilePaths(tool: string, args: Record<string, unknown>): string[]
   return files;
 }
 
-function extractErrorMessage(err: unknown): string {
-  if (typeof err === "string") return err;
-  if (err && typeof err === "object") {
-    const e = err as Record<string, unknown>;
-    if (typeof e.message === "string") return e.message;
-    if (e.data && typeof e.data === "object") {
-      const d = e.data as Record<string, unknown>;
-      if (typeof d.message === "string") return d.message;
-    }
-    if (typeof e.name === "string") return e.name;
-    try { return JSON.stringify(err); } catch { return ""; }
-  }
-  return String(err ?? "");
-}
-
 export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
   const sessionCwd = pluginInput?.directory || process.cwd();
   const projectPath = resolveProject(sessionCwd);
   let activeSessionId: string | null = null;
-  let pendingConfig: Record<string, unknown> | null = null;
   const stashedFiles = new Map<string, Set<string>>();
   const seenSubtaskIds = new Map<string, Set<string>>();
   const seenToolCallIds = new Map<string, Set<string>>();
@@ -479,13 +442,13 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
       // ── session.created ──
       if (event.type === "session.created") {
         const info = event.properties.info as SessionInfoPayload | undefined;
-        activeSessionId = info?.id || (event.properties as SessionIdPayload).sessionID || null;
-        if (!activeSessionId) return;
-        stashedFiles.set(activeSessionId, new Set());
-        seenSubtaskIds.delete(activeSessionId);
-        seenToolCallIds.delete(activeSessionId);
-        contextInjectedSessions.delete(activeSessionId);
-        const sessionId = activeSessionId;
+        const sessionId = info?.id || (event.properties as SessionIdPayload).sessionID;
+        if (!sessionId) return;
+        if (!info?.parentID || !activeSessionId) activeSessionId = sessionId;
+        stashedFiles.set(sessionId, new Set());
+        seenSubtaskIds.delete(sessionId);
+        seenToolCallIds.delete(sessionId);
+        contextInjectedSessions.delete(sessionId);
         seedSessionHead(sessionId);
         const startResult: ContextResponse | null = await postJson("/session/start", {
           sessionId,
@@ -496,12 +459,12 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
           cwd: sessionCwd,
         });
         const startCtx = startResult?.context;
-        if (typeof startCtx === "string" && startCtx.length > 0) {
+        if (
+          typeof startCtx === "string" &&
+          startCtx.length > 0 &&
+          !contextInjectedSessions.has(sessionId)
+        ) {
           startContextCache.set(sessionId, startCtx);
-        }
-        if (pendingConfig) {
-          await observe(sessionId, "config_loaded", pendingConfig);
-          pendingConfig = null;
         }
       }
 
@@ -518,20 +481,15 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         if (status.type === "idle") {
           await post("/session/checkpoint", { sessionId: sid });
         }
-        await observe(sid, "session_status", {
-          status_type: status.type,
-          attempt: status.attempt ?? null,
-          message: safeSlice(status.message, 2000),
-        });
       }
 
       // ── session.compacted ──
       if (event.type === "session.compacted") {
         const sid = event.properties.sessionID ?? activeSessionId;
         if (sid) {
+          contextInjectedSessions.delete(sid);
           await post("/session/checkpoint", { sessionId: sid });
           await observe(sid, "session_compacted", {});
-          contextInjectedSessions.delete(sid);
         }
       }
 
@@ -555,17 +513,14 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
             resumed: true,
           });
           const resumeCtx = resumeResult?.context;
-          if (typeof resumeCtx === "string" && resumeCtx.length > 0) {
+          if (
+            typeof resumeCtx === "string" &&
+            resumeCtx.length > 0 &&
+            !contextInjectedSessions.has(sid)
+          ) {
             startContextCache.set(sid, resumeCtx);
           }
         }
-        await observe(sid, "session_updated", {
-          title: info?.title ?? null,
-          parentID: info?.parentID ?? null,
-          additions: info?.summary?.additions ?? null,
-          deletions: info?.summary?.deletions ?? null,
-          files: info?.summary?.files ?? null,
-        });
       }
 
       // ── session.diff ──
@@ -577,7 +532,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
           files: diffs.map(d => d.file),
           additions: diffs.reduce((s, d) => s + ((d.additions as number) || 0), 0),
           deletions: diffs.reduce((s, d) => s + ((d.deletions as number) || 0), 0),
-          diffs: diffs.slice(0, 50),
         });
       }
 
@@ -590,8 +544,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
           return;
         }
         await post("/session/end", { sessionId: sid });
-        void post("/crystals/auto", { sessionId: sid, olderThanDays: 7 }, HEAVY_TIMEOUT_MS);
-        void post("/consolidate-pipeline", { sessionId: sid, tier: "all", force: true }, HEAVY_TIMEOUT_MS);
         if (sid === activeSessionId) activeSessionId = null;
         stashedFiles.delete(sid);
         startContextCache.delete(sid);
@@ -610,49 +562,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
             tool_name: "session.error",
             tool_input: "",
             tool_output: safeSlice(event.properties.error, 8000),
-          });
-        }
-      }
-
-      // ── message.updated ──
-      if (event.type === "message.updated") {
-        const info = event.properties.info as MessageInfoPayload | undefined;
-        if (!info) return;
-
-        if (info.role === "assistant") {
-          const sid = (event.properties as SessionIdPayload).sessionID ?? info.sessionID ?? activeSessionId;
-          if (!sid) return;
-          const tokens = info.tokens;
-          const time = info.time;
-          const error = info.error ? extractErrorMessage(info.error) : null;
-          await observe(sid, "assistant_message", {
-            messageID: info.id,
-            parentID: info.parentID,
-            modelID: info.modelID,
-            providerID: info.providerID,
-            mode: info.mode,
-            cost: info.cost ?? 0,
-            tokens: {
-              input: tokens?.input ?? 0,
-              output: tokens?.output ?? 0,
-              reasoning: tokens?.reasoning ?? 0,
-              cache_read: tokens?.cache?.read ?? 0,
-              cache_write: tokens?.cache?.write ?? 0,
-            },
-            finish: info.finish ?? null,
-            error,
-            duration_ms: typeof time?.completed === "number"
-              ? time.completed - (time.created || 0)
-              : null,
-          });
-        } else if (info.role === "user") {
-          const sid = (event.properties as SessionIdPayload).sessionID ?? info.sessionID ?? activeSessionId;
-          if (!sid) return;
-          await observe(sid, "user_message", {
-            messageID: info.id,
-            parentID: info.parentID,
-            mode: info.mode ?? null,
-            time_created: info.time?.created ?? null,
           });
         }
       }
@@ -683,6 +592,16 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         if (!part) return;
         const sid = part.sessionID ?? (event.properties as SessionIdPayload).sessionID ?? activeSessionId;
         if (!sid) return;
+
+        if (part.type === "text") {
+          if (typeof part.time?.end !== "number") return;
+          await observe(sid, "assistant_message", {
+            messageID: part.messageID,
+            partID: part.id,
+            message: safeSlice(part.text, 8000),
+          });
+          return;
+        }
 
         if (part.type === "subtask") {
           const subtaskId = part.id;
@@ -816,16 +735,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         const sid = (event.properties as SessionIdPayload).sessionID ?? activeSessionId;
         if (sid && typeof event.properties.file === "string" && event.properties.file.length > 0) {
           addToStash(sid, event.properties.file);
-        }
-      }
-
-      if (event.type === "file.watcher.updated") {
-        const sid = activeSessionId;
-        if (sid && typeof event.properties.file === "string" && event.properties.file.length > 0) {
-          await observe(sid, "file_watcher", {
-            file: event.properties.file,
-            event: event.properties.event || "change",
-          });
         }
       }
 
@@ -1071,24 +980,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
       });
     },
 
-    // ── chat.params ──
-    "chat.params": async (input, output) => {
-      if (!input.model || !output) return;
-      const sid = input.sessionID || activeSessionId;
-      if (!sid) return;
-      await observe(sid, "llm_params", {
-        agent: input.agent,
-        model: `${input.model.providerID}/${input.model.id}`,
-        provider_url: input.model.api?.url ?? null,
-        temperature: output.temperature,
-        topP: output.topP,
-        max_output_tokens: input.model.limit?.output ?? null,
-        context_limit: input.model.limit?.context ?? null,
-        cost_1k_input: input.model.cost?.input ?? 0,
-        cost_1k_output: input.model.cost?.output ?? 0,
-      });
-    },
-
     // ── tool.execute.before ──
     "tool.execute.before": async (input, output) => {
       const tool = input.tool.toLowerCase();
@@ -1170,18 +1061,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
       }
     },
 
-    // SDK shape: input is {}, output has messages[]. No sessionID on input;
-    // observe against activeSessionId when present.
-    "experimental.chat.messages.transform": async (_input, output) => {
-      const sid = activeSessionId;
-      if (!sid) return;
-      const msgs = output?.messages;
-      const msgCount = Array.isArray(msgs) ? msgs.length : 0;
-      await observe(sid, "messages_transform", {
-        message_count: msgCount,
-      });
-    },
-
     // ── experimental.session.compacting (WIP) ──
     "experimental.session.compacting": async (input, output) => {
       const sid = input.sessionID || activeSessionId;
@@ -1237,31 +1116,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
       lastSeenHeads.clear();
       commitCheckChains.clear();
       activeSessionId = null;
-      pendingConfig = null;
-    },
-
-    // ── config ──
-    config: async (input) => {
-      const payload: Record<string, unknown> = {
-        theme: input.theme ?? null,
-        model: input.model ?? null,
-        autoupdate: input.autoupdate ?? null,
-        agents: typeof input.agent === "object" && input.agent !== null && !Array.isArray(input.agent)
-          ? Object.keys(input.agent as Record<string, unknown>)
-          : Array.isArray(input.agent) ? input.agent : [],
-        mcp_servers: typeof input.mcp === "object" && input.mcp !== null && !Array.isArray(input.mcp)
-          ? Object.keys(input.mcp as Record<string, unknown>)
-          : Array.isArray(input.mcp) ? input.mcp : [],
-        providers: typeof input.provider === "object" && input.provider !== null && !Array.isArray(input.provider)
-          ? Object.keys(input.provider as Record<string, unknown>)
-          : Array.isArray(input.provider) ? input.provider : [],
-        permission: input.permission ?? null,
-      };
-      if (activeSessionId) {
-        await observe(activeSessionId, "config_loaded", payload);
-      } else {
-        pendingConfig = payload;
-      }
     },
   };
 };

@@ -33,8 +33,6 @@ type TriggerCall = {
   timeoutMs?: number;
 };
 
-type TriggerListener = (call: TriggerCall) => void;
-
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -82,10 +80,8 @@ function mockKV() {
 function mockSdk() {
   const calls: TriggerCall[] = [];
   const functions = new Map<string, (data: unknown) => unknown | Promise<unknown>>();
-  const listeners = new Set<TriggerListener>();
   return {
     calls,
-    onTrigger: (listener: TriggerListener) => listeners.add(listener),
     registerFunction: (
       idOrOptions: string | { id: string },
       handler: (data: unknown) => unknown | Promise<unknown>,
@@ -96,7 +92,6 @@ function mockSdk() {
     registerTrigger: () => {},
     trigger: async (call: TriggerCall): Promise<unknown> => {
       calls.push(call);
-      for (const listener of listeners) listener(call);
       const handler = functions.get(call.function_id);
       if (!handler) return undefined;
       return handler(call.payload);
@@ -368,39 +363,30 @@ describe("session sweep final summary", () => {
     },
   );
 
-  it("deduplicates concurrent session end and sweep finalization inside the session queue", async () => {
+  it("serializes concurrent session end and sweep finalization", async () => {
     const sessionId = "ses_end_sweep_race";
     const summarizeGate = deferred();
     const summarizeEntered = deferred();
-    const sweepStopped = deferred();
-    const sweepSettled = deferred();
     const provider = makeProvider(summarizeGate.promise, () => summarizeEntered.resolve());
     const { sdk, kv } = await setupSession(sessionId, 1, 1, provider);
-    sdk.onTrigger((call) => {
-      if (
-        call.function_id === "event::session::stopped" &&
-        (call.payload as { reason?: string } | undefined)?.reason === "sweep-finalize"
-      ) {
-        sweepStopped.resolve();
-      }
-    });
 
     const endPromise = sdk.trigger({
       function_id: "event::session::ended",
       payload: { sessionId },
     });
     await summarizeEntered.promise;
-    const sweepPromise = sdk
-      .trigger({
-        function_id: "mem::session-sweep",
-        payload: { sessionIds: [sessionId], mode: "finalize" },
-      })
-      .finally(() => sweepSettled.resolve());
-    await Promise.race([sweepStopped.promise, sweepSettled.promise]);
+    const sweepPromise = sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: [sessionId], mode: "finalize" },
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(
+      sdk.calls.filter((call) => call.function_id === "event::session::stopped"),
+    ).toHaveLength(1);
     summarizeGate.resolve();
     await Promise.all([endPromise, sweepPromise]);
 
-    expect(sdk.calls.filter((call) => call.function_id === "event::session::stopped")).toHaveLength(2);
+    expect(sdk.calls.filter((call) => call.function_id === "event::session::stopped")).toHaveLength(1);
     expect(sdk.calls.filter((call) => call.function_id === "mem::summarize")).toHaveLength(1);
     expect(await kv.get<SessionSummary>(KV.summaries, sessionId)).toMatchObject({
       sessionId,

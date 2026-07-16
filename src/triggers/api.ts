@@ -647,6 +647,7 @@ export function registerApiTriggers(
         ...(title ? { summary: title.slice(0, 200) } : {}),
         ...(title ? { firstPrompt: title.slice(0, 200) } : {}),
         ...(agentId ? { agentId } : {}),
+        ...(body.resumed === true ? { resumed: true } : {}),
       });
       if (identityConflict) {
         logger.warn("Session project conflict on start", {

@@ -79,6 +79,14 @@ function mockSdk() {
   };
 }
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 function makeObs(id: string, sessionId: string, timestamp: string): CompressedObservation {
   return {
     id,
@@ -477,6 +485,61 @@ describe("event::session::ended restart safety", () => {
     sdk = mockSdk();
     kv = mockKV();
     registerEventTriggers(sdk as never, kv as never);
+  });
+
+  it("defers completion when activity advances during consolidation", async () => {
+    const summarizeStarted = deferred();
+    const releaseSummarize = deferred();
+    sdk.registerFunction("mem::summarize", async () => {
+      summarizeStarted.resolve();
+      await releaseSummarize.promise;
+      return { success: true };
+    });
+    sdk.registerFunction("mem::slot-reflect", async () => ({ success: true }));
+    sdk.registerFunction("mem::graph-extract", async () => ({ success: true }));
+
+    const sessionId = "ses_ended_activity_race";
+    const originalAnchor = "2026-01-01T17:00:00.000Z";
+    const newerAnchor = "2026-01-01T17:01:00.000Z";
+    await kv.set(KV.sessions, sessionId, {
+      id: sessionId,
+      project: "test",
+      cwd: "/tmp",
+      startedAt: "2026-01-01T09:00:00.000Z",
+      updatedAt: originalAnchor,
+      status: "active",
+      observationCount: 1,
+    } satisfies Session);
+    await kv.set(
+      KV.observations(sessionId),
+      "obs_1",
+      makeObs("obs_1", sessionId, originalAnchor),
+    );
+
+    const ending = sdk.trigger({
+      function_id: "event::session::ended",
+      payload: { sessionId },
+    });
+    await summarizeStarted.promise;
+    await kv.update<Session>(KV.sessions, sessionId, [
+      { type: "set", path: "updatedAt", value: newerAnchor },
+      { type: "set", path: "observationCount", value: 2 },
+    ]);
+    releaseSummarize.resolve();
+
+    const result = (await ending) as {
+      success: boolean;
+      completionDeferred?: boolean;
+    };
+    const stored = await kv.get<Session>(KV.sessions, sessionId);
+    expect(result).toMatchObject({
+      success: true,
+      completionDeferred: true,
+    });
+    expect(stored?.status).toBe("active");
+    expect(stored?.endedAt).toBeUndefined();
+    expect(stored?.lastCheckpointAt).toBe(originalAnchor);
+    expect(stored?.updatedAt).toBe(newerAnchor);
   });
 
   it("active path: pipeline failure leaves KV untouched", async () => {

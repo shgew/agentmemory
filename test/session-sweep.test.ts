@@ -16,8 +16,17 @@ vi.mock("../src/config.js", () => ({
 }));
 
 import { registerSessionSweepFunction } from "../src/functions/session-sweep.js";
-import type { Session, SessionSummary, AuditEntry } from "../src/types.js";
+import { upsertSession } from "../src/functions/session-upsert.js";
+import { registerObserveFunction } from "../src/functions/observe.js";
+import type {
+  AuditEntry,
+  CompressedObservation,
+  RawObservation,
+  Session,
+  SessionSummary,
+} from "../src/types.js";
 import { registerEventTriggers } from "../src/triggers/events.js";
+import { KV } from "../src/state/schema.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -421,6 +430,233 @@ describe("Session Sweep Scheduling", () => {
     const result = (await sweep) as { swept: string[] };
     expect(result.swept).toHaveLength(6);
     expect(maxActive).toBe(4);
+  });
+
+  it("loads raw payloads once and recovers pending compression for every session", async () => {
+    const staleAt = new Date(
+      Date.now() - 10 * 60 * 60 * 1000,
+    ).toISOString();
+    for (const sessionId of ["ses_pending_a", "ses_pending_b"]) {
+      await kv.set(
+        SESSIONS_SCOPE,
+        sessionId,
+        makeSession({ id: sessionId, updatedAt: staleAt }),
+      );
+      const raw: RawObservation = {
+        id: `obs_${sessionId}`,
+        sessionId,
+        timestamp: staleAt,
+        hookType: "prompt_submit",
+        raw: { prompt: sessionId },
+        userPrompt: sessionId,
+      };
+      await kv.set(KV.rawPayloads, raw.id, raw);
+    }
+
+    let rawPayloadListCount = 0;
+    const originalList = kv.list;
+    kv.list = (async <T>(scope: string): Promise<T[]> => {
+      if (scope === KV.rawPayloads) rawPayloadListCount += 1;
+      return originalList<T>(scope);
+    }) as typeof kv.list;
+    sdk.registerFunction("mem::compress", async (payload: unknown) => {
+      const { observationId, sessionId, raw } = payload as {
+        observationId: string;
+        sessionId: string;
+        raw: RawObservation;
+      };
+      const compressed: CompressedObservation = {
+        id: observationId,
+        sessionId,
+        timestamp: raw.timestamp,
+        sourceType: raw.hookType,
+        type: "conversation",
+        title: "Recovered pending observation",
+        facts: [],
+        narrative: raw.userPrompt ?? "",
+        concepts: [],
+        files: [],
+        importance: 5,
+      };
+      await kv.set(KV.observations(sessionId), observationId, compressed);
+      return { success: true };
+    });
+    sdk.registerFunction("event::session::stopped", async () => ({
+      success: true,
+    }));
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    })) as { swept: string[]; failed: unknown[] };
+
+    expect(rawPayloadListCount).toBe(1);
+    expect(result.swept.sort()).toEqual(["ses_pending_a", "ses_pending_b"]);
+    expect(result.failed).toHaveLength(0);
+    const stoppedCalls = sdk.triggerCalls.filter(
+      (call) => call.function_id === "event::session::stopped",
+    );
+    expect(stoppedCalls).toHaveLength(2);
+    expect(
+      stoppedCalls.every(
+        (call) =>
+          (call.payload as {
+            until?: string;
+            pendingCompressionDrained?: boolean;
+            pendingCompressionRecovered?: boolean;
+          }).until === undefined &&
+          (call.payload as { pendingCompressionDrained?: boolean })
+            .pendingCompressionDrained === true &&
+          (call.payload as { pendingCompressionRecovered?: boolean })
+            .pendingCompressionRecovered === true,
+      ),
+    ).toBe(true);
+  });
+
+  it("allows observations during consolidation and defers finalization", async () => {
+    registerObserveFunction(sdk as never, kv as never);
+    const staleAt = new Date(
+      Date.now() - 10 * 60 * 60 * 1000,
+    ).toISOString();
+    const sessionId = "ses_live_finalize";
+    await kv.set(
+      SESSIONS_SCOPE,
+      sessionId,
+      makeSession({ id: sessionId, updatedAt: staleAt }),
+    );
+
+    const consolidationStarted = deferred();
+    const finishConsolidation = deferred();
+    sdk.registerFunction("event::session::stopped", async () => {
+      consolidationStarted.resolve();
+      await finishConsolidation.promise;
+      return { success: true };
+    });
+
+    const sweep = sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: [sessionId] },
+    });
+    await consolidationStarted.promise;
+
+    const observation = sdk.trigger({
+      function_id: "mem::observe",
+      payload: {
+        sessionId,
+        project: "test-project",
+        cwd: "/tmp",
+        hookType: "prompt_submit",
+        timestamp: new Date().toISOString(),
+        data: { prompt: "captured during finalization" },
+      },
+    });
+    let observationTimeout: ReturnType<typeof setTimeout> | undefined;
+    const observedBeforeConsolidation = await Promise.race([
+      observation.then(() => {
+        if (observationTimeout) clearTimeout(observationTimeout);
+        return true;
+      }),
+      new Promise<boolean>((resolve) => {
+        observationTimeout = setTimeout(() => resolve(false), 250);
+      }),
+    ]);
+
+    finishConsolidation.resolve();
+    const result = (await sweep) as {
+      swept: string[];
+      checkpointed: string[];
+      failed: unknown[];
+    };
+    await observation;
+
+    expect(observedBeforeConsolidation).toBe(true);
+    expect(result.swept).not.toContain(sessionId);
+    expect(result.checkpointed).toContain(sessionId);
+    expect(result.failed).toHaveLength(0);
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, sessionId);
+    expect(stored?.status).toBe("active");
+    expect(stored?.endedAt).toBeUndefined();
+    expect(stored?.lastCheckpointAt).toBe(staleAt);
+    expect(stored?.updatedAt).not.toBe(staleAt);
+  });
+
+  it("does not finalize a completed session resumed during pending compression", async () => {
+    const staleAt = new Date(
+      Date.now() - 10 * 60 * 60 * 1000,
+    ).toISOString();
+    const sessionId = "ses_resumed_during_sweep";
+    await kv.set(
+      SESSIONS_SCOPE,
+      sessionId,
+      makeSession({
+        id: sessionId,
+        updatedAt: staleAt,
+        status: "completed",
+        endedAt: staleAt,
+        lastCheckpointAt: staleAt,
+      }),
+    );
+    const raw: RawObservation = {
+      id: "obs_resume_race",
+      sessionId,
+      timestamp: staleAt,
+      hookType: "prompt_submit",
+      raw: { prompt: "resume race" },
+      userPrompt: "resume race",
+    };
+    await kv.set(KV.rawPayloads, raw.id, raw);
+
+    const compressionStarted = deferred();
+    const releaseCompression = deferred();
+    sdk.registerFunction("mem::compress", async () => {
+      compressionStarted.resolve();
+      await releaseCompression.promise;
+      await kv.set<CompressedObservation>(KV.observations(sessionId), raw.id, {
+        id: raw.id,
+        sessionId,
+        timestamp: staleAt,
+        sourceType: raw.hookType,
+        type: "conversation",
+        title: "Resume race",
+        facts: [],
+        narrative: "resume race",
+        concepts: [],
+        files: [],
+        importance: 5,
+      });
+      return { success: true };
+    });
+
+    const sweep = sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: [sessionId] },
+    });
+    await compressionStarted.promise;
+
+    const resumed = await upsertSession(kv as never, {
+      sessionId,
+      project: "test-project",
+      cwd: "/tmp",
+      resumed: true,
+    });
+    releaseCompression.resolve();
+    const result = (await sweep) as {
+      swept: string[];
+      checkpointed: string[];
+      skipped: string[];
+      failed: unknown[];
+    };
+
+    expect(resumed.session?.status).toBe("active");
+    expect(resumed.session?.updatedAt).not.toBe(staleAt);
+    expect(result.swept).not.toContain(sessionId);
+    expect(result.checkpointed).not.toContain(sessionId);
+    expect(result.skipped).toContain(sessionId);
+    expect(result.failed).toHaveLength(0);
+    const stored = await kv.get<Session>(SESSIONS_SCOPE, sessionId);
+    expect(stored?.status).toBe("active");
+    expect(stored?.endedAt).toBe(staleAt);
+    expect(stored?.updatedAt).toBe(resumed.session?.updatedAt);
   });
 
   it("serializes overlapping sweep requests", async () => {

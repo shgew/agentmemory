@@ -11,6 +11,7 @@ export type SessionUpsertInput = {
   readonly firstPrompt?: string;
   readonly agentId?: string;
   readonly parentSessionId?: string;
+  readonly resumed?: boolean;
 };
 
 export type SessionUpsertResult = {
@@ -125,6 +126,14 @@ export function upsertSession(
         type: "set",
         path: "parentSessionId",
         value: input.parentSessionId,
+      });
+    }
+    if (input.resumed && existing.status === "completed") {
+      ops.push({ type: "set", path: "status", value: "active" });
+      ops.push({
+        type: "set",
+        path: "updatedAt",
+        value: new Date().toISOString(),
       });
     }
 

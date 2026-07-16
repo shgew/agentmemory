@@ -38,18 +38,20 @@ describe("buildMergedHooks", () => {
     expect(preToolUse![0].matcher).toBe("Edit|Write|Read|Glob|Grep");
   });
 
-  it("includes all six expected lifecycle events", () => {
+  it("includes all seven expected lifecycle events", () => {
     const merged = buildMergedHooks(null, PLUGIN_ROOT);
     for (const event of [
       "SessionStart",
       "UserPromptSubmit",
       "PreToolUse",
       "PostToolUse",
-      "PreCompact",
+      "SubagentStart",
+      "SubagentStop",
       "Stop",
     ]) {
       expect(Object.keys(merged.hooks)).toContain(event);
     }
+    expect(Object.keys(merged.hooks)).not.toContain("PreCompact");
   });
 
   it("appends to existing user hooks without dropping them", () => {

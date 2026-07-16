@@ -160,13 +160,6 @@ export function registerObserveFunction(
           if (session) {
             const identityError = sessionIdentityError(session, payload);
             if (identityError) return { success: false, error: identityError };
-            await kv.update(KV.sessions, payload.sessionId, [
-              {
-                type: "set",
-                path: "updatedAt",
-                value: new Date().toISOString(),
-              },
-            ]);
           }
           return {
             skipped: true,
@@ -225,6 +218,18 @@ export function registerObserveFunction(
         }
         if (payload.hookType === "prompt_submit") {
           raw.userPrompt = d["prompt"] as string | undefined;
+        }
+        if (
+          payload.hookType === "assistant_message" &&
+          typeof d["message"] === "string"
+        ) {
+          raw.assistantResponse = d["message"];
+        }
+        if (
+          payload.hookType === "subagent_stop" &&
+          typeof d["last_message"] === "string"
+        ) {
+          raw.assistantResponse = d["last_message"];
         }
 
         extractedImage = extractImage(sanitizedRaw);

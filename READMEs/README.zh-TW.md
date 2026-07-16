@@ -121,7 +121,7 @@ agentmemory 相容任何支援 hooks、MCP 或 REST API 的代理。所有代理
 <td align="center" width="12.5%">
 <a href="https://github.com/openai/codex"><img src="https://github.com/openai.png?size=120" alt="Codex CLI" width="48" height="48" /></a><br/>
 <strong>Codex CLI</strong><br/>
-<sub>原生外掛 + 6 hooks + MCP</sub>
+<sub>原生外掛 + 7 hooks + MCP</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="../integrations/openclaw/"><img src="https://github.com/openclaw.png?size=120" alt="OpenClaw" width="48" height="48" /></a><br/>
@@ -158,7 +158,7 @@ agentmemory 相容任何支援 hooks、MCP 或 REST API 的代理。所有代理
 <td align="center" width="12.5%">
 <a href="https://github.com/opencode-ai/opencode"><img src="https://github.com/opencode-ai.png?size=120" alt="OpenCode" width="48" height="48" /></a><br/>
 <strong>OpenCode</strong><br/>
-<sub>22 hooks + MCP + 外掛</sub>
+<sub>40 條擷取路徑 + MCP + 外掛</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/cline/cline"><img src="https://github.com/cline.png?size=120" alt="Cline" width="48" height="48" /></a><br/>
@@ -428,7 +428,7 @@ npx @agentmemory/agentmemory upgrade
 ### Claude Code(一段話,直接貼上)
 
 ```text
-Install agentmemory: run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server. Then run `/plugin marketplace add rohitg00/agentmemory` and `/plugin install agentmemory` — the plugin registers all 12 hooks, 4 skills, AND auto-wires the `@agentmemory/mcp` stdio server via its `.mcp.json`, so you get 53 MCP tools (memory_smart_search, memory_save, memory_sessions, memory_governance_delete, etc.) without any extra config step. Verify with `curl http://localhost:3111/agentmemory/health`. The real-time viewer is at http://localhost:3113.
+Install agentmemory: run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server. Then run `/plugin marketplace add rohitg00/agentmemory` and `/plugin install agentmemory` - the plugin registers all 12 hooks, 16 skills, AND auto-wires the `@agentmemory/mcp` stdio server via its `.mcp.json`, so you get 53 MCP tools (memory_smart_search, memory_save, memory_sessions, memory_governance_delete, etc.) without any extra config step. Verify with `curl http://localhost:3111/agentmemory/health`. The real-time viewer is at http://localhost:3113.
 ```
 
 #### Claude Code 不安裝外掛(MCP-standalone 路徑)
@@ -458,29 +458,29 @@ codex plugin add agentmemory@agentmemory
 
 Codex 外掛與 Claude Code 外掛同源,來自相同的 `plugin/` 目錄。它註冊:
 
-- `@agentmemory/mcp` 作為 MCP 伺服器(當 `AGENTMEMORY_URL` 指向執行中的 agentmemory 伺服器時,代理全部 51 個工具;若伺服器不可達,本地回退至 7 個工具)
-- 6 個生命週期 hooks:`SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`PreCompact`、`Stop`
-- 4 個 skills:`/recall`、`/remember`、`/session-history`、`/forget`
+- `@agentmemory/mcp` 作為 MCP 伺服器(當 `AGENTMEMORY_URL` 指向執行中的 agentmemory 伺服器時,代理全部 53 個工具;若伺服器不可達,本地回退至 7 個工具)
+- 7 個生命週期 hooks:`SessionStart`、`UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`SubagentStart`、`SubagentStop`、`Stop`
+- 16 個 skills:9 個可呼叫 skills 和 7 個按需載入的參考 skills
 
-Codex 的 hook 引擎會把 `CLAUDE_PLUGIN_ROOT` 注入 hook 子行程(參見 [`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs)),因此同樣的 hook 腳本在兩個宿主中都能運作,無需重複實作。Subagent / SessionEnd / Notification / TaskCompleted / PostToolUseFailure 事件僅 Claude Code 支援,Codex 未註冊這些。
+Codex 的 hook 引擎會把 `CLAUDE_PLUGIN_ROOT` 注入 hook 子行程(參見 [`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs)),因此共用的生命週期腳本可在兩個宿主中運作。兩個宿主都會在每個代理回合後派發 `Stop`,所以共用腳本只記錄 `last_assistant_message`,不會結束或總結會話。`SessionEnd`、`Notification`、`TaskCompleted` 和 `PostToolUseFailure` 僅 Claude Code 支援,Codex 不會註冊這些事件。
 
-#### Codex Desktop:外掛 hooks 目前沒有回應(有變通方法)
+#### Codex Desktop 回退設定
 
-`CodexHooks` 和 `PluginHooks` 在 [`codex-rs/features/src/lib.rs`](https://github.com/openai/codex/blob/main/codex-rs/features/src/lib.rs) 中都已穩定且預設啟用,但 Codex Desktop 目前不會派發外掛本地的 `hooks.json`([openai/codex#16430](https://github.com/openai/codex/issues/16430))。MCP 工具仍能運作;只是生命週期觀測缺失。
+目前 Codex 版本會同時載入外掛內建 hooks 和使用者 hooks。部分 Codex Desktop 版本曾無法派發外掛 hooks,[openai/codex#16430](https://github.com/openai/codex/issues/16430) 追蹤此問題。先檢查 `/hooks`。如果其中列出 agentmemory 外掛來源,就不需要回退設定。
 
-在上游修正落地前,把同樣的 hook 指令鏡像到全域 `~/.codex/hooks.json`:
+如果 `/hooks` 未列出 agentmemory,把指令鏡像到 `~/.codex/hooks.json`:
 
 ```bash
 agentmemory connect codex --with-hooks
 ```
 
-這會在 `~/.codex/hooks.json` 新增一個冪等區塊,引用捆綁腳本的絕對路徑(在使用者範圍下無需 `${CLAUDE_PLUGIN_ROOT}` 展開)。升級 agentmemory 後重新執行同一指令以重新整理路徑。同一檔案中的使用者條目會被保留;只取代之前的 agentmemory 條目。
+這會在 `~/.codex/hooks.json` 新增一個冪等區塊,引用捆綁腳本的絕對路徑。升級 agentmemory 後重新執行該指令以重新整理路徑。使用者條目會被保留。外掛 hooks 出現後應移除此回退設定,因為 Codex 會執行每個已載入來源中相符的 hooks。
 
 <details>
 <summary><b>OpenClaw(貼上此提示)</b></summary>
 
 ```text
-Install agentmemory for OpenClaw. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to my OpenClaw MCP config so agentmemory is available with all 51 memory tools:
+Install agentmemory for OpenClaw. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to my OpenClaw MCP config so agentmemory is available with all 53 memory tools:
 
 {
   "mcpServers": {
@@ -505,7 +505,7 @@ Restart OpenClaw. Verify with `curl http://localhost:3111/agentmemory/health`. O
 <summary><b>Hermes Agent(貼上此提示)</b></summary>
 
 ```text
-Install agentmemory for Hermes. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to ~/.hermes/config.yaml so Hermes can use agentmemory as an MCP server with all 51 memory tools:
+Install agentmemory for Hermes. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to ~/.hermes/config.yaml so Hermes can use agentmemory as an MCP server with all 53 memory tools:
 
 mcp_servers:
   agentmemory:
@@ -550,9 +550,9 @@ Verify with `curl http://localhost:3111/agentmemory/health`. Open http://localho
 | **Gemini CLI** | `~/.gemini/settings.json` | `gemini mcp add agentmemory npx -y @agentmemory/mcp --scope user`(自動合併)。 |
 | **OpenClaw** | OpenClaw MCP 設定 | 同樣的 `mcpServers` 區塊,或使用更深的[記憶外掛](../integrations/openclaw/)。 |
 | **Codex CLI(僅 MCP)** | `.codex/config.toml` | TOML 形式:`codex mcp add agentmemory -- npx -y @agentmemory/mcp`,或手動新增 `[mcp_servers.agentmemory]`。 |
-| **Codex CLI(完整外掛)** | Codex 外掛市集 | `codex plugin marketplace add rohitg00/agentmemory` 然後 `codex plugin add agentmemory@agentmemory`。註冊 MCP + 6 個生命週期 hooks(SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、PreCompact、Stop)+ 4 個 skills。在 Codex Desktop 上,直到 [openai/codex#16430](https://github.com/openai/codex/issues/16430) 落地之前,還要執行 `agentmemory connect codex --with-hooks` — 那裡的外掛 hooks 目前沒有回應。 |
-| **OpenCode(僅 MCP)** | `opencode.json` | 不同結構 — 頂層 `mcp` key,command 是陣列:`{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`。 |
-| **OpenCode(完整外掛)** | `plugin/opencode/` | 22 個自動捕捉 hooks,涵蓋會話生命週期、訊息、工具、錯誤。兩個斜線指令(`/recall`、`/remember`)。把 `plugin/opencode/` 複製到你的 OpenCode 工作區並把外掛條目新增到 `opencode.json`。完整 hook 表與差異分析見 [`plugin/opencode/README.md`](../plugin/opencode/README.md)。 |
+| **Codex CLI(完整外掛)** | Codex 外掛市集 | `codex plugin marketplace add rohitg00/agentmemory` 然後 `codex plugin add agentmemory@agentmemory`。註冊 MCP、7 個生命週期 hooks(SessionStart、UserPromptSubmit、PreToolUse、PostToolUse、SubagentStart、SubagentStop、Stop)和 16 個 skills。只有在 `/hooks` 未列出 agentmemory 外掛來源時,才需要在受影響的 Codex Desktop 版本上執行 `agentmemory connect codex --with-hooks`。 |
+| **OpenCode(僅 MCP)** | `opencode.jsonc` 或 `opencode.json` | 頂層使用 `mcp` key,command 是陣列:`{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`。 |
+| **OpenCode(完整外掛)** | `plugin/opencode/` | 40 條自動擷取路徑涵蓋會話生命週期、訊息、工具和錯誤,並安裝 16 個 skills。一次性安裝指令是 `agentmemory connect opencode --with-plugin`。該指令會複製外掛和 skill 目錄樹,然後更新現有的 `opencode.jsonc` 或 `opencode.json`。OpenCode 會自動發現 `plugins/` 目錄中的檔案,無需頂層 `plugin` 陣列。完整 hook 表見 [`plugin/opencode/README.md`](../plugin/opencode/README.md)。 |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | 複製 [`integrations/pi`](../integrations/pi/) 並重啟 pi。 |
 | **Hermes Agent** | `~/.hermes/config.yaml` | 使用更深的[記憶提供者外掛](../integrations/hermes/),設定 `memory.provider: agentmemory`。 |
 | **Qwen Code** | `~/.qwen/settings.json` | `agentmemory connect qwen` 會寫入標準的 `mcpServers` 區塊。Hook 負載與 Claude Code 欄位相容,因此既有的 12 hook 腳本無需修改即可運作 — 透過同一 `settings.json` 的 `hooks` 區段連接它們。 |
@@ -836,11 +836,11 @@ npm install @xenova/transformers
 
 <h2 id="mcp-server"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/tags/light/section-mcp.svg"><img src="../assets/tags/section-mcp.svg" alt="MCP Server" height="32" /></picture></h2>
 
-53 個工具、6 個資源、3 個提示、4 個 skills — 任何代理可用的最全面 MCP 記憶工具組。
+53 個工具、6 個資源、3 個提示、16 個 skills - 任何代理可用的最全面 MCP 記憶工具組。
 
-> **MCP shim 對比完整伺服器:** 已發布的 `@agentmemory/mcp` 套件是一個薄 shim。**只有當它能透過 `AGENTMEMORY_URL` 連通執行中的 agentmemory 伺服器**(代理模式)時,才暴露完整的 51 工具表面。在沒有可達伺服器的情況下,shim 回退到 7 工具的本地集合(`memory_save`、`memory_recall`、`memory_smart_search`、`memory_sessions`、`memory_export`、`memory_audit`、`memory_governance_delete`)。`AGENTMEMORY_TOOLS=core|all` 環境變數是*伺服器端*旗標 — 在 shim 的 `env` 區塊中設定無效。若在 Cursor / OpenCode / Gemini CLI 中只看到 7 個工具,啟動 `npx @agentmemory/agentmemory`(或 Docker 堆疊)並設定 `AGENTMEMORY_URL=http://localhost:3111`。
+> **MCP shim 對比完整伺服器:** 已發布的 `@agentmemory/mcp` 套件是一個薄 shim。**只有當它能透過 `AGENTMEMORY_URL` 連通執行中的 agentmemory 伺服器**(代理模式)時,才暴露完整的 53 工具表面。在沒有可達伺服器的情況下,shim 回退到 7 工具的本地集合(`memory_save`、`memory_recall`、`memory_smart_search`、`memory_sessions`、`memory_export`、`memory_audit`、`memory_governance_delete`)。`AGENTMEMORY_TOOLS=core|all` 環境變數是*伺服器端*旗標 - 在 shim 的 `env` 區塊中設定無效。若在 Cursor / OpenCode / Gemini CLI 中只看到 7 個工具,啟動 `npx @agentmemory/agentmemory`(或 Docker 堆疊)並設定 `AGENTMEMORY_URL=http://localhost:3111`。
 
-### 51 個工具
+### 53 個工具
 
 <details>
 <summary>核心工具(始終可用)</summary>
@@ -861,46 +861,9 @@ npm install @xenova/transformers
 
 </details>
 
-<details>
-<summary>擴展工具(共 51 — 設定 AGENTMEMORY_TOOLS=all)</summary>
+伺服器預設公開全部 53 個工具。完整清單和參數結構描述請參閱[產生的 MCP 工具參考](../plugin/skills/agentmemory-mcp-tools/REFERENCE.md)。
 
-| 工具 | 描述 |
-|------|-------------|
-| `memory_patterns` | 偵測反覆出現的模式 |
-| `memory_timeline` | 按時間排列的觀測 |
-| `memory_relations` | 查詢關係圖 |
-| `memory_graph_query` | 知識圖譜走訪 |
-| `memory_consolidate` | 執行 4 層整合 |
-| `memory_claude_bridge_sync` | 與 MEMORY.md 同步 |
-| `memory_team_share` | 與團隊成員共享 |
-| `memory_team_feed` | 最近共享條目 |
-| `memory_audit` | 操作稽核軌跡 |
-| `memory_governance_delete` | 帶稽核軌跡的刪除 |
-| `memory_snapshot_create` | Git 版本快照 |
-| `memory_action_create` | 建立帶相依性的工作項 |
-| `memory_action_update` | 更新動作狀態 |
-| `memory_frontier` | 依優先序排序的未阻塞動作 |
-| `memory_next` | 單一最重要的下一個動作 |
-| `memory_lease` | 獨佔動作租約(多代理) |
-| `memory_routine_run` | 實例化工作流例程 |
-| `memory_signal_send` | 代理之間的訊息 |
-| `memory_signal_read` | 帶回執讀取訊息 |
-| `memory_checkpoint` | 外部條件閘門 |
-| `memory_mesh_sync` | 實例之間 P2P 同步 |
-| `memory_sentinel_create` | 事件驅動監視器 |
-| `memory_sentinel_trigger` | 外部觸發哨兵 |
-| `memory_sketch_create` | 暫時動作圖 |
-| `memory_sketch_promote` | 提升為永久 |
-| `memory_crystallize` | 緊湊化動作鏈 |
-| `memory_diagnose` | 健康檢查 |
-| `memory_heal` | 自動修復卡住的狀態 |
-| `memory_facet_tag` | 維度:值 標籤 |
-| `memory_facet_query` | 依 facet 標籤查詢 |
-| `memory_verify` | 追溯來源 |
-
-</details>
-
-### 6 個資源 · 3 個提示 · 4 個 Skills
+### 6 個資源 · 3 個提示 · 16 個 Skills
 
 | 類型 | 名稱 | 描述 |
 |------|------|-------------|
@@ -944,7 +907,7 @@ npx -y @agentmemory/mcp                # shim 套件別名
 
 把 `agentmemory` 條目合併到你的宿主既有的 `mcpServers` 物件中,而非取代檔案。對於無法存取宿主 `localhost` 的沙箱用戶端,在 env 區塊中加入 `"AGENTMEMORY_FORCE_PROXY": "1"`,並把 `AGENTMEMORY_URL` 設為沙箱能到達的路由。
 
-OpenCode (`opencode.json`):
+OpenCode (`opencode.jsonc` 或 `opencode.json`):
 ```json
 {
   "mcp": {
@@ -953,17 +916,20 @@ OpenCode (`opencode.json`):
       "command": ["npx", "-y", "@agentmemory/mcp"],
       "enabled": true
     }
-  },
-  "plugin": ["./plugins/agentmemory-capture.ts"]
+  }
 }
 ```
 
-從倉庫複製外掛檔:
+複製外掛和 skills,或執行一次性安裝指令:
 ```bash
-mkdir -p ~/.config/opencode/plugins
+agentmemory connect opencode --with-plugin
+# 或手動安裝:
+mkdir -p ~/.config/opencode/plugins ~/.config/opencode/skills
 cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
-cp plugin/opencode/commands/*.md ~/.config/opencode/commands/
+cp -R plugin/skills/* ~/.config/opencode/skills/
 ```
+
+OpenCode 會自動從 `plugins/` 目錄發現 `agentmemory-capture.ts`。現有的頂層 `plugin` 陣列仍然相容,但此安裝無需該陣列。
 
 ---
 
@@ -1324,7 +1290,7 @@ CONSOLIDATION_ENABLED=true
 # USER_ID=
 # TEAM_MODE=private
 
-# Tool visibility: "core" (8 tools) or "all" (51 tools)
+# Tool visibility: "core" (8 tools) or "all" (53 tools)
 # AGENTMEMORY_TOOLS=core
 ```
 
@@ -1332,7 +1298,7 @@ CONSOLIDATION_ENABLED=true
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/tags/light/section-api.svg"><img src="../assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-連接埠 `3111` 上的 124 個端點。REST API 預設繫結 `127.0.0.1`。當 `AGENTMEMORY_SECRET` 已設定時,受保護端點需要 `Authorization: Bearer <secret>`,網狀同步端點要求兩端都設定 `AGENTMEMORY_SECRET`。
+連接埠 `3111` 上的 134 個端點。REST API 預設繫結 `127.0.0.1`。當 `AGENTMEMORY_SECRET` 已設定時,受保護端點需要 `Authorization: Bearer <secret>`,網狀同步端點要求兩端都設定 `AGENTMEMORY_SECRET`。
 
 <details>
 <summary>關鍵端點</summary>

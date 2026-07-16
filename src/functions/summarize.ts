@@ -275,7 +275,16 @@ export function registerSummarizeFunction(
 ): void {
   sdk.registerFunction(
     "mem::summarize",
-    async (data: { sessionId: string; until?: string } | undefined) => {
+    async (
+      data:
+        | {
+            sessionId: string;
+            until?: string;
+            pendingCompressionDrained?: boolean;
+            pendingCompressionRecovered?: boolean;
+          }
+        | undefined,
+    ) => {
       const startMs = Date.now();
       if (
         !data ||
@@ -294,37 +303,39 @@ export function registerSummarizeFunction(
         return { success: false, error: "session_not_found" };
       }
 
-      let recoveredPending = false;
-      try {
-        const drain = await drainPendingCompression(sdk, kv, sessionId);
-        if (drain.remainingIds.length > 0) {
+      let recoveredPending = data.pendingCompressionRecovered ?? false;
+      if (!data.pendingCompressionDrained) {
+        try {
+          const drain = await drainPendingCompression(sdk, kv, sessionId);
+          if (drain.remainingIds.length > 0) {
+            const latencyMs = Date.now() - startMs;
+            if (metricsStore) {
+              await metricsStore.record("mem::summarize", latencyMs, false);
+            }
+            logger.warn("Summarize deferred by pending compression", {
+              sessionId,
+              attempted: drain.attempted,
+              completed: drain.completed,
+              remaining: drain.remainingIds.length,
+            });
+            return {
+              success: false,
+              error: "pending_compression_failed",
+              pendingObservationIds: drain.remainingIds,
+            };
+          }
+          recoveredPending ||= drain.completed > 0;
+        } catch (error) {
           const latencyMs = Date.now() - startMs;
           if (metricsStore) {
             await metricsStore.record("mem::summarize", latencyMs, false);
           }
-          logger.warn("Summarize deferred by pending compression", {
+          logger.error("Pending compression drain failed", {
             sessionId,
-            attempted: drain.attempted,
-            completed: drain.completed,
-            remaining: drain.remainingIds.length,
+            error: error instanceof Error ? error.message : String(error),
           });
-          return {
-            success: false,
-            error: "pending_compression_failed",
-            pendingObservationIds: drain.remainingIds,
-          };
+          return { success: false, error: "pending_compression_failed" };
         }
-        recoveredPending = drain.completed > 0;
-      } catch (error) {
-        const latencyMs = Date.now() - startMs;
-        if (metricsStore) {
-          await metricsStore.record("mem::summarize", latencyMs, false);
-        }
-        logger.error("Pending compression drain failed", {
-          sessionId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        return { success: false, error: "pending_compression_failed" };
       }
 
       const summaryUntil = recoveredPending ? undefined : data.until;

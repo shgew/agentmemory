@@ -121,7 +121,7 @@ agentmemory किसी भी ऐसे एजेंट के साथ क�
 <td align="center" width="12.5%">
 <a href="https://github.com/openai/codex"><img src="https://github.com/openai.png?size=120" alt="Codex CLI" width="48" height="48" /></a><br/>
 <strong>Codex CLI</strong><br/>
-<sub>native plugin + 6 hooks + MCP</sub>
+<sub>native plugin + 7 hooks + MCP</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="../integrations/openclaw/"><img src="https://github.com/openclaw.png?size=120" alt="OpenClaw" width="48" height="48" /></a><br/>
@@ -158,7 +158,7 @@ agentmemory किसी भी ऐसे एजेंट के साथ क�
 <td align="center" width="12.5%">
 <a href="https://github.com/opencode-ai/opencode"><img src="https://github.com/opencode-ai.png?size=120" alt="OpenCode" width="48" height="48" /></a><br/>
 <strong>OpenCode</strong><br/>
-<sub>22 hooks + MCP + plugin</sub>
+<sub>40 capture paths + MCP + plugin</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/cline/cline"><img src="https://github.com/cline.png?size=120" alt="Cline" width="48" height="48" /></a><br/>
@@ -428,7 +428,7 @@ Implementation विवरण `src/cli.ts` में हैं (`src/cli.ts:544
 ### Claude Code (एक block, paste करें)
 
 ```text
-Install agentmemory: run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server. Then run `/plugin marketplace add rohitg00/agentmemory` and `/plugin install agentmemory` — the plugin registers all 12 hooks, 4 skills, AND auto-wires the `@agentmemory/mcp` stdio server via its `.mcp.json`, so you get 53 MCP tools (memory_smart_search, memory_save, memory_sessions, memory_governance_delete, etc.) without any extra config step. Verify with `curl http://localhost:3111/agentmemory/health`. The real-time viewer is at http://localhost:3113.
+Install agentmemory: run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server. Then run `/plugin marketplace add rohitg00/agentmemory` and `/plugin install agentmemory` - the plugin registers all 12 hooks, 16 skills, AND auto-wires the `@agentmemory/mcp` stdio server via its `.mcp.json`, so you get 53 MCP tools (memory_smart_search, memory_save, memory_sessions, memory_governance_delete, etc.) without any extra config step. Verify with `curl http://localhost:3111/agentmemory/health`. The real-time viewer is at http://localhost:3113.
 ```
 
 #### Plugin install के बिना Claude Code (MCP-standalone path)
@@ -457,29 +457,29 @@ codex plugin add agentmemory@agentmemory
 
 Codex plugin उसी `plugin/` directory से ship होता है जिससे Claude Code plugin। यह register करता है:
 
-- `@agentmemory/mcp` MCP सर्वर के रूप में (जब `AGENTMEMORY_URL` चल रहे agentmemory सर्वर पर point करता है, तो सभी 51 tools proxy करता है; कोई पहुँच योग्य सर्वर न होने पर locally 7 tools पर fallback करता है)
-- 6 lifecycle hooks: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop`
-- 4 skills: `/recall`, `/remember`, `/session-history`, `/forget`
+- `@agentmemory/mcp` MCP सर्वर के रूप में (जब `AGENTMEMORY_URL` चल रहे agentmemory सर्वर पर point करता है, तो सभी 53 tools proxy करता है; कोई पहुँच योग्य सर्वर न होने पर locally 7 tools पर fallback करता है)
+- 7 lifecycle hooks: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SubagentStart`, `SubagentStop`, `Stop`
+- 16 skills
 
-Codex का hook engine hook subprocesses में `CLAUDE_PLUGIN_ROOT` inject करता है ([`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs) के अनुसार), इसलिए वही hook scripts duplication के बिना दोनों hosts में काम करते हैं। Subagent / SessionEnd / Notification / TaskCompleted / PostToolUseFailure events केवल Claude-Code-only हैं और Codex के लिए register नहीं होते।
+Codex का hook engine hook subprocesses में `CLAUDE_PLUGIN_ROOT` inject करता है ([`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs) के अनुसार), इसलिए वही hook scripts duplication के बिना दोनों hosts में काम करते हैं। `SessionEnd`, `Notification`, `TaskCompleted` और `PostToolUseFailure` events केवल Claude Code के लिए हैं और Codex के लिए register नहीं होते।
 
-#### Codex Desktop: plugin hooks वर्तमान में silent हैं (workaround उपलब्ध)
+#### Codex Desktop fallback
 
-`CodexHooks` और `PluginHooks` दोनों [`codex-rs/features/src/lib.rs`](https://github.com/openai/codex/blob/main/codex-rs/features/src/lib.rs) में stable + default-enabled हैं, लेकिन Codex Desktop builds वर्तमान में plugin-local `hooks.json` dispatch नहीं करते ([openai/codex#16430](https://github.com/openai/codex/issues/16430))। MCP tools अभी भी काम करते हैं; केवल lifecycle observations छूट जाते हैं।
+मौजूदा Codex releases plugin-bundled hooks को user hooks के साथ load करते हैं। कुछ Codex Desktop builds ने plugin hooks dispatch नहीं किए; [openai/codex#16430](https://github.com/openai/codex/issues/16430) इस bug को track करता है। पहले `/hooks` check करें। अगर यह agentmemory plugin source list करता है, तो fallback की ज़रूरत नहीं है।
 
-जब तक upstream fix land नहीं करता, वही hook commands को global `~/.codex/hooks.json` में mirror करें:
+अगर `/hooks` agentmemory को list नहीं करता, तो commands को `~/.codex/hooks.json` में mirror करें:
 
 ```bash
 agentmemory connect codex --with-hooks
 ```
 
-यह `~/.codex/hooks.json` में एक idempotent block जोड़ता है जो bundled scripts के absolute paths को reference करता है (user-scope पर `${CLAUDE_PLUGIN_ROOT}` expansion की ज़रूरत नहीं)। agentmemory upgrade के बाद paths refresh करने के लिए वही कमांड फिर से चलाएँ। उसी फाइल में user entries संरक्षित रहती हैं; केवल पिछली agentmemory entries replace होती हैं।
+यह `~/.codex/hooks.json` में bundled scripts के absolute paths वाला idempotent block जोड़ता है। agentmemory upgrade के बाद paths refresh करने के लिए command फिर चलाएँ। User entries बनी रहती हैं। Plugin hooks दिखने पर fallback हटाएँ, क्योंकि Codex हर loaded source से matching hooks चलाता है।
 
 <details>
 <summary><b>OpenClaw (यह prompt paste करें)</b></summary>
 
 ```text
-Install agentmemory for OpenClaw. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to my OpenClaw MCP config so agentmemory is available with all 51 memory tools:
+Install agentmemory for OpenClaw. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to my OpenClaw MCP config so agentmemory is available with all 53 memory tools:
 
 {
   "mcpServers": {
@@ -504,7 +504,7 @@ Restart OpenClaw. Verify with `curl http://localhost:3111/agentmemory/health`. O
 <summary><b>Hermes Agent (यह prompt paste करें)</b></summary>
 
 ```text
-Install agentmemory for Hermes. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to ~/.hermes/config.yaml so Hermes can use agentmemory as an MCP server with all 51 memory tools:
+Install agentmemory for Hermes. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to ~/.hermes/config.yaml so Hermes can use agentmemory as an MCP server with all 53 memory tools:
 
 mcp_servers:
   agentmemory:
@@ -549,9 +549,9 @@ agentmemory entry `mcpServers` shape का उपयोग करने वा�
 | **Gemini CLI** | `~/.gemini/settings.json` | `gemini mcp add agentmemory npx -y @agentmemory/mcp --scope user` (auto-merges)। |
 | **OpenClaw** | OpenClaw MCP config | वही `mcpServers` block, या गहरे [memory plugin](../integrations/openclaw/) का उपयोग करें। |
 | **Codex CLI (केवल MCP)** | `.codex/config.toml` | TOML shape: `codex mcp add agentmemory -- npx -y @agentmemory/mcp`, या manually `[mcp_servers.agentmemory]` जोड़ें। |
-| **Codex CLI (पूर्ण plugin)** | Codex plugin marketplace | `codex plugin marketplace add rohitg00/agentmemory` फिर `codex plugin add agentmemory@agentmemory`। MCP + 6 lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, Stop) + 4 skills register करता है। Codex Desktop पर, [openai/codex#16430](https://github.com/openai/codex/issues/16430) land होने तक `agentmemory connect codex --with-hooks` भी चलाएँ — plugin hooks वर्तमान में वहाँ silent हैं। |
+| **Codex CLI (पूर्ण plugin)** | Codex plugin marketplace | `codex plugin marketplace add rohitg00/agentmemory` फिर `codex plugin add agentmemory@agentmemory`। MCP + 7 lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, SubagentStart, SubagentStop, Stop) + 16 skills register करता है। `agentmemory connect codex --with-hooks` केवल तब चलाएँ जब `/hooks` agentmemory plugin source को list न करे। |
 | **OpenCode (केवल MCP)** | `opencode.json` | अलग shape — top-level `mcp` key, command array के रूप में: `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`। |
-| **OpenCode (पूर्ण plugin)** | `plugin/opencode/` | Session lifecycle, messages, tools, errors को कवर करने वाले 22 auto-capture hooks। दो slash commands (`/recall`, `/remember`)। `plugin/opencode/` को अपने OpenCode workspace में copy करें और plugin entry को `opencode.json` में जोड़ें। पूरी hook table + gap analysis के लिए [`plugin/opencode/README.md`](../plugin/opencode/README.md) देखें। |
+| **OpenCode (पूर्ण plugin)** | `plugin/opencode/` | 40 capture paths और 16 skills। One-shot install: `agentmemory connect opencode --with-plugin`। OpenCode `plugins/` directory से file को auto-discover करता है, इसलिए `plugin` array की ज़रूरत नहीं है। पूरी table के लिए [`plugin/opencode/README.md`](../plugin/opencode/README.md) देखें। |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | [`integrations/pi`](../integrations/pi/) copy करें और pi restart करें। |
 | **Hermes Agent** | `~/.hermes/config.yaml` | गहरे [memory provider plugin](../integrations/hermes/) का उपयोग `memory.provider: agentmemory` के साथ करें। |
 | **Qwen Code** | `~/.qwen/settings.json` | `agentmemory connect qwen` standard `mcpServers` block लिखता है। Hook payload Claude Code के साथ field-compatible है, इसलिए मौजूदा 12-hook scripts modification के बिना काम करते हैं — उन्हें उसी `settings.json` के `hooks` section के माध्यम से जोड़ें। |
@@ -838,85 +838,52 @@ npm install @xenova/transformers
 
 <h2 id="mcp-server"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/tags/light/section-mcp.svg"><img src="../assets/tags/section-mcp.svg" alt="MCP Server" height="32" /></picture></h2>
 
-53 tools, 6 resources, 3 prompts, और 4 skills — किसी भी agent के लिए सबसे व्यापक MCP memory toolkit।
+53 tools, 6 resources, 3 prompts, और 16 skills - किसी भी agent के लिए सबसे व्यापक MCP memory toolkit।
 
-> **MCP shim बनाम full server:** published `@agentmemory/mcp` package एक thin shim है। यह full 51-tool surface को **केवल तभी expose करता है जब यह `AGENTMEMORY_URL` के माध्यम से चल रहे agentmemory server तक पहुँच सके** (proxy mode)। कोई पहुँच योग्य server न होने पर, shim 7-tool local set (`memory_save`, `memory_recall`, `memory_smart_search`, `memory_sessions`, `memory_export`, `memory_audit`, `memory_governance_delete`) पर fallback करता है। `AGENTMEMORY_TOOLS=core|all` env var एक *server-side* flag है — shim के `env` block में set करने का कोई असर नहीं। अगर आप Cursor / OpenCode / Gemini CLI में केवल 7 tools देखते हैं, तो `npx @agentmemory/agentmemory` (या Docker stack) शुरू करें और `AGENTMEMORY_URL=http://localhost:3111` set करें।
+> **MCP shim बनाम full server:** published `@agentmemory/mcp` package एक thin shim है। यह full 53-tool surface को **केवल तभी expose करता है जब यह `AGENTMEMORY_URL` के माध्यम से चल रहे agentmemory server तक पहुँच सके** (proxy mode)। कोई पहुँच योग्य server न होने पर, shim 7-tool local set (`memory_save`, `memory_recall`, `memory_smart_search`, `memory_sessions`, `memory_export`, `memory_audit`, `memory_governance_delete`) पर fallback करता है। `AGENTMEMORY_TOOLS=core|all` env var एक *server-side* flag है - shim के `env` block में set करने का कोई असर नहीं। अगर आप Cursor / OpenCode / Gemini CLI में केवल 7 tools देखते हैं, तो `npx @agentmemory/agentmemory` (या Docker stack) शुरू करें और `AGENTMEMORY_URL=http://localhost:3111` set करें।
 
-### 51 Tools
+### 53 Tools
 
 <details>
-<summary>Core tools (हमेशा उपलब्ध)</summary>
+<summary>Core tools (AGENTMEMORY_TOOLS=core)</summary>
 
 | Tool | विवरण |
-|------|-------------|
+|------|--------|
+| `memory_save` | Insight, decision या pattern save करें |
 | `memory_recall` | पिछले observations खोजें |
-| `memory_compress_file` | Structure preserve करते हुए markdown files compress करें |
-| `memory_save` | एक insight, decision, या pattern save करें |
-| `memory_patterns` | Recurring patterns detect करें |
-| `memory_smart_search` | Hybrid semantic + keyword search |
-| `memory_file_history` | विशिष्ट files के बारे में पिछले observations |
+| `memory_consolidate` | Memory consolidation चलाएँ |
+| `memory_smart_search` | Hybrid semantic और keyword search |
 | `memory_sessions` | Recent sessions list करें |
-| `memory_timeline` | Chronological observations |
-| `memory_profile` | Project profile (concepts, files, patterns) |
-| `memory_export` | सभी memory data export करें |
-| `memory_relations` | Relationship graph query करें |
+| `memory_diagnose` | Health checks चलाएँ |
+| `memory_lesson_save` | Reusable lesson save करें |
+| `memory_reflect` | Recent memory से insights synthesize करें |
 
 </details>
 
-<details>
-<summary>Extended tools (कुल 51 — AGENTMEMORY_TOOLS=all set करें)</summary>
+सर्वर default रूप से सभी 53 tools expose करता है। पूरी list और parameter schemas के लिए [generated MCP tool reference](../plugin/skills/agentmemory-mcp-tools/REFERENCE.md) देखें।
 
-| Tool | विवरण |
-|------|-------------|
-| `memory_patterns` | Recurring patterns detect करें |
-| `memory_timeline` | Chronological observations |
-| `memory_relations` | Relationship graph query करें |
-| `memory_graph_query` | Knowledge graph traversal |
-| `memory_consolidate` | 4-tier consolidation चलाएँ |
-| `memory_claude_bridge_sync` | MEMORY.md के साथ sync करें |
-| `memory_team_share` | Team members के साथ share करें |
-| `memory_team_feed` | हाल ही में shared items |
-| `memory_audit` | Operations का audit trail |
-| `memory_governance_delete` | Audit trail के साथ delete करें |
-| `memory_snapshot_create` | Git-versioned snapshot |
-| `memory_action_create` | Dependencies के साथ work items create करें |
-| `memory_action_update` | Action status update करें |
-| `memory_frontier` | Priority द्वारा ranked unblocked actions |
-| `memory_next` | Single most important next action |
-| `memory_lease` | Exclusive action leases (multi-agent) |
-| `memory_routine_run` | Workflow routines instantiate करें |
-| `memory_signal_send` | Inter-agent messaging |
-| `memory_signal_read` | Receipts के साथ messages पढ़ें |
-| `memory_checkpoint` | External condition gates |
-| `memory_mesh_sync` | Instances के बीच P2P sync |
-| `memory_sentinel_create` | Event-driven watchers |
-| `memory_sentinel_trigger` | Sentinels externally fire करें |
-| `memory_sketch_create` | Ephemeral action graphs |
-| `memory_sketch_promote` | Permanent पर promote करें |
-| `memory_crystallize` | Action chains compact करें |
-| `memory_diagnose` | Health checks |
-| `memory_heal` | Stuck state को auto-fix करें |
-| `memory_facet_tag` | Dimension:value tags |
-| `memory_facet_query` | Facet tags द्वारा query करें |
-| `memory_verify` | Provenance trace करें |
+### 6 Resources · 3 Prompts · 16 Skills
 
-</details>
-
-### 6 Resources · 3 Prompts · 4 Skills
-
-| प्रकार | नाम | विवरण |
-|------|------|-------------|
-| Resource | `agentmemory://status` | Health, session count, memory count |
-| Resource | `agentmemory://project/{name}/profile` | Per-project intelligence |
-| Resource | `agentmemory://memories/latest` | नवीनतम 10 active memories |
+| Type | Name | विवरण |
+|------|------|--------|
+| Resource | `agentmemory://status` | Health, session count और memory count |
+| Resource | `agentmemory://project/{name}/profile` | Project-specific intelligence |
+| Resource | `agentmemory://project/{name}/recent` | किसी project के recent observations |
+| Resource | `agentmemory://memories/latest` | Latest 10 active memories |
 | Resource | `agentmemory://graph/stats` | Knowledge graph statistics |
-| Prompt | `recall_context` | Search + context messages return करें |
+| Resource | `agentmemory://team/{id}/profile` | Team memory profile |
+| Prompt | `recall_context` | Context messages खोजें और return करें |
 | Prompt | `session_handoff` | Agents के बीच handoff data |
 | Prompt | `detect_patterns` | Recurring patterns analyze करें |
-| Skill | `/recall` | Memory खोजें |
-| Skill | `/remember` | Long-term memory में save करें |
-| Skill | `/session-history` | हाल के session summaries |
-| Skill | `/forget` | Observations/sessions delete करें |
+| Skill | `/recall` | BM25, vector और graph से memory search करें |
+| Skill | `/remember` | Concept tags के साथ long-term memory में save करें |
+| Skill | `/recap` | Current project की recent sessions summarize करें |
+| Skill | `/handoff` | Open questions के साथ latest session resume करें |
+| Skill | `/forget` | Confirmation के बाद observations delete करें |
+| Skill | `/commit-context` | File या line को उसे बनाने वाली session से trace करें |
+| Skill | `/commit-history` | Recent agent-linked commits list करें |
+| Skill | `/session-history` | Project की recent sessions की timeline |
+| Skill | `/health` | Server probe करें, providers list करें और stuck items दिखाएँ |
 
 ### Standalone MCP
 
@@ -946,7 +913,7 @@ npx -y @agentmemory/mcp                # shim package alias
 
 `agentmemory` entry को file को replace करने के बजाय अपने host के मौजूदा `mcpServers` object में merge करें। होस्ट के `localhost` तक नहीं पहुँच सकने वाले sandboxed clients के लिए, env block में `"AGENTMEMORY_FORCE_PROXY": "1"` जोड़ें और `AGENTMEMORY_URL` को एक ऐसे route पर set करें जिस तक sandbox पहुँच सकता है।
 
-OpenCode (`opencode.json`):
+OpenCode (`opencode.jsonc` या `opencode.json`):
 ```json
 {
   "mcp": {
@@ -955,17 +922,20 @@ OpenCode (`opencode.json`):
       "command": ["npx", "-y", "@agentmemory/mcp"],
       "enabled": true
     }
-  },
-  "plugin": ["./plugins/agentmemory-capture.ts"]
+  }
 }
 ```
 
-Plugin file को repo से copy करें:
+Plugin और skills को एक command से install करें या repo से copy करें:
 ```bash
-mkdir -p ~/.config/opencode/plugins
+agentmemory connect opencode --with-plugin
+# या manually:
+mkdir -p ~/.config/opencode/plugins ~/.config/opencode/skills
 cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
-cp plugin/opencode/commands/*.md ~/.config/opencode/commands/
+cp -R plugin/skills/* ~/.config/opencode/skills/
 ```
+
+OpenCode `plugins/` directory से `agentmemory-capture.ts` को auto-discover करता है। Top-level `plugin` array की ज़रूरत नहीं है।
 
 ---
 
@@ -1326,7 +1296,7 @@ CONSOLIDATION_ENABLED=true
 # USER_ID=
 # TEAM_MODE=private
 
-# Tool visibility: "core" (8 tools) or "all" (51 tools)
+# Tool visibility: "core" (8 tools) or "all" (53 tools)
 # AGENTMEMORY_TOOLS=core
 ```
 
@@ -1334,7 +1304,7 @@ CONSOLIDATION_ENABLED=true
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/tags/light/section-api.svg"><img src="../assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-Port `3111` पर 124 endpoints। REST API default रूप से `127.0.0.1` से bind होता है। `AGENTMEMORY_SECRET` set होने पर protected endpoints `Authorization: Bearer <secret>` की आवश्यकता रखते हैं, और mesh sync endpoints दोनों peers पर `AGENTMEMORY_SECRET` की आवश्यकता रखते हैं।
+Port `3111` पर 134 endpoints। REST API default रूप से `127.0.0.1` से bind होता है। `AGENTMEMORY_SECRET` set होने पर protected endpoints `Authorization: Bearer <secret>` की आवश्यकता रखते हैं, और mesh sync endpoints दोनों peers पर `AGENTMEMORY_SECRET` की आवश्यकता रखते हैं।
 
 <details>
 <summary>मुख्य endpoints</summary>

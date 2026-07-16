@@ -12,6 +12,12 @@ describe("stripPrivateData", () => {
     expect(stripPrivateData("<Private>data</Private>")).toBe("[REDACTED]");
   });
 
+  it("strips a private block truncated before its closing tag", () => {
+    expect(stripPrivateData("before <private>secret")).toBe(
+      "before [REDACTED]",
+    );
+  });
+
   it("strips API keys", () => {
     expect(stripPrivateData("api_key=sk-ant-1234567890abcdefghij")).toBe(
       "[REDACTED_SECRET]",

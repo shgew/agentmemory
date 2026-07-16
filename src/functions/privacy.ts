@@ -1,6 +1,6 @@
 import type { ISdk } from "iii-sdk";
 
-const PRIVATE_TAG_RE = /<private>[\s\S]*?<\/private>/gi;
+const PRIVATE_TAG_RE = /<private>[\s\S]*?(?:<\/private>|$)/gi;
 
 const SECRET_PATTERN_SOURCES = [
   /(?:api[_-]?key|secret|token|password|credential|auth)[\s]*[=:]\s*["']?[A-Za-z0-9_\-/.+]{20,}["']?/gi,

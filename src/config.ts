@@ -333,10 +333,8 @@ export function getGraphBatchSize(): number {
   return safeParseInt(getMergedEnv()["GRAPH_EXTRACTION_BATCH_SIZE"], 10);
 }
 
-// Server-side kill switch for automatic lesson crystallization. Gates ONLY
-// the mem::auto-crystallize entry point (the plugin's fire-and-forget
-// /agentmemory/crystals/auto call). Manual mem::crystallize is never gated.
-// OFF by default so the automatic path stays opt-in.
+// Gates scheduled mem::auto-crystallize calls. Manual mem::crystallize calls
+// remain available when automatic crystallization is disabled.
 export function isAutoCrystallizeEnabled(): boolean {
   return getMergedEnv()["AUTO_CRYSTALLIZE_ENABLED"] === "true";
 }

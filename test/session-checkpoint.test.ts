@@ -5,6 +5,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerSessionCheckpoint } from "../src/functions/session-checkpoint.js";
+import { registerSessionSweepFunction } from "../src/functions/session-sweep.js";
 import { registerObserveFunction } from "../src/functions/observe.js";
 import { KV } from "../src/state/schema.js";
 import type {
@@ -82,6 +83,14 @@ function mockSdk() {
   return sdk;
 }
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 function makeSession(overrides: Partial<Session> = {}): Session {
   return {
     id: "ses_1",
@@ -135,6 +144,7 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
     const checkpointCall = sdk.triggerCalls.find((c) => c.function_id === "event::session::checkpoint");
     expect(checkpointCall?.payload).toMatchObject({
       sessionId: "ses_first",
+      reason: "idle-checkpoint",
       since: undefined,
       until: startedAt,
       waitForCompletion: true,
@@ -156,6 +166,7 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
   it("defers without firing (no free first-fire) when a fresh session is idle below the threshold", async () => {
     const session = makeSession({ id: "ses_fresh", startedAt: new Date().toISOString() });
     await kv.set(SESSIONS_SCOPE, "ses_fresh", session);
+    const list = vi.spyOn(kv, "list");
 
     const result = (await sdk.trigger({
       function_id: "mem::session::checkpoint",
@@ -172,6 +183,7 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
       expect.objectContaining({ sessionId: "ses_fresh", idleThresholdMs: IDLE_THRESHOLD_MS }),
     );
     expect(sdk.triggerCalls.filter((c) => c.function_id === "event::session::checkpoint")).toHaveLength(0);
+    expect(list).not.toHaveBeenCalledWith(KV.rawPayloads);
 
     const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_fresh");
     expect(stored?.lastCheckpointAt).toBeUndefined();
@@ -224,6 +236,7 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
     const checkpointCall = sdk.triggerCalls.find((c) => c.function_id === "event::session::checkpoint");
     expect(checkpointCall?.payload).toMatchObject({
       sessionId: "ses_new",
+      reason: "idle-checkpoint",
       since: older,
       until: newer,
       waitForCompletion: true,
@@ -357,9 +370,12 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
       function_id: "event::session::checkpoint",
       payload: {
         sessionId,
+        reason: "idle-checkpoint",
         since: undefined,
         until: undefined,
         waitForCompletion: true,
+        pendingCompressionDrained: true,
+        pendingCompressionRecovered: true,
       },
     });
     expect(compressCalls).toBe(2);
@@ -553,6 +569,126 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
     expect([first, second].some((result) => (result as { queued?: boolean }).queued)).toBe(true);
     expect([first, second].some((result) => (result as { noOp?: boolean }).noOp)).toBe(true);
     expect(sdk.triggerCalls.filter((c) => c.function_id === "event::session::checkpoint")).toHaveLength(1);
+  });
+
+  it("serializes with idle sweep so the same activity window runs once", async () => {
+    vi.stubEnv("AGENTMEMORY_IDLE_CHECKPOINT_MS", "0");
+    registerSessionSweepFunction(sdk as never, kv as never);
+    const checkpointAt = pastThreshold();
+    const sessionId = "ses_sweep_checkpoint_lock";
+    await kv.set(
+      SESSIONS_SCOPE,
+      sessionId,
+      makeSession({ id: sessionId, updatedAt: checkpointAt }),
+    );
+
+    const firstCheckpointStarted = deferred();
+    const releaseFirstCheckpoint = deferred();
+    let checkpointCalls = 0;
+    sdk.registerFunction("event::session::checkpoint", async () => {
+      checkpointCalls += 1;
+      if (checkpointCalls === 1) {
+        firstCheckpointStarted.resolve();
+        await releaseFirstCheckpoint.promise;
+      }
+      return { success: true };
+    });
+
+    const sweep = sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {
+        sessionIds: [sessionId],
+        mode: "idle-checkpoint",
+        maxAgeMs: 1,
+      },
+    });
+    await firstCheckpointStarted.promise;
+
+    const reactiveCheckpoint = sdk.trigger({
+      function_id: "mem::session::checkpoint",
+      payload: { sessionId },
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(checkpointCalls).toBe(1);
+
+    releaseFirstCheckpoint.resolve();
+    const [sweepResult, checkpointResult] = await Promise.all([
+      sweep,
+      reactiveCheckpoint,
+    ]);
+
+    expect(
+      (sweepResult as { checkpointed: string[] }).checkpointed,
+    ).toContain(sessionId);
+    expect(checkpointResult).toMatchObject({ success: true, noOp: true });
+    expect(checkpointCalls).toBe(1);
+  });
+
+  it("invalidates the pending-compression drain when activity changes", async () => {
+    vi.stubEnv("AGENTMEMORY_IDLE_CHECKPOINT_MS", "0");
+    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "true");
+    registerObserveFunction(sdk as never, kv as never);
+
+    const checkpointAt = pastThreshold();
+    const sessionId = "ses_drain_anchor";
+    await kv.set(
+      SESSIONS_SCOPE,
+      sessionId,
+      makeSession({ id: sessionId, updatedAt: checkpointAt }),
+    );
+
+    const rawListRead = deferred();
+    const releaseRawList = deferred();
+    const originalList = kv.list;
+    let blockedRawList = false;
+    kv.list = (async <T>(scope: string): Promise<T[]> => {
+      if (scope === KV.rawPayloads && !blockedRawList) {
+        blockedRawList = true;
+        const snapshot = await originalList<T>(scope);
+        rawListRead.resolve();
+        await releaseRawList.promise;
+        return snapshot;
+      }
+      return originalList<T>(scope);
+    }) as typeof kv.list;
+
+    let checkpointPayload:
+      | {
+          until?: string;
+          pendingCompressionDrained?: boolean;
+        }
+      | undefined;
+    sdk.registerFunction("event::session::checkpoint", async (payload) => {
+      checkpointPayload = payload as typeof checkpointPayload;
+      return { success: true };
+    });
+
+    const checkpoint = sdk.trigger({
+      function_id: "mem::session::checkpoint",
+      payload: { sessionId },
+    });
+    await rawListRead.promise;
+
+    await sdk.trigger({
+      function_id: "mem::observe",
+      payload: {
+        sessionId,
+        project: "test-project",
+        cwd: "/workspace",
+        hookType: "prompt_submit",
+        timestamp: new Date().toISOString(),
+        data: { prompt: "arrived during pending compression drain" },
+      },
+    });
+    const observed = await kv.get<Session>(SESSIONS_SCOPE, sessionId);
+    releaseRawList.resolve();
+    await checkpoint;
+
+    expect(observed?.updatedAt).not.toBe(checkpointAt);
+    expect(checkpointPayload).toMatchObject({
+      until: observed?.updatedAt,
+      pendingCompressionDrained: false,
+    });
   });
 
   it("allows observations during consolidation without advancing past them", async () => {

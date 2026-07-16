@@ -121,7 +121,7 @@ agentmemory funciona con cualquier agente que soporte hooks, MCP o REST API. Tod
 <td align="center" width="12.5%">
 <a href="https://github.com/openai/codex"><img src="https://github.com/openai.png?size=120" alt="Codex CLI" width="48" height="48" /></a><br/>
 <strong>Codex CLI</strong><br/>
-<sub>native plugin + 6 hooks + MCP</sub>
+<sub>native plugin + 7 hooks + MCP</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="../integrations/openclaw/"><img src="https://github.com/openclaw.png?size=120" alt="OpenClaw" width="48" height="48" /></a><br/>
@@ -158,7 +158,7 @@ agentmemory funciona con cualquier agente que soporte hooks, MCP o REST API. Tod
 <td align="center" width="12.5%">
 <a href="https://github.com/opencode-ai/opencode"><img src="https://github.com/opencode-ai.png?size=120" alt="OpenCode" width="48" height="48" /></a><br/>
 <strong>OpenCode</strong><br/>
-<sub>22 hooks + MCP + plugin</sub>
+<sub>40 rutas de captura + MCP + plugin</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/cline/cline"><img src="https://github.com/cline.png?size=120" alt="Cline" width="48" height="48" /></a><br/>
@@ -428,7 +428,7 @@ Los detalles de implementación están en `src/cli.ts` (ver `runUpgrade` en torn
 ### Claude Code (un bloque, pégalo)
 
 ```text
-Install agentmemory: run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server. Then run `/plugin marketplace add rohitg00/agentmemory` and `/plugin install agentmemory` — the plugin registers all 12 hooks, 4 skills, AND auto-wires the `@agentmemory/mcp` stdio server via its `.mcp.json`, so you get 53 MCP tools (memory_smart_search, memory_save, memory_sessions, memory_governance_delete, etc.) without any extra config step. Verify with `curl http://localhost:3111/agentmemory/health`. The real-time viewer is at http://localhost:3113.
+Install agentmemory: run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server. Then run `/plugin marketplace add rohitg00/agentmemory` and `/plugin install agentmemory` - the plugin registers all 12 hooks, 16 skills, AND auto-wires the `@agentmemory/mcp` stdio server via its `.mcp.json`, so you get 53 MCP tools (memory_smart_search, memory_save, memory_sessions, memory_governance_delete, etc.) without any extra config step. Verify with `curl http://localhost:3111/agentmemory/health`. The real-time viewer is at http://localhost:3113.
 ```
 
 #### Claude Code sin instalar el plugin (ruta MCP standalone)
@@ -457,29 +457,29 @@ codex plugin add agentmemory@agentmemory
 
 El plugin de Codex se sirve desde el mismo directorio `plugin/` que el de Claude Code. Registra:
 
-- `@agentmemory/mcp` como servidor MCP (hace de proxy a las 51 tools cuando `AGENTMEMORY_URL` apunta a un servidor agentmemory en ejecución; cae a 7 tools en local cuando no hay servidor accesible)
-- 6 hooks de ciclo de vida: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`, `Stop`
-- 4 skills: `/recall`, `/remember`, `/session-history`, `/forget`
+- `@agentmemory/mcp` como servidor MCP (hace de proxy a las 53 tools cuando `AGENTMEMORY_URL` apunta a un servidor agentmemory en ejecución; cae a 7 tools en local cuando no hay servidor accesible)
+- 7 hooks de ciclo de vida: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `SubagentStart`, `SubagentStop`, `Stop`
+- 16 skills
 
-El motor de hooks de Codex inyecta `CLAUDE_PLUGIN_ROOT` en los subprocesos de hook (según [`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs)), por lo que los mismos scripts de hook funcionan en ambos hosts sin duplicación. Los eventos Subagent / SessionEnd / Notification / TaskCompleted / PostToolUseFailure son exclusivos de Claude Code y no se registran para Codex.
+El motor de hooks de Codex inyecta `CLAUDE_PLUGIN_ROOT` en los subprocesos de hook (según [`codex-rs/hooks/src/engine/discovery.rs`](https://github.com/openai/codex/blob/main/codex-rs/hooks/src/engine/discovery.rs)), por lo que los mismos scripts de hook funcionan en ambos hosts sin duplicación. Los eventos `SessionEnd`, `Notification`, `TaskCompleted` y `PostToolUseFailure` son exclusivos de Claude Code y no se registran para Codex.
 
-#### Codex Desktop: los hooks del plugin están silenciados (con workaround)
+#### Fallback de Codex Desktop
 
-`CodexHooks` y `PluginHooks` son estables y están activados por defecto en [`codex-rs/features/src/lib.rs`](https://github.com/openai/codex/blob/main/codex-rs/features/src/lib.rs), pero las builds actuales de Codex Desktop no despachan el `hooks.json` local del plugin ([openai/codex#16430](https://github.com/openai/codex/issues/16430)). Las tools MCP siguen funcionando; solo faltan las observaciones del ciclo de vida.
+Las versiones actuales de Codex cargan los hooks incluidos en el plugin junto con los hooks de usuario. Algunas builds de Codex Desktop no han despachado los hooks del plugin; [openai/codex#16430](https://github.com/openai/codex/issues/16430) sigue ese error. Comprueba primero `/hooks`. Si muestra la fuente del plugin agentmemory, no hace falta el fallback.
 
-Hasta que se solucione upstream, replica los mismos comandos de hook en el `~/.codex/hooks.json` global:
+Si `/hooks` no muestra agentmemory, replica los comandos en `~/.codex/hooks.json`:
 
 ```bash
 agentmemory connect codex --with-hooks
 ```
 
-Esto añade un bloque idempotente a `~/.codex/hooks.json` que referencia rutas absolutas a los scripts empaquetados (no hace falta expandir `${CLAUDE_PLUGIN_ROOT}` en el ámbito de usuario). Vuelve a ejecutar el mismo comando tras actualizar agentmemory para refrescar las rutas. Las entradas de usuario en el mismo fichero se preservan; solo se reemplazan las entradas previas de agentmemory.
+Esto añade un bloque idempotente a `~/.codex/hooks.json` con rutas absolutas a los scripts empaquetados. Vuelve a ejecutar el comando tras actualizar agentmemory para refrescar las rutas. Las entradas de usuario se preservan. Elimina el fallback cuando aparezcan los hooks del plugin, porque Codex ejecuta los hooks coincidentes de todas las fuentes cargadas.
 
 <details>
 <summary><b>OpenClaw (pega este prompt)</b></summary>
 
 ```text
-Install agentmemory for OpenClaw. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to my OpenClaw MCP config so agentmemory is available with all 51 memory tools:
+Install agentmemory for OpenClaw. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to my OpenClaw MCP config so agentmemory is available with all 53 memory tools:
 
 {
   "mcpServers": {
@@ -504,7 +504,7 @@ Guía completa: [`integrations/openclaw/`](../integrations/openclaw/)
 <summary><b>Hermes Agent (pega este prompt)</b></summary>
 
 ```text
-Install agentmemory for Hermes. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to ~/.hermes/config.yaml so Hermes can use agentmemory as an MCP server with all 51 memory tools:
+Install agentmemory for Hermes. Run `npx @agentmemory/agentmemory` in a separate terminal to start the memory server on localhost:3111. Then add this to ~/.hermes/config.yaml so Hermes can use agentmemory as an MCP server with all 53 memory tools:
 
 mcp_servers:
   agentmemory:
@@ -549,9 +549,9 @@ La entrada de agentmemory es el **mismo bloque de servidor MCP** en cada host qu
 | **Gemini CLI** | `~/.gemini/settings.json` | `gemini mcp add agentmemory npx -y @agentmemory/mcp --scope user` (fusión automática). |
 | **OpenClaw** | Configuración MCP de OpenClaw | Mismo bloque `mcpServers`, o usa el [memory plugin](../integrations/openclaw/) más profundo. |
 | **Codex CLI (solo MCP)** | `.codex/config.toml` | Forma TOML: `codex mcp add agentmemory -- npx -y @agentmemory/mcp`, o añade `[mcp_servers.agentmemory]` a mano. |
-| **Codex CLI (plugin completo)** | Marketplace de plugins Codex | `codex plugin marketplace add rohitg00/agentmemory` y luego `codex plugin add agentmemory@agentmemory`. Registra MCP + 6 hooks de ciclo de vida (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, PreCompact, Stop) + 4 skills. En Codex Desktop, ejecuta también `agentmemory connect codex --with-hooks` hasta que se mergee [openai/codex#16430](https://github.com/openai/codex/issues/16430) — los hooks de plugin están silenciados allí. |
+| **Codex CLI (plugin completo)** | Marketplace de plugins Codex | `codex plugin marketplace add rohitg00/agentmemory` y luego `codex plugin add agentmemory@agentmemory`. Registra MCP + 7 hooks de ciclo de vida (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, SubagentStart, SubagentStop, Stop) + 16 skills. Ejecuta `agentmemory connect codex --with-hooks` solo si `/hooks` no muestra la fuente del plugin agentmemory. |
 | **OpenCode (solo MCP)** | `opencode.json` | Forma distinta — clave `mcp` en el nivel superior, comando como array: `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`. |
-| **OpenCode (plugin completo)** | `plugin/opencode/` | 22 hooks de captura automática que cubren ciclo de vida de sesión, mensajes, tools y errores. Dos comandos slash (`/recall`, `/remember`). Copia `plugin/opencode/` a tu workspace de OpenCode y añade la entrada del plugin a `opencode.json`. Tabla completa de hooks + análisis de gaps en [`plugin/opencode/README.md`](../plugin/opencode/README.md). |
+| **OpenCode (plugin completo)** | `plugin/opencode/` | 40 rutas de captura y 16 skills. Instalación única: `agentmemory connect opencode --with-plugin`. OpenCode detecta automáticamente el archivo en el directorio `plugins/`, por lo que no necesita un array `plugin`. Consulta [`plugin/opencode/README.md`](../plugin/opencode/README.md) para ver la tabla completa. |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | Copia [`integrations/pi`](../integrations/pi/) y reinicia pi. |
 | **Hermes Agent** | `~/.hermes/config.yaml` | Usa el [memory provider plugin](../integrations/hermes/) más profundo con `memory.provider: agentmemory`. |
 | **Qwen Code** | `~/.qwen/settings.json` | `agentmemory connect qwen` escribe el bloque `mcpServers` estándar. El payload de los hooks es compatible a nivel de campo con Claude Code, así que los scripts de los 12 hooks existentes funcionan sin modificación — conéctalos en la sección `hooks` del mismo `settings.json`. |
@@ -828,85 +828,52 @@ npm install @xenova/transformers
 
 <h2 id="mcp-server"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/tags/light/section-mcp.svg"><img src="../assets/tags/section-mcp.svg" alt="Servidor MCP" height="32" /></picture></h2>
 
-53 tools, 6 recursos, 3 prompts y 4 skills — el toolkit MCP de memoria más completo para cualquier agente.
+53 tools, 6 recursos, 3 prompts y 16 skills - el toolkit MCP de memoria más completo para cualquier agente.
 
-> **Shim MCP vs servidor completo:** el paquete publicado `@agentmemory/mcp` es un shim ligero. Expone la superficie completa de 51 tools **solo cuando puede alcanzar un servidor agentmemory en ejecución** vía `AGENTMEMORY_URL` (modo proxy). Sin servidor accesible, el shim cae a un set local de 7 tools (`memory_save`, `memory_recall`, `memory_smart_search`, `memory_sessions`, `memory_export`, `memory_audit`, `memory_governance_delete`). La variable de entorno `AGENTMEMORY_TOOLS=core|all` es un flag *del lado del servidor* — definirla en el bloque `env` del shim no tiene efecto. Si ves solo 7 tools en Cursor / OpenCode / Gemini CLI, arranca `npx @agentmemory/agentmemory` (o la stack Docker) y define `AGENTMEMORY_URL=http://localhost:3111`.
+> **Shim MCP vs servidor completo:** el paquete publicado `@agentmemory/mcp` es un shim ligero. Expone la superficie completa de 53 tools **solo cuando puede alcanzar un servidor agentmemory en ejecución** vía `AGENTMEMORY_URL` (modo proxy). Sin servidor accesible, el shim cae a un set local de 7 tools (`memory_save`, `memory_recall`, `memory_smart_search`, `memory_sessions`, `memory_export`, `memory_audit`, `memory_governance_delete`). La variable de entorno `AGENTMEMORY_TOOLS=core|all` es un flag *del lado del servidor* - definirla en el bloque `env` del shim no tiene efecto. Si ves solo 7 tools en Cursor / OpenCode / Gemini CLI, arranca `npx @agentmemory/agentmemory` (o la stack Docker) y define `AGENTMEMORY_URL=http://localhost:3111`.
 
-### 51 Tools
+### 53 Tools
 
 <details>
-<summary>Tools principales (siempre disponibles)</summary>
+<summary>Tools principales (AGENTMEMORY_TOOLS=core)</summary>
 
 | Tool | Descripción |
 |------|-------------|
+| `memory_save` | Guarda un hallazgo, decisión o patrón |
 | `memory_recall` | Busca observaciones pasadas |
-| `memory_compress_file` | Comprime ficheros markdown preservando la estructura |
-| `memory_save` | Guarda un insight, decisión o patrón |
-| `memory_patterns` | Detecta patrones recurrentes |
-| `memory_smart_search` | Búsqueda híbrida semántica + por palabras |
-| `memory_file_history` | Observaciones pasadas sobre ficheros concretos |
+| `memory_consolidate` | Ejecuta la consolidación de memoria |
+| `memory_smart_search` | Búsqueda híbrida semántica y por keywords |
 | `memory_sessions` | Lista sesiones recientes |
-| `memory_timeline` | Observaciones cronológicas |
-| `memory_profile` | Perfil de proyecto (conceptos, ficheros, patrones) |
-| `memory_export` | Exporta todos los datos de memoria |
-| `memory_relations` | Consulta el grafo de relaciones |
+| `memory_diagnose` | Ejecuta comprobaciones de salud |
+| `memory_lesson_save` | Guarda una lección reutilizable |
+| `memory_reflect` | Sintetiza hallazgos de memoria reciente |
 
 </details>
 
-<details>
-<summary>Tools extendidas (51 en total — define AGENTMEMORY_TOOLS=all)</summary>
+El servidor expone las 53 tools de forma predeterminada. Consulta la [referencia MCP generada](../plugin/skills/agentmemory-mcp-tools/REFERENCE.md) para ver la lista completa y los esquemas de parámetros.
 
-| Tool | Descripción |
-|------|-------------|
-| `memory_patterns` | Detecta patrones recurrentes |
-| `memory_timeline` | Observaciones cronológicas |
-| `memory_relations` | Consulta el grafo de relaciones |
-| `memory_graph_query` | Recorrido del grafo de conocimiento |
-| `memory_consolidate` | Ejecuta la consolidación de 4 niveles |
-| `memory_claude_bridge_sync` | Sincroniza con MEMORY.md |
-| `memory_team_share` | Comparte con miembros del equipo |
-| `memory_team_feed` | Elementos compartidos recientes |
-| `memory_audit` | Pista de auditoría de operaciones |
-| `memory_governance_delete` | Borrado con pista de auditoría |
-| `memory_snapshot_create` | Snapshot versionado en Git |
-| `memory_action_create` | Crea ítems de trabajo con dependencias |
-| `memory_action_update` | Actualiza estado de una action |
-| `memory_frontier` | Actions desbloqueadas, ordenadas por prioridad |
-| `memory_next` | La única acción más importante a continuación |
-| `memory_lease` | Leases exclusivos de actions (multiagente) |
-| `memory_routine_run` | Instancia rutinas de workflow |
-| `memory_signal_send` | Mensajería entre agentes |
-| `memory_signal_read` | Lee mensajes con acuse de recibo |
-| `memory_checkpoint` | Gates de condiciones externas |
-| `memory_mesh_sync` | Sincronización P2P entre instancias |
-| `memory_sentinel_create` | Watchers dirigidos por eventos |
-| `memory_sentinel_trigger` | Dispara sentinels desde fuera |
-| `memory_sketch_create` | Grafos de actions efímeros |
-| `memory_sketch_promote` | Promociona a permanente |
-| `memory_crystallize` | Compacta cadenas de actions |
-| `memory_diagnose` | Health checks |
-| `memory_heal` | Repara automáticamente estado atascado |
-| `memory_facet_tag` | Tags dimension:value |
-| `memory_facet_query` | Consulta por tags de facet |
-| `memory_verify` | Traza provenance |
-
-</details>
-
-### 6 Recursos · 3 Prompts · 4 Skills
+### 6 Recursos · 3 Prompts · 16 Skills
 
 | Tipo | Nombre | Descripción |
-|------|------|-------------|
-| Resource | `agentmemory://status` | Salud, conteo de sesiones, conteo de memorias |
-| Resource | `agentmemory://project/{name}/profile` | Inteligencia por proyecto |
-| Resource | `agentmemory://memories/latest` | Las 10 memorias activas más recientes |
-| Resource | `agentmemory://graph/stats` | Estadísticas del grafo de conocimiento |
-| Prompt | `recall_context` | Búsqueda + devuelve mensajes de contexto |
-| Prompt | `session_handoff` | Datos de traspaso entre agentes |
+|------|--------|-------------|
+| Recurso | `agentmemory://status` | Salud, número de sesiones y memorias |
+| Recurso | `agentmemory://project/{name}/profile` | Inteligencia por proyecto |
+| Recurso | `agentmemory://project/{name}/recent` | Observaciones recientes de un proyecto |
+| Recurso | `agentmemory://memories/latest` | Las 10 memorias activas más recientes |
+| Recurso | `agentmemory://graph/stats` | Estadísticas del grafo de conocimiento |
+| Recurso | `agentmemory://team/{id}/profile` | Perfil de memoria del equipo |
+| Prompt | `recall_context` | Busca y devuelve mensajes de contexto |
+| Prompt | `session_handoff` | Datos de handoff entre agentes |
 | Prompt | `detect_patterns` | Analiza patrones recurrentes |
-| Skill | `/recall` | Busca en memoria |
-| Skill | `/remember` | Guarda en memoria a largo plazo |
-| Skill | `/session-history` | Resúmenes recientes de sesiones |
-| Skill | `/forget` | Borra observaciones/sesiones |
+| Skill | `/recall` | Busca memoria con BM25, vectores y grafo |
+| Skill | `/remember` | Guarda en memoria a largo plazo con etiquetas de concepto |
+| Skill | `/recap` | Resume sesiones recientes del proyecto actual |
+| Skill | `/handoff` | Reanuda la última sesión con las preguntas abiertas |
+| Skill | `/forget` | Elimina observaciones tras confirmación |
+| Skill | `/commit-context` | Rastrea un archivo o línea hasta la sesión que lo creó |
+| Skill | `/commit-history` | Lista commits recientes vinculados a agentes |
+| Skill | `/session-history` | Timeline de sesiones recientes del proyecto |
+| Skill | `/health` | Comprueba el servidor, lista providers y muestra elementos bloqueados |
 
 ### MCP standalone
 
@@ -936,7 +903,7 @@ La mayoría de los agentes (Cursor, Claude Desktop, Cline, Roo Code, Windsurf, G
 
 Fusiona la entrada `agentmemory` en el objeto `mcpServers` existente del host en lugar de reemplazar el fichero. Para clientes en sandbox que no pueden alcanzar el `localhost` del host, añade `"AGENTMEMORY_FORCE_PROXY": "1"` al bloque env y define `AGENTMEMORY_URL` a una ruta a la que el sandbox sí pueda llegar.
 
-OpenCode (`opencode.json`):
+OpenCode (`opencode.jsonc` o `opencode.json`):
 ```json
 {
   "mcp": {
@@ -945,17 +912,20 @@ OpenCode (`opencode.json`):
       "command": ["npx", "-y", "@agentmemory/mcp"],
       "enabled": true
     }
-  },
-  "plugin": ["./plugins/agentmemory-capture.ts"]
+  }
 }
 ```
 
-Copia el fichero del plugin desde el repo:
+Instala el plugin y los skills de una vez o cópialos desde el repo:
 ```bash
-mkdir -p ~/.config/opencode/plugins
+agentmemory connect opencode --with-plugin
+# o manualmente:
+mkdir -p ~/.config/opencode/plugins ~/.config/opencode/skills
 cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
-cp plugin/opencode/commands/*.md ~/.config/opencode/commands/
+cp -R plugin/skills/* ~/.config/opencode/skills/
 ```
+
+OpenCode detecta automáticamente `agentmemory-capture.ts` en el directorio `plugins/`. No hace falta un array `plugin` en el nivel superior.
 
 ---
 
@@ -1316,7 +1286,7 @@ Crea `~/.agentmemory/.env`:
 # USER_ID=
 # TEAM_MODE=private
 
-# Tool visibility: "core" (8 tools) or "all" (51 tools)
+# Tool visibility: "core" (8 tools) or "all" (53 tools)
 # AGENTMEMORY_TOOLS=core
 ```
 
@@ -1324,7 +1294,7 @@ Crea `~/.agentmemory/.env`:
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="../assets/tags/light/section-api.svg"><img src="../assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-124 endpoints en el puerto `3111`. La REST API se enlaza a `127.0.0.1` por defecto. Los endpoints protegidos requieren `Authorization: Bearer <secret>` cuando `AGENTMEMORY_SECRET` está definido, y los endpoints de mesh sync requieren `AGENTMEMORY_SECRET` en ambos peers.
+134 endpoints en el puerto `3111`. La REST API se enlaza a `127.0.0.1` por defecto. Los endpoints protegidos requieren `Authorization: Bearer <secret>` cuando `AGENTMEMORY_SECRET` está definido, y los endpoints de mesh sync requieren `AGENTMEMORY_SECRET` en ambos peers.
 
 <details>
 <summary>Endpoints principales</summary>

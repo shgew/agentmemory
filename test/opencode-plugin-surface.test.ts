@@ -15,12 +15,10 @@ const EVENT_BRANCHES = [
   "session.diff",
   "session.deleted",
   "session.error",
-  "message.updated",
   "message.removed",
   "message.part.updated",
   "message.part.removed",
   "file.edited",
-  "file.watcher.updated",
   "permission.updated",
   "permission.asked",
   "permission.replied",
@@ -45,15 +43,12 @@ const EVENT_BRANCHES = [
 
 const TYPED_HOOKS = [
   "chat.message",
-  "chat.params",
   "tool.execute.before",
   "tool.execute.after",
   "experimental.chat.system.transform",
-  "experimental.chat.messages.transform",
   "experimental.session.compacting",
   "experimental.compaction.autocontinue",
   "command.execute.before",
-  "config",
 ] as const;
 
 const PART_SUBTYPES = [
@@ -79,12 +74,6 @@ describe("OpenCode plugin surface: event branches", () => {
 
 describe("OpenCode plugin surface: typed hooks", () => {
   for (const hook of TYPED_HOOKS) {
-    if (hook === "config") {
-      it(`registers ${hook} key`, () => {
-        expect(plugin).toMatch(/\bconfig\s*:\s*async/);
-      });
-      continue;
-    }
     it(`registers typed hook ${hook}`, () => {
       const escaped = hook.replace(/\./g, "\\.");
       expect(plugin).toMatch(new RegExp(`["']${escaped}["']\\s*:\\s*async`));
@@ -102,16 +91,6 @@ describe("OpenCode plugin surface: message.part subtypes", () => {
       expect(plugin).toMatch(new RegExp(`part\\.type\\s*===\\s*["']${sub}["']`));
     });
   }
-});
-
-describe("OpenCode plugin surface: assistant + user message branches", () => {
-  it("captures assistant role on message.updated", () => {
-    expect(plugin).toMatch(/info\.role\s*===\s*["']assistant["']/);
-  });
-
-  it("captures user role on message.updated", () => {
-    expect(plugin).toMatch(/info\.role\s*===\s*["']user["']/);
-  });
 });
 
 describe("OpenCode plugin surface: dedup invariants", () => {

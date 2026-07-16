@@ -66,7 +66,7 @@ export const adapter: ConnectAdapter = {
   category: "native",
   docs: "https://github.com/rohitg00/agentmemory#codex-cli-codex-plugin-platform",
   protocolNote:
-    "→ Using MCP. Hooks ship via the Codex plugin; on Codex Desktop, also pass --with-hooks to install the global hooks.json workaround for openai/codex#16430.",
+    "Using MCP. Hooks ship via the Codex plugin. On affected Codex Desktop builds where `/hooks` does not list agentmemory, pass --with-hooks to install the user-scope fallback.",
 
   detect(): boolean {
     return existsSync(CODEX_DIR);
@@ -79,6 +79,12 @@ export const adapter: ConnectAdapter = {
 
     if (wired && !opts.force) {
       logAlreadyWired("Codex CLI", CODEX_TOML);
+      if (opts.withHooks) {
+        const hookResult = installCodexHooks(opts);
+        if (hookResult.kind === "skipped") {
+          p.log.warn(`Codex hooks fallback skipped: ${hookResult.reason}.`);
+        }
+      }
       return { kind: "already-wired", mutatedPath: CODEX_TOML };
     }
 
@@ -133,12 +139,6 @@ export const adapter: ConnectAdapter = {
   },
 };
 
-/**
- * Install the global `~/.codex/hooks.json` fallback. See
- * `codex-hooks.ts` for context (openai/codex#16430). Returns a result
- * describing the side effect for the caller's summary; failures here do
- * not roll back the MCP wiring.
- */
 function installCodexHooks(opts: ConnectOptions): ConnectResult {
   let pluginRoot: string;
   try {
@@ -168,7 +168,7 @@ function installCodexHooks(opts: ConnectOptions): ConnectResult {
 
   writeJsonAtomic(CODEX_HOOKS, merged);
 
-  logInstalled("Codex hooks (workaround for openai/codex#16430)", CODEX_HOOKS);
+  logInstalled("Codex hooks fallback", CODEX_HOOKS);
   p.log.info(
     "User-scope hooks reference absolute paths under the bundled plugin/ dir. Re-run `agentmemory connect codex --with-hooks` after upgrading agentmemory to refresh them.",
   );

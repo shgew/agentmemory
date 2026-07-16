@@ -63,7 +63,8 @@ async function main() {
 		body: JSON.stringify({
 			sessionId,
 			project,
-			cwd
+			cwd,
+			...data.source === "resume" ? { resumed: true } : {}
 		})
 	};
 	if (!INJECT_CONTEXT) {

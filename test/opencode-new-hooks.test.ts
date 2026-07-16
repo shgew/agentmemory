@@ -109,19 +109,6 @@ describe("OpenCode plugin: dispose cleanup hook", () => {
   });
 });
 
-describe("OpenCode plugin: experimental.chat.messages.transform observer", () => {
-  it("registers the messages.transform handler", () => {
-    expect(pluginSource).toMatch(/["']experimental\.chat\.messages\.transform["']\s*:\s*async/);
-  });
-
-  it("emits a messages_transform observation", () => {
-    const start = pluginSource.indexOf('"experimental.chat.messages.transform":');
-    expect(start).toBeGreaterThan(-1);
-    const block = pluginSource.slice(start, start + 600);
-    expect(block).toMatch(/observe\(\s*sid\s*,\s*["']messages_transform["']/);
-  });
-});
-
 describe("OpenCode plugin: command.execute.before typed hook", () => {
   it("registers the command.execute.before handler", () => {
     expect(pluginSource).toMatch(/["']command\.execute\.before["']\s*:\s*async/);

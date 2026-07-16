@@ -17,10 +17,8 @@ describe("OpenCode plugin auto-context injection (#431)", () => {
     expect(plugin).toMatch(
       /postJson\(["']\/session\/start["']/,
     );
-    // Snapshot `activeSessionId` into a local before the await so the cached
-    // context binds to the session that opened it, not a later one.
     expect(plugin).toMatch(
-      /const\s+sessionId\s*=\s*activeSessionId[\s\S]*?startContextCache\.set\(sessionId/,
+      /const\s+sessionId\s*=[\s\S]*?postJson\(["']\/session\/start["'][\s\S]*?startContextCache\.set\(sessionId/,
     );
   });
 

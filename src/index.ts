@@ -740,7 +740,8 @@ async function main() {
   const idleThresholdMs = getIdleCheckpointMs();
   if (
     getEnvVar("AGENTMEMORY_IDLE_CHECKPOINT_ENABLED") !== "false" &&
-    idleThresholdMs > 0
+    idleThresholdMs > 0 &&
+    isGraphExtractionEnabled()
   ) {
     const idleCheckpointPollMs = parseIntervalMs(
       getEnvVar("AGENTMEMORY_IDLE_CHECKPOINT_POLL_MS"),

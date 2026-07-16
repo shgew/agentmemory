@@ -1,4 +1,32 @@
 #!/usr/bin/env node
+import { execFileSync } from "node:child_process";
+import { basename, resolve } from "node:path";
+//#region src/hooks/_project.ts
+function resolveProject(cwd) {
+	const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
+	if (explicit && explicit.trim()) return explicit.trim();
+	const dir = cwd && cwd.trim() ? cwd : process.cwd();
+	try {
+		const top = gitRevParse(dir, "--show-toplevel");
+		const gitDir = gitRevParse(dir, "--git-dir");
+		const commonDir = gitRevParse(dir, "--git-common-dir");
+		const root = resolve(dir, gitDir) === resolve(dir, commonDir) ? top : resolve(dir, commonDir, "..");
+		if (root) return basename(root);
+	} catch {}
+	return basename(dir);
+}
+function gitRevParse(cwd, arg) {
+	return execFileSync("git", ["rev-parse", arg], {
+		cwd,
+		stdio: [
+			"ignore",
+			"pipe",
+			"ignore"
+		],
+		timeout: 500
+	}).toString().trim();
+}
+//#endregion
 //#region src/hooks/stop.ts
 function isSdkChildContext(payload) {
 	if (process.env["AGENTMEMORY_SDK_CHILD"] === "1") return true;
@@ -8,9 +36,9 @@ function isSdkChildContext(payload) {
 const REST_URL = process.env["AGENTMEMORY_URL"] || "http://localhost:3111";
 const SECRET = process.env["AGENTMEMORY_SECRET"] || "";
 function authHeaders() {
-	const h = { "Content-Type": "application/json" };
-	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
-	return h;
+	const headers = { "Content-Type": "application/json" };
+	if (SECRET) headers["Authorization"] = `Bearer ${SECRET}`;
+	return headers;
 }
 async function main() {
 	let input = "";
@@ -22,20 +50,25 @@ async function main() {
 		return;
 	}
 	if (isSdkChildContext(data)) return;
-	const sessionId = data.session_id || data.sessionId || "unknown";
-	fetch(`${REST_URL}/agentmemory/summarize`, {
+	const rawSessionId = data.session_id ?? data.sessionId;
+	const sessionId = typeof rawSessionId === "string" && rawSessionId.length > 0 ? rawSessionId : "unknown";
+	const message = typeof data.last_assistant_message === "string" ? data.last_assistant_message.slice(0, 8e3) : "";
+	if (!message) return;
+	const cwd = typeof data.cwd === "string" && data.cwd.length > 0 ? data.cwd : process.cwd();
+	fetch(`${REST_URL}/agentmemory/observe`, {
 		method: "POST",
 		headers: authHeaders(),
-		body: JSON.stringify({ sessionId }),
-		signal: AbortSignal.timeout(12e4)
+		body: JSON.stringify({
+			hookType: "assistant_message",
+			sessionId,
+			project: resolveProject(cwd),
+			cwd,
+			timestamp: (/* @__PURE__ */ new Date()).toISOString(),
+			data: { message }
+		}),
+		signal: AbortSignal.timeout(3e3)
 	}).catch(() => {});
-	fetch(`${REST_URL}/agentmemory/session/end`, {
-		method: "POST",
-		headers: authHeaders(),
-		body: JSON.stringify({ sessionId }),
-		signal: AbortSignal.timeout(5e3)
-	}).catch(() => {});
-	setTimeout(() => process.exit(0), 1500).unref();
+	setTimeout(() => process.exit(0), 500).unref();
 }
 main();
 //#endregion

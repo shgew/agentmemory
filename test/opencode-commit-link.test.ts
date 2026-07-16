@@ -113,7 +113,6 @@ describe("OpenCode commit-link capture", () => {
     activePlugin = plugin;
 
     expect(plugin.event).toEqual(expect.any(Function));
-    expect(plugin.config).toEqual(expect.any(Function));
   });
 
   it("posts final HEAD metadata after a successful tool completion changes HEAD", async () => {

@@ -13,10 +13,15 @@ export interface PendingCompressionDrainResult {
   remainingIds: string[];
 }
 
+export interface PendingCompressionDrainOptions {
+  rawPayloads?: readonly RawObservation[];
+}
+
 export async function drainPendingCompression(
   sdk: ISdk,
   kv: StateKV,
   sessionId: string,
+  options?: PendingCompressionDrainOptions,
 ): Promise<PendingCompressionDrainResult> {
   return withKeyedLock(`pending-compression:${sessionId}`, async () => {
     const compressed = await kv.list<CompressedObservation>(
@@ -27,7 +32,8 @@ export async function drainPendingCompression(
         .filter((observation) => Boolean(observation.title))
         .map((observation) => observation.id),
     );
-    const rawPayloads = await kv.list<RawObservation>(KV.rawPayloads);
+    const rawPayloads =
+      options?.rawPayloads ?? (await kv.list<RawObservation>(KV.rawPayloads));
     const pending = rawPayloads.filter(
       (raw) => raw.sessionId === sessionId && !compressedIds.has(raw.id),
     );

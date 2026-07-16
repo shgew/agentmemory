@@ -291,8 +291,8 @@ describe("OpenCode plugin behavior: instance isolation", () => {
 
       await pluginA.event!({
         event: {
-          type: "file.watcher.updated",
-          properties: { file: "src/a.ts", event: "change" },
+          type: "vcs.branch.updated",
+          properties: { branch: "feature/a" },
         } as any,
       });
 
@@ -401,26 +401,34 @@ describe("OpenCode plugin behavior: message.part.removed", () => {
   });
 });
 
-describe("OpenCode plugin behavior: file.watcher.updated", () => {
+describe("OpenCode plugin behavior: root session ownership", () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(async () => { await teardownPlugin(); });
 
-  it("captures external fs changes when an active session exists", async () => {
+  it("keeps root session active when a child session starts", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
-      event: { type: "session.created", properties: { info: { id: "s7" } } } as any,
+      event: { type: "session.created", properties: { info: { id: "root" } } } as any,
     });
-    calls.length = 0;
     await plugin.event!({
       event: {
-        type: "file.watcher.updated",
-        properties: { file: "/tmp/changed.ts", event: "change" },
+        type: "session.created",
+        properties: { info: { id: "child", parentID: "root" } },
       } as any,
     });
-    const observe = calls.find((c) => c.body?.hookType === "file_watcher");
-    expect(observe).toBeDefined();
-    expect(observe!.body.data.file).toBe("/tmp/changed.ts");
-    expect(observe!.body.data.event).toBe("change");
+    calls.length = 0;
+
+    await plugin.event!({
+      event: {
+        type: "vcs.branch.updated",
+        properties: { branch: "feature/root" },
+      } as any,
+    });
+
+    const observation = calls.find((call) =>
+      call.url.endsWith("/agentmemory/observe"),
+    );
+    expect(observation?.body.sessionId).toBe("root");
   });
 });
 

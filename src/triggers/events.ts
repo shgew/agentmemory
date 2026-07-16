@@ -47,6 +47,8 @@ type SessionStoppedPayload = {
   waitForCompletion?: boolean;
   reason?: string;
   summaryOnly?: boolean;
+  pendingCompressionDrained?: boolean;
+  pendingCompressionRecovered?: boolean;
 };
 type SessionStoppedQueued = {
   queued: true;
@@ -177,6 +179,8 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     until?: string;
     reason?: string;
     summaryOnly?: boolean;
+    pendingCompressionDrained?: boolean;
+    pendingCompressionRecovered?: boolean;
   }): Promise<unknown> => {
     const { sessionId, since, until, reason, summaryOnly } = params;
     // Idle checkpoints fire every few minutes for every active session and
@@ -196,14 +200,18 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
       runsFullConsolidation && isGraphExtractionEnabled();
     let windowSince = since;
     let windowUntil = until;
+    let recoveredPending = params.pendingCompressionRecovered ?? false;
     if (shouldSummarize || runsGraphExtraction) {
-      const drain = await drainPendingCompression(sdk, kv, sessionId);
-      if (drain.remainingIds.length > 0) {
-        throw new Error(
-          `pending_compression_failed: ${drain.remainingIds.length} observation(s) remain`,
-        );
+      if (!params.pendingCompressionDrained) {
+        const drain = await drainPendingCompression(sdk, kv, sessionId);
+        if (drain.remainingIds.length > 0) {
+          throw new Error(
+            `pending_compression_failed: ${drain.remainingIds.length} observation(s) remain`,
+          );
+        }
+        recoveredPending ||= drain.completed > 0;
       }
-      if (drain.completed > 0) {
+      if (recoveredPending) {
         windowSince = undefined;
         windowUntil = undefined;
       }
@@ -263,6 +271,8 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
           payload: {
             sessionId,
             ...(windowUntil ? { until: windowUntil } : {}),
+            pendingCompressionDrained: true,
+            pendingCompressionRecovered: recoveredPending,
           },
           timeoutMs: getSummarizeTimeoutMs(),
         });
@@ -343,6 +353,8 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
           until: data.until,
           reason,
           summaryOnly: data.summaryOnly,
+          pendingCompressionDrained: data.pendingCompressionDrained,
+          pendingCompressionRecovered: data.pendingCompressionRecovered,
         }),
       );
       return data.waitForCompletion
@@ -371,6 +383,8 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
           until: data.until,
           reason,
           summaryOnly: data.summaryOnly,
+          pendingCompressionDrained: data.pendingCompressionDrained,
+          pendingCompressionRecovered: data.pendingCompressionRecovered,
         }),
       );
       return data.waitForCompletion
@@ -390,50 +404,117 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
 
   sdk.registerFunction(
     "event::session::ended",
-    async (data: { sessionId: string }) => {
-      const existing = await kv.get<Session>(KV.sessions, data.sessionId);
-      if (!existing) return { success: false, error: "session_not_found" };
-      const anchor = existing.updatedAt ?? existing.startedAt;
+    async (data: { sessionId: string }) =>
+      withKeyedLock(`session:checkpoint:${data.sessionId}`, async () => {
+        const preparation = await withKeyedLock(
+          `obs:${data.sessionId}`,
+          async () => {
+            const session = await kv.get<Session>(KV.sessions, data.sessionId);
+            if (!session) {
+              return {
+                result: { success: false, error: "session_not_found" },
+              } as const;
+            }
+            const anchor = session.updatedAt ?? session.startedAt;
+            if (session.status === "completed") {
+              const watermark =
+                session.lastCheckpointAt ?? session.endedAt;
+              if (!anchor || !isAfter(anchor, watermark)) {
+                return {
+                  result: { success: true, alreadyCompleted: true },
+                } as const;
+              }
+              return {
+                plan: {
+                  anchor,
+                  expectedStatus: session.status,
+                  kind: "checkpoint" as const,
+                  watermark,
+                },
+              };
+            }
+            return {
+              plan: {
+                anchor: anchor ?? new Date().toISOString(),
+                expectedStatus: session.status,
+                kind: "end" as const,
+                watermark: session.lastCheckpointAt ?? session.endedAt,
+              },
+            };
+          },
+        );
 
-      if (existing.status === "completed") {
-        const watermark = existing.lastCheckpointAt ?? existing.endedAt;
-        if (anchor && isAfter(anchor, watermark)) {
-          await sdk.trigger({
-            function_id: "event::session::checkpoint",
-            payload: {
-              sessionId: data.sessionId,
-              reason: "ended",
-              since: watermark,
-              until: anchor,
-              waitForCompletion: true,
+        if ("result" in preparation) return preparation.result;
+
+        const { plan } = preparation;
+        await sdk.trigger({
+          function_id:
+            plan.kind === "checkpoint"
+              ? "event::session::checkpoint"
+              : "event::session::stopped",
+          payload: {
+            sessionId: data.sessionId,
+            reason: "ended",
+            ...(plan.kind === "checkpoint" && plan.watermark
+              ? { since: plan.watermark }
+              : {}),
+            until: plan.anchor,
+            waitForCompletion: true,
+          },
+        });
+
+        return withKeyedLock(`obs:${data.sessionId}`, async () => {
+          const current = await kv.get<Session>(KV.sessions, data.sessionId);
+          if (!current) {
+            return { success: false, error: "session_not_found" };
+          }
+          const currentAnchor = current.updatedAt ?? current.startedAt;
+          if (
+            current.status !== plan.expectedStatus ||
+            currentAnchor !== plan.anchor
+          ) {
+            const currentWatermark =
+              current.lastCheckpointAt ?? current.endedAt;
+            if (isAfter(plan.anchor, currentWatermark)) {
+              await kv.update<Session>(KV.sessions, data.sessionId, [
+                {
+                  type: "set",
+                  path: "lastCheckpointAt",
+                  value: plan.anchor,
+                },
+              ]);
+            }
+            return {
+              success: true,
+              checkpointed: true,
+              completionDeferred: current.status === "active",
+            };
+          }
+
+          if (plan.kind === "checkpoint") {
+            await kv.update<Session>(KV.sessions, data.sessionId, [
+              {
+                type: "set",
+                path: "lastCheckpointAt",
+                value: plan.anchor,
+              },
+            ]);
+            return { success: true, checkpointed: true };
+          }
+
+          const endedAt = new Date().toISOString();
+          await kv.update<Session>(KV.sessions, data.sessionId, [
+            { type: "set", path: "endedAt", value: endedAt },
+            { type: "set", path: "status", value: "completed" },
+            {
+              type: "set",
+              path: "lastCheckpointAt",
+              value: plan.anchor,
             },
-          });
-          await kv.update(KV.sessions, data.sessionId, [
-            { type: "set", path: "lastCheckpointAt", value: anchor },
           ]);
-          return { success: true, checkpointed: true };
-        }
-        return { success: true, alreadyCompleted: true };
-      }
-
-      const effectiveAnchor = anchor ?? new Date().toISOString();
-      await sdk.trigger({
-        function_id: "event::session::stopped",
-        payload: {
-          sessionId: data.sessionId,
-          reason: "ended",
-          until: effectiveAnchor,
-          waitForCompletion: true,
-        },
-      });
-      const endedAt = new Date().toISOString();
-      await kv.update(KV.sessions, data.sessionId, [
-        { type: "set", path: "endedAt", value: endedAt },
-        { type: "set", path: "status", value: "completed" },
-        { type: "set", path: "lastCheckpointAt", value: effectiveAnchor },
-      ]);
-      return { success: true };
-    },
+          return { success: true };
+        });
+      }),
   );
   sdk.registerTrigger({
     type: "durable:subscriber",

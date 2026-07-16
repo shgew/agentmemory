@@ -21,13 +21,13 @@ describe("api::session::end → event::session::ended → event::session::stoppe
 
   it("event::session::ended fires event::session::stopped on active-to-completed transition", () => {
     expect(events).toMatch(
-      /event::session::ended[\s\S]*?function_id:\s*"event::session::stopped"/,
+      /event::session::ended[\s\S]*?"event::session::stopped"/,
     );
   });
 
   it("event::session::stopped trigger payload includes sessionId", () => {
     expect(events).toMatch(
-      /function_id:\s*"event::session::stopped",\s*payload:\s*\{\s*sessionId[^}]*\}/,
+      /"event::session::stopped"[\s\S]*?payload:\s*\{\s*sessionId[^}]*\}/,
     );
   });
 

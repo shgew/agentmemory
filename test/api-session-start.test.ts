@@ -156,7 +156,7 @@ describe("api::session::start", () => {
     expect(result.body.projectConflict).toBe(false);
   });
 
-  it("preserves durable completed-session fields and enriches only empty metadata", async () => {
+  it("preserves durable completed-session fields on an ordinary repeated start", async () => {
     const existing = session({
       cwd: "",
       status: "completed",
@@ -187,6 +187,37 @@ describe("api::session::start", () => {
       agentId: "reviewer",
     });
     expect(await kv.get<Session>(KV.sessions, existing.id)).toEqual(result.body.session);
+  });
+
+  it("reopens a completed session only when resumed is explicitly true", async () => {
+    const existing = session({
+      status: "completed",
+      endedAt: "2026-01-01T01:00:00.000Z",
+      lastCheckpointAt: "2026-01-01T00:59:00.000Z",
+      commitShas: ["abc123"],
+    });
+    kv.seed(KV.sessions, existing.id, existing);
+
+    const result = (await start(
+      request({
+        sessionId: existing.id,
+        project: existing.project,
+        cwd: existing.cwd,
+        resumed: true,
+      }),
+    )) as StartResponse;
+
+    expect(result.body.session).toEqual({
+      ...existing,
+      status: "active",
+      updatedAt: expect.any(String),
+    });
+    expect(Date.parse(result.body.session.updatedAt ?? "")).toBeGreaterThan(
+      Date.parse(existing.endedAt ?? ""),
+    );
+    expect(await kv.get<Session>(KV.sessions, existing.id)).toEqual(
+      result.body.session,
+    );
   });
 
   it("preserves commitShas when resuming a session", async () => {
