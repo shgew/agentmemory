@@ -269,6 +269,37 @@ describe("session sweep final summary", () => {
     expect(await kv.get<Session>(KV.sessions, sessionId)).toMatchObject({ status: "completed" });
   });
 
+  it.each(["no_provider", "no_observations"] as const)(
+    "completes a no-delta session after permanent summarize no-op: %s",
+    async (error) => {
+      const sessionId = `ses_permanent_noop_${error}`;
+      const observationCount = error === "no_observations" ? 0 : 1;
+      const provider = makeProvider();
+      const { sdk, kv } = await setupSession(
+        sessionId,
+        observationCount,
+        observationCount,
+        provider,
+      );
+      sdk.registerFunction("mem::summarize", async () => ({ success: false, error }));
+
+      const finalized = await sdk.trigger({
+        function_id: "mem::session-sweep",
+        payload: { sessionIds: [sessionId], mode: "finalize" },
+      });
+      const repeated = await sdk.trigger({
+        function_id: "mem::session-sweep",
+        payload: { sessionIds: [sessionId], mode: "finalize" },
+      });
+
+      expect(finalized).toMatchObject({ swept: [sessionId], failed: [] });
+      expect(repeated).toMatchObject({ swept: [], skipped: [sessionId], failed: [] });
+      expect(sdk.calls.filter((call) => call.function_id === "mem::summarize")).toHaveLength(1);
+      expect(await kv.get<Session>(KV.sessions, sessionId)).toMatchObject({ status: "completed" });
+      expect(await kv.get<SessionSummary>(KV.summaries, sessionId)).toBeNull();
+    },
+  );
+
   it("deduplicates concurrent session end and sweep finalization inside the session queue", async () => {
     const sessionId = "ses_end_sweep_race";
     const summarizeGate = deferred();

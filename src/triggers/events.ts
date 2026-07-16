@@ -194,6 +194,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
       : Promise.resolve();
 
     let summarizeError: Error | null = null;
+    let summarizeWasNoOp = false;
     let summary: unknown;
     if (shouldSummarize) {
       try {
@@ -208,10 +209,8 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
           (summary as { success?: boolean }).success === false
         ) {
           const error = (summary as { error?: string }).error ?? "unknown";
-          if (
-            reason !== "sweep-finalize" &&
-            (error === "no_provider" || error === "no_observations")
-          ) {
+          if (error === "no_provider" || error === "no_observations") {
+            summarizeWasNoOp = true;
             logger.info("Summarize skipped as no-op, pipeline continues", {
               sessionId,
               error,
@@ -228,7 +227,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
       }
     }
 
-    if (reason === "sweep-finalize" && !summarizeError) {
+    if (reason === "sweep-finalize" && !summarizeError && !summarizeWasNoOp) {
       const summary = await kv.get<SessionSummary>(KV.summaries, sessionId);
       if (
         !summary ||
