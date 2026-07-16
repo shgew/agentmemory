@@ -9,6 +9,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { renderViewerDocument } from "./document.js";
 import { timingSafeCompare } from "../auth.js";
+import { getEnvVar } from "../config.js";
 
 // Self-host the viewer favicon at /favicon.svg instead of an inline
 // data: URI so the viewer CSP can stay tight at `img-src 'self'`.
@@ -34,7 +35,7 @@ function loadViewerFavicon(): Buffer | null {
 const VIEWER_FAVICON: Buffer | null = loadViewerFavicon();
 
 const ALLOWED_ORIGINS = (
-  process.env.VIEWER_ALLOWED_ORIGINS ||
+  getEnvVar("VIEWER_ALLOWED_ORIGINS") ||
   "http://localhost:3111,http://localhost:3113,http://127.0.0.1:3111,http://127.0.0.1:3113"
 )
   .split(",")
@@ -58,14 +59,14 @@ const ALLOWED_ORIGINS = (
 // cache miss for the in-process `allowedHosts` set, so production env
 // changes after the first request require a restart.
 function readAllowedHostsOverride(): string[] {
-  return (process.env.VIEWER_ALLOWED_HOSTS || "")
+  return (getEnvVar("VIEWER_ALLOWED_HOSTS") || "")
     .split(",")
     .map((h) => h.trim().toLowerCase())
     .filter(Boolean);
 }
 
 export function resolveViewerHost(): string {
-  return process.env.AGENTMEMORY_VIEWER_HOST?.trim() || "127.0.0.1";
+  return getEnvVar("AGENTMEMORY_VIEWER_HOST")?.trim() || "127.0.0.1";
 }
 
 export function isLoopbackHost(host: string): boolean {

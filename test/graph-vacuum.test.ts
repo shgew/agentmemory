@@ -4,7 +4,11 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { registerGraphFunction, applyDegreeDelta } from "../src/functions/graph.js";
+import {
+  applyDegreeDelta,
+  recordGraphTombstone,
+  registerGraphFunction,
+} from "../src/functions/graph.js";
 import { KV } from "../src/state/schema.js";
 import type { GraphNode, GraphEdge, GraphSnapshot } from "../src/types.js";
 
@@ -254,6 +258,60 @@ describe("mem::graph-vacuum", () => {
     expect(await kv.get(KV.graphTombstones, "ge_live")).toBeNull();
   });
 
+  it("skips deletion when provenance changes without changing source count", async () => {
+    const { kv, sdk } = setup();
+    const liveNode = {
+      ...node("gn_live", "concept", "bar"),
+      sourceObservationIds: ["obs_new"],
+    };
+    await kv.set(KV.graphNodes, liveNode.id, liveNode);
+    await recordGraphTombstone(kv as never, {
+      id: liveNode.id,
+      kind: "node",
+      reason: "prune",
+      indexKey: nameKey(liveNode.type, liveNode.name),
+      observedSourceIds: ["obs_old"],
+    });
+
+    const result = (await sdk.trigger("mem::graph-vacuum", {})) as {
+      deletedNodes: number;
+      skippedStale: number;
+    };
+
+    expect(result.deletedNodes).toBe(0);
+    expect(result.skippedStale).toBe(1);
+    expect(await kv.get(KV.graphNodes, liveNode.id)).toEqual(liveNode);
+    expect(await kv.get(KV.graphTombstones, liveNode.id)).toBeNull();
+  });
+
+  it("clears an already-deleted prune row without a graph snapshot", async () => {
+    const { kv, sdk } = setup();
+    await kv.set(KV.graphNameIndex, "concept|missing", "gn_missing");
+    await kv.set(KV.graphTombstones, "gn_missing", {
+      id: "gn_missing",
+      kind: "node",
+      reason: "prune",
+      indexKey: "concept|missing",
+      tombstonedAt: "2026-04-01T00:00:00Z",
+      observedSourceCount: 1,
+      nodeType: "concept",
+    });
+
+    const result = (await sdk.trigger("mem::graph-vacuum", {})) as {
+      success: boolean;
+      skippedStale: number;
+      remaining: number;
+    };
+
+    expect(result).toMatchObject({
+      success: true,
+      skippedStale: 1,
+      remaining: 0,
+    });
+    expect(await kv.get(KV.graphNameIndex, "concept|missing")).toBeNull();
+    expect(await kv.get(KV.graphTombstones, "gn_missing")).toBeNull();
+  });
+
   it("deletes a prune-tombstoned node when its sourceObservationIds length is unchanged", async () => {
     const { kv, sdk } = setup();
     await kv.set(KV.graphNodes, "gn_dead", {
@@ -322,6 +380,106 @@ describe("mem::graph-vacuum", () => {
     expect(snap!.stats.totalNodes).toBe(10);
   });
 
+  it("removes a pruned edge from the snapshot and decrements endpoint degrees", async () => {
+    const { kv, sdk } = setup();
+    const left = node("left");
+    const right = node("right");
+    const doomed = {
+      ...edge("ge_top", left.id, right.id),
+      sourceObservationIds: ["gone"],
+    };
+    await kv.set(KV.graphNodes, left.id, left);
+    await kv.set(KV.graphNodes, right.id, right);
+    await kv.set(KV.graphNodeDegree, left.id, 1);
+    await kv.set(KV.graphNodeDegree, right.id, 1);
+    await kv.set(KV.graphEdges, doomed.id, doomed);
+    await kv.set(
+      KV.graphEdgeKey,
+      edgeKey(left.id, right.id, doomed.type),
+      doomed.id,
+    );
+    await kv.set(KV.graphSnapshot, "current", {
+      version: 1,
+      topNodes: [left, right],
+      topEdges: [doomed],
+      topDegrees: { left: 1, right: 1 },
+      stats: {
+        totalNodes: 2,
+        totalEdges: 1,
+        nodesByType: { concept: 2 },
+        edgesByType: { related_to: 1 },
+      },
+      updatedAt: "2026-04-01T00:00:00Z",
+      dirty: false,
+    });
+    await kv.set(KV.graphTombstones, doomed.id, {
+      id: doomed.id,
+      kind: "edge",
+      reason: "prune",
+      indexKey: edgeKey(left.id, right.id, doomed.type),
+      tombstonedAt: "2026-04-01T00:00:00Z",
+      observedSourceCount: 1,
+    });
+
+    await sdk.trigger("mem::graph-vacuum", {});
+
+    const snap = await kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
+    expect(snap?.topEdges).toEqual([]);
+    expect(snap?.topDegrees).toMatchObject({ left: 0, right: 0 });
+    expect(snap?.stats.totalEdges).toBe(0);
+    expect(await kv.get(KV.graphNodeDegree, left.id)).toBe(0);
+    expect(await kv.get(KV.graphNodeDegree, right.id)).toBe(0);
+  });
+
+  it("repairs snapshot state when a pruned edge row is already missing", async () => {
+    const { kv, sdk } = setup();
+    const left = node("left");
+    const right = node("right");
+    const missing = edge("ge_missing", left.id, right.id);
+    await kv.set(KV.graphNodes, left.id, left);
+    await kv.set(KV.graphNodes, right.id, right);
+    await kv.set(KV.graphNodeDegree, left.id, 1);
+    await kv.set(KV.graphNodeDegree, right.id, 1);
+    await kv.set(KV.graphSnapshot, "current", {
+      version: 1,
+      topNodes: [left, right],
+      topEdges: [missing],
+      topDegrees: { left: 1, right: 1 },
+      stats: {
+        totalNodes: 2,
+        totalEdges: 1,
+        nodesByType: { concept: 2 },
+        edgesByType: { related_to: 1 },
+      },
+      updatedAt: "2026-04-01T00:00:00Z",
+      dirty: false,
+    });
+    await kv.set(KV.graphTombstones, missing.id, {
+      id: missing.id,
+      kind: "edge",
+      reason: "prune",
+      indexKey: edgeKey(left.id, right.id, missing.type),
+      tombstonedAt: "2026-04-01T00:00:00Z",
+      observedSourceCount: 0,
+      edgeType: missing.type,
+      sourceNodeId: left.id,
+      targetNodeId: right.id,
+    });
+
+    const result = (await sdk.trigger("mem::graph-vacuum", {})) as {
+      success: boolean;
+      skippedStale: number;
+    };
+
+    expect(result.success).toBe(true);
+    expect(result.skippedStale).toBe(1);
+    const snapshot = await kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
+    expect(snapshot?.topEdges).toEqual([]);
+    expect(snapshot?.topDegrees).toEqual({ left: 0, right: 0 });
+    expect(snapshot?.stats.totalEdges).toBe(0);
+    expect(await kv.get(KV.graphTombstones, missing.id)).toBeNull();
+  });
+
   it("decrements snapshot stats when it deletes a prune node", async () => {
     const { kv, sdk } = setup();
     await kv.set(KV.graphSnapshot, "current", {
@@ -358,6 +516,48 @@ describe("mem::graph-vacuum", () => {
     expect(snap!.stats.totalNodes).toBe(9);
     expect(snap!.stats.nodesByType.concept).toBe(9);
     expect(snap!.stats.totalEdges).toBe(5);
+  });
+
+  it("removes a pruned node and its incident edges from the snapshot", async () => {
+    const { kv, sdk } = setup();
+    const doomed = {
+      ...node("gn_top"),
+      sourceObservationIds: ["gone"],
+    };
+    const survivor = node("gn_keep");
+    const incident = edge("ge_incident", doomed.id, survivor.id);
+    await kv.set(KV.graphNodes, doomed.id, doomed);
+    await kv.set(KV.graphNameIndex, nameKey(doomed.type, doomed.name), doomed.id);
+    await kv.set(KV.graphSnapshot, "current", {
+      version: 1,
+      topNodes: [doomed, survivor],
+      topEdges: [incident],
+      topDegrees: { gn_top: 1, gn_keep: 1 },
+      stats: {
+        totalNodes: 2,
+        totalEdges: 1,
+        nodesByType: { concept: 2 },
+        edgesByType: { related_to: 1 },
+      },
+      updatedAt: "2026-04-01T00:00:00Z",
+      dirty: false,
+    });
+    await kv.set(KV.graphTombstones, doomed.id, {
+      id: doomed.id,
+      kind: "node",
+      reason: "prune",
+      indexKey: nameKey(doomed.type, doomed.name),
+      tombstonedAt: "2026-04-01T00:00:00Z",
+      observedSourceCount: 1,
+    });
+
+    await sdk.trigger("mem::graph-vacuum", {});
+
+    const snap = await kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
+    expect(snap?.topNodes.map((item) => item.id)).toEqual([survivor.id]);
+    expect(snap?.topEdges).toEqual([]);
+    expect(snap?.topDegrees).not.toHaveProperty(doomed.id);
+    expect(snap?.stats.totalNodes).toBe(1);
   });
 
   it("does NOT decrement snapshot stats for a non-prune (cascade) deletion", async () => {
@@ -493,6 +693,56 @@ describe("graph-extract orphan tombstoning", () => {
     expect(repointed).not.toBe("gn_orphan");
     expect(repointed).toBeTruthy();
   });
+
+  it("cancels a tombstone when extraction revives the same canonical row", async () => {
+    const { kv, sdk } = setup();
+    provider.compress.mockResolvedValue('<entity type="concept" name="foo"/>');
+    const observation = {
+      id: "obs1",
+      sessionId: "s",
+      timestamp: "2026-06-15T00:00:00Z",
+      type: "file_read",
+      title: "t",
+      facts: [],
+      narrative: "n",
+      concepts: [],
+      files: [],
+      importance: 0.5,
+    };
+    await sdk.trigger("mem::graph-extract", { observations: [observation] });
+    const [stored] = await kv.list<GraphNode>(KV.graphNodes);
+    const snapshot = await kv.get<GraphSnapshot>(KV.graphSnapshot, "current");
+    snapshot!.topNodes = [];
+    snapshot!.topDegrees = {};
+    snapshot!.stats.totalNodes = 0;
+    snapshot!.stats.nodesByType = {};
+    await kv.set(KV.graphSnapshot, "current", snapshot!);
+    await kv.set(KV.graphTombstones, stored.id, {
+      id: stored.id,
+      kind: "node",
+      reason: "retention",
+      indexKey: nameKey(stored.type, stored.name),
+      tombstonedAt: "2026-06-15T00:00:00Z",
+      observedSourceCount: 1,
+    });
+
+    await sdk.trigger("mem::graph-extract", {
+      observations: [{ ...observation, id: "obs2" }],
+    });
+
+    expect(await kv.get(KV.graphTombstones, stored.id)).toBeNull();
+    const revived = await kv.get<GraphNode>(KV.graphNodes, stored.id);
+    expect(revived?.stale).toBe(false);
+    expect(revived?.sourceObservationIds.sort()).toEqual(["obs1", "obs2"]);
+    const revivedSnapshot = await kv.get<GraphSnapshot>(
+      KV.graphSnapshot,
+      "current",
+    );
+    expect(revivedSnapshot?.stats.totalNodes).toBe(1);
+    expect(revivedSnapshot?.topNodes.map((item) => item.id)).toEqual([
+      stored.id,
+    ]);
+  });
 });
 
 describe("retention cap (AGENTMEMORY_GRAPH_RETENTION_CAP)", () => {
@@ -533,12 +783,17 @@ describe("retention cap (AGENTMEMORY_GRAPH_RETENTION_CAP)", () => {
 
     await applyDegreeDelta(kv as never, snap, "gn_hot", 1);
 
-    const tombs = await kv.list<{ reason: string; kind: string }>(
+    const tombs = await kv.list<{
+      reason: string;
+      kind: string;
+      observedSourceCount?: number;
+    }>(
       KV.graphTombstones,
     );
     expect(tombs.length).toBe(1);
     expect(tombs[0].reason).toBe("retention");
     expect(tombs[0].kind).toBe("node");
+    expect(tombs[0].observedSourceCount).toBe(0);
     expect(snap.stats.totalNodes).toBe(499);
     expect(snap.topNodes.some((n) => n.id === "gn_hot")).toBe(true);
     expect(snap.topNodes.some((n) => n.id === "t499")).toBe(false);

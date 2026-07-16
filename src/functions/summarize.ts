@@ -21,11 +21,15 @@ import type { MetricsStore } from "../eval/metrics-store.js";
 import { safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import { isAtOrBefore } from "../state/timestamp-compare.js";
+import { getEnvVar } from "../config.js";
+import { drainPendingCompression } from "./pending-compression.js";
+import { parseIntervalMs } from "../state/cron.js";
 
 // Per-chunk observation budget when a session is too large to fit in one
 // LLM call. Default ≈ 50k input tokens per chunk at ~110 tok/obs — fits
 // comfortably in 128k-window models. Override via SUMMARIZE_CHUNK_SIZE.
 const CHUNK_SIZE_DEFAULT = 400;
+const CHUNK_SIZE_MAX = 10_000;
 // Concurrent in-flight chunk calls. 6 keeps a 100-chunk session under
 // the default AGENTMEMORY_SUMMARIZE_TIMEOUT_MS budget (180s) at
 // ~8s/call while staying inside generous-but-not-unlimited provider
@@ -33,6 +37,7 @@ const CHUNK_SIZE_DEFAULT = 400;
 // providers (Novita / DeepInfra / DeepSeek) typically allow 100+
 // concurrent; set SUMMARIZE_CHUNK_CONCURRENCY higher for larger sessions.
 const CHUNK_CONCURRENCY_DEFAULT = 6;
+const CHUNK_CONCURRENCY_MAX = 128;
 // Bail on the merged summary if more than this fraction of chunks fail
 // to parse — a half-blind narrative is worse than a clean error.
 const MAX_SKIP_RATIO = 0.5;
@@ -44,25 +49,40 @@ const MAX_SKIP_RATIO = 0.5;
 // bulk-imported sessions (100+ chunks).
 const SUMMARIZE_TIMEOUT_MS_DEFAULT = 180_000;
 
+function positiveInteger(
+  raw: string | undefined,
+  fallback: number,
+  max = Number.MAX_SAFE_INTEGER,
+): number {
+  const value = raw?.trim();
+  if (!value || !/^\d+$/.test(value)) return fallback;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= max
+    ? parsed
+    : fallback;
+}
+
 function getChunkSize(): number {
-  const raw = process.env.SUMMARIZE_CHUNK_SIZE;
-  if (!raw) return CHUNK_SIZE_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : CHUNK_SIZE_DEFAULT;
+  return positiveInteger(
+    getEnvVar("SUMMARIZE_CHUNK_SIZE"),
+    CHUNK_SIZE_DEFAULT,
+    CHUNK_SIZE_MAX,
+  );
 }
 
 function getChunkConcurrency(): number {
-  const raw = process.env.SUMMARIZE_CHUNK_CONCURRENCY;
-  if (!raw) return CHUNK_CONCURRENCY_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : CHUNK_CONCURRENCY_DEFAULT;
+  return positiveInteger(
+    getEnvVar("SUMMARIZE_CHUNK_CONCURRENCY"),
+    CHUNK_CONCURRENCY_DEFAULT,
+    CHUNK_CONCURRENCY_MAX,
+  );
 }
 
 export function getSummarizeTimeoutMs(): number {
-  const raw = process.env.AGENTMEMORY_SUMMARIZE_TIMEOUT_MS;
-  if (!raw) return SUMMARIZE_TIMEOUT_MS_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : SUMMARIZE_TIMEOUT_MS_DEFAULT;
+  return parseIntervalMs(
+    getEnvVar("AGENTMEMORY_SUMMARIZE_TIMEOUT_MS"),
+    SUMMARIZE_TIMEOUT_MS_DEFAULT,
+  );
 }
 
 // One chunk call with retry-once. Returns null when both attempts fail —
@@ -146,8 +166,14 @@ async function produceSummaryXml(
   // Sparse array preserves chunk → index mapping after parallel resolution,
   // so the reduce step sees partials in chronological order even when some
   // were skipped.
-  const partialByIdx: Array<SessionSummary | null> = new Array(chunks.length).fill(null);
-  for (let batchStart = 0; batchStart < chunks.length; batchStart += concurrency) {
+  const partialByIdx: Array<SessionSummary | null> = new Array(
+    chunks.length,
+  ).fill(null);
+  for (
+    let batchStart = 0;
+    batchStart < chunks.length;
+    batchStart += concurrency
+  ) {
     const batch = chunks.slice(batchStart, batchStart + concurrency);
     await Promise.all(
       batch.map(async (chunk, j) => {
@@ -247,10 +273,15 @@ export function registerSummarizeFunction(
   provider: MemoryProvider,
   metricsStore?: MetricsStore,
 ): void {
-  sdk.registerFunction("mem::summarize", 
+  sdk.registerFunction(
+    "mem::summarize",
     async (data: { sessionId: string; until?: string } | undefined) => {
       const startMs = Date.now();
-      if (!data || typeof data.sessionId !== "string" || !data.sessionId.trim()) {
+      if (
+        !data ||
+        typeof data.sessionId !== "string" ||
+        !data.sessionId.trim()
+      ) {
         return { success: false, error: "sessionId is required" };
       }
       const sessionId = data.sessionId.trim();
@@ -263,12 +294,46 @@ export function registerSummarizeFunction(
         return { success: false, error: "session_not_found" };
       }
 
+      let recoveredPending = false;
+      try {
+        const drain = await drainPendingCompression(sdk, kv, sessionId);
+        if (drain.remainingIds.length > 0) {
+          const latencyMs = Date.now() - startMs;
+          if (metricsStore) {
+            await metricsStore.record("mem::summarize", latencyMs, false);
+          }
+          logger.warn("Summarize deferred by pending compression", {
+            sessionId,
+            attempted: drain.attempted,
+            completed: drain.completed,
+            remaining: drain.remainingIds.length,
+          });
+          return {
+            success: false,
+            error: "pending_compression_failed",
+            pendingObservationIds: drain.remainingIds,
+          };
+        }
+        recoveredPending = drain.completed > 0;
+      } catch (error) {
+        const latencyMs = Date.now() - startMs;
+        if (metricsStore) {
+          await metricsStore.record("mem::summarize", latencyMs, false);
+        }
+        logger.error("Pending compression drain failed", {
+          sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return { success: false, error: "pending_compression_failed" };
+      }
+
+      const summaryUntil = recoveredPending ? undefined : data.until;
       const observations = await kv.list<CompressedObservation>(
         KV.observations(sessionId),
       );
-      const until = data?.until;
-      const compressed = observations.filter((o) =>
-        o.title && (!until || isAtOrBefore(o.timestamp, until)),
+      const compressed = observations.filter(
+        (o) =>
+          o.title && (!summaryUntil || isAtOrBefore(o.timestamp, summaryUntil)),
       );
 
       if (compressed.length === 0) {

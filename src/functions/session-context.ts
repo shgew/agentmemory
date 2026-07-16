@@ -36,16 +36,26 @@ async function buildSubagentRollup(
   const children = sessions.filter(
     (session) =>
       session.parentSessionId === parentSessionId &&
-      session.project === parent.project,
+      session.project === parent.project &&
+      session.agentId === parent.agentId,
   );
   if (children.length === 0) return null;
 
+  const visibleChildren = children
+    .slice()
+    .sort((left, right) =>
+      (right.updatedAt ?? right.startedAt).localeCompare(
+        left.updatedAt ?? left.startedAt,
+      ),
+    )
+    .slice(0, 20);
+
   const summaries = await Promise.all(
-    children.map((child) =>
+    visibleChildren.map((child) =>
       kv.get<SessionSummary>(KV.summaries, child.id).catch(() => null),
     ),
   );
-  const labels = children.map((child, index) => {
+  const labels = visibleChildren.map((child, index) => {
     const summary = summaries[index];
     return summary?.title ?? child.summary ?? child.firstPrompt ?? child.id.slice(0, 8);
   });
@@ -57,10 +67,12 @@ async function buildSubagentRollup(
     0,
   );
   const taskLines = labels.map((label) => `- ${escapeXmlText(label)}`).join("\n");
+  const omitted = children.length - visibleChildren.length;
+  const omittedLine = omitted > 0 ? `\n- ${omitted} more tasks` : "";
   const filesLine = files.length > 0
     ? `\nKey files touched: ${files.map(escapeXmlText).join(", ")}`
     : "";
-  const content = `<subagent-activity-summary task-count="${children.length}" observation-count="${observationCount}">\n## Subagent activity summary\nTasks:\n${taskLines}${filesLine}\n</subagent-activity-summary>`;
+  const content = `<subagent-activity-summary task-count="${children.length}" observation-count="${observationCount}">\n## Subagent activity summary\nTasks:\n${taskLines}${omittedLine}${filesLine}\n</subagent-activity-summary>`;
   const recency = children.reduce((latest, child) => {
     const timestamp = new Date(
       child.updatedAt ?? child.endedAt ?? child.startedAt,
@@ -82,6 +94,10 @@ export async function buildSessionContextBlocks(
   input: SessionContextInput,
 ): Promise<ContextBlock[]> {
   const allSessions = await kv.list<Session>(KV.sessions);
+  const currentSession = allSessions.find(
+    (session) => session.id === input.sessionId,
+  );
+  if (!currentSession) return [];
   const blocks: ContextBlock[] = [];
   const subagentRollup = await buildSubagentRollup(
     kv,
@@ -93,7 +109,8 @@ export async function buildSessionContextBlocks(
   const sessions = allSessions
     .filter(
       (session) =>
-        session.project === input.project &&
+        session.project === currentSession.project &&
+        session.agentId === currentSession.agentId &&
         session.id !== input.sessionId &&
         !session.parentSessionId,
     )

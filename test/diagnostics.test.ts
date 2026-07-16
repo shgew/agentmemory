@@ -868,7 +868,7 @@ describe("Diagnostics Functions", () => {
 });
 
 
-describe("diagnose — completed session with uncheckpointed activity (Option K)", () => {
+describe("diagnose completed session with uncheckpointed activity", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
 

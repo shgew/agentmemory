@@ -41,7 +41,17 @@ function wireContext(kv: ReturnType<typeof mockKV>) {
   } as unknown as import("iii-sdk").ISdk;
   registerContextFunction(sdk, kv as never, 2000);
   if (!handler) throw new Error("mem::context not registered");
-  return handler;
+  return async (data: Parameters<ContextHandler>[0]) => {
+    await kv.set(KV.sessions, data.sessionId, {
+      id: data.sessionId,
+      project: data.project,
+      cwd: data.project,
+      startedAt: new Date().toISOString(),
+      status: "active",
+      observationCount: 0,
+    });
+    return handler(data);
+  };
 }
 
 async function seedPinnedSlot(

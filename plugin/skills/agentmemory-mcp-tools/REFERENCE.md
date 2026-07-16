@@ -24,41 +24,41 @@ agentmemory exposes 53 MCP tools. 8 are in the lean core set (`--tools core` or 
 | `memory_file_history` |  | `files`*: string, `sessionId`: string | Get past observations about specific files. |
 | `memory_frontier` |  | `project`: string, `agentId`: string, `limit`: number | Get all unblocked actions ranked by priority and urgency. Returns the frontier of actionable work with no unsatisfied dependencies. |
 | `memory_governance_delete` |  | `memoryIds`*: string, `reason`: string | Delete specific memories with audit trail. |
-| `memory_graph_query` |  | `startNodeId`: string, `nodeType`: string, `maxDepth`: number, `query`: string | Query the knowledge graph for entities and relationships. |
+| `memory_graph_query` |  | `startNodeId`: string, `nodeType`: string, `maxDepth`: number, `query`: string, `limit`: number, `offset`: number | Query the knowledge graph for entities and relationships. |
 | `memory_heal` |  | `categories`: string, `dryRun`: string | Auto-fix all fixable issues found by diagnostics. Unblocks stuck actions, expires stale leases, cleans up orphaned data. |
 | `memory_insight_list` |  | `project`: string, `minConfidence`: number, `limit`: number | List synthesized insights, higher-order observations derived from patterns across memories, lessons, and crystals. |
 | `memory_lease` |  | `actionId`*: string, `agentId`*: string, `operation`*: string, `result`: string, `ttlMs`: number | Acquire, release, or renew an exclusive lease on an action. Prevents multiple agents from working on the same thing. |
 | `memory_lesson_recall` |  | `query`*: string, `project`: string, `minConfidence`: number, `limit`: number | Search lessons by query. Returns lessons sorted by confidence and recency. Use to check what the agent has learned before making decisions. |
-| `memory_lesson_save` | yes | `content`*: string, `context`: string, `confidence`: number, `project`: string, `tags`: string | Save a lesson learned from this session. Lessons have confidence scores that strengthen when reinforced and decay when not used. Duplicate content auto-strengthens the existing lesson. |
+| `memory_lesson_save` | yes | `content`*: string, `context`: string, `confidence`: number, `project`: string, `tags`: string, `corrects`: string | Save or correct a lesson. Same-project exact and near-duplicate content strengthens the existing lesson; corrected lessons are superseded in recall. |
 | `memory_mesh_sync` |  | `peerId`: string, `direction`: string | Sync memories and actions with peer agentmemory instances for multi-agent collaboration. |
 | `memory_next` |  | `project`: string, `agentId`: string | Get the single most important next action to work on. Combines dependency resolution, priority, and recency into a score. |
 | `memory_obsidian_export` |  | `vaultDir`: string, `types`: string | Export memories, lessons, and crystals as Obsidian-compatible Markdown files with YAML frontmatter and wikilinks for graph view. |
 | `memory_patterns` |  | `project`: string | Detect recurring patterns across sessions. |
 | `memory_profile` |  | `project`*: string, `refresh`: string | User/project profile with top concepts and file patterns. |
-| `memory_recall` | yes | `query`*: string, `limit`: number, `format`: string, `token_budget`: number | Search past session observations for relevant context. Use when you need to recall what happened in previous sessions, find past decisions, or look up how a file was modified before. |
+| `memory_recall` | yes | `query`*: string, `limit`: number, `format`: string, `token_budget`: number, `project`: string | Search past session observations for relevant context. Use when you need to recall what happened in previous sessions, find past decisions, or look up how a file was modified before. |
 | `memory_reflect` | yes | `project`: string, `maxClusters`: number | Traverse the knowledge graph, group related memories by concept clusters, and synthesize higher-order insights via LLM. Returns new and reinforced insights. |
-| `memory_relations` |  | `memoryId`*: string, `maxHops`: number, `minConfidence`: number | Query the memory relationship graph. |
+| `memory_relations` |  | `memoryId`*: string, `maxHops`: number, `minConfidence`: number | Query memory relationships or a lesson correction chain. |
 | `memory_routine_run` |  | `routineId`*: string, `project`: string, `initiatedBy`: string | Instantiate a frozen workflow routine, creating actions for each step with proper dependencies. |
 | `memory_save` | yes | `content`*: string, `type`: string, `concepts`: string, `files`: string, `project`: string | Explicitly save an important insight, decision, or pattern to long-term memory. |
 | `memory_sentinel_create` |  | `name`*: string, `type`*: string, `config`: string, `linkedActionIds`: string, `expiresInMs`: number | Create an event-driven sentinel that watches for conditions (webhook, timer, threshold, pattern, approval) and auto-unblocks gated actions when triggered. |
 | `memory_sentinel_trigger` |  | `sentinelId`*: string, `result`: string | Externally fire a sentinel, providing an optional result payload. Unblocks any gated actions. |
-| `memory_sessions` | yes | none | List recent sessions with their status and observation counts. |
+| `memory_sessions` | yes | `limit`: number, `agentId`: string, `includeSubagents`: boolean | List recent sessions with their status and observation counts. |
 | `memory_signal_read` |  | `agentId`*: string, `unreadOnly`: string, `threadId`: string, `limit`: number | Read messages for an agent. Marks delivered messages as read. |
 | `memory_signal_send` |  | `from`*: string, `to`: string, `content`*: string, `type`: string, `replyTo`: string | Send a message to another agent or broadcast. Supports threading, typed messages, and TTL expiration. |
 | `memory_sketch_create` |  | `title`*: string, `description`: string, `expiresInMs`: number, `project`: string | Create an ephemeral action graph for exploratory work. Auto-expires after TTL. Can be promoted to permanent actions or discarded. |
 | `memory_sketch_promote` |  | `sketchId`*: string, `project`: string | Promote a sketch's ephemeral actions to permanent actions. Makes the exploratory work official. |
-| `memory_slot_append` |  | `label`*: string, `text`*: string | Append text to an existing slot. Fails with 413 if the append would exceed the slot's sizeLimit, agent must compact via memory_slot_replace first. |
-| `memory_slot_create` |  | `label`*: string, `content`: string, `sizeLimit`: number, `description`: string, `pinned`: string, `scope`: string | Create a new slot. Reject if a slot with the same label already exists. |
-| `memory_slot_delete` |  | `label`*: string | Delete a slot. Seeded default slots can be deleted unless marked readOnly. |
-| `memory_slot_get` |  | `label`*: string | Read a single slot by label. |
-| `memory_slot_list` |  | none | List all memory slots (pinned + project + global). Slots are editable, size-limited memory units the agent can read and modify across sessions. |
-| `memory_slot_replace` |  | `label`*: string, `content`*: string | Replace slot content in place. Fails if content exceeds sizeLimit. |
-| `memory_smart_search` | yes | `query`*: string, `expandIds`: string, `limit`: number | Hybrid semantic+keyword search with progressive disclosure. |
+| `memory_slot_append` |  | `label`*: string, `text`*: string, `project`: string | Append text to an existing slot. Fails with 413 if the append would exceed the slot's sizeLimit, agent must compact via memory_slot_replace first. |
+| `memory_slot_create` |  | `label`*: string, `content`: string, `sizeLimit`: number, `description`: string, `pinned`: string, `scope`: string, `project`: string | Create a new slot. Reject if a slot with the same label already exists. |
+| `memory_slot_delete` |  | `label`*: string, `project`: string | Delete a slot. Seeded default slots can be deleted unless marked readOnly. |
+| `memory_slot_get` |  | `label`*: string, `project`: string, `legacyUnscoped`: boolean | Read a single slot by label. |
+| `memory_slot_list` |  | `project`*: string | List global slots plus slots for one explicit project. Project-scoped slots are never resolved from cwd. |
+| `memory_slot_replace` |  | `label`*: string, `content`*: string, `project`: string | Replace slot content in place. Fails if content exceeds sizeLimit. |
+| `memory_smart_search` | yes | `query`*: string, `expandIds`: string, `limit`: number, `project`: string | Hybrid semantic+keyword search with progressive disclosure. |
 | `memory_snapshot_create` |  | `message`: string | Create a git-versioned snapshot of current memory state. |
 | `memory_team_feed` |  | `limit`: number | Get recent shared items from all team members. |
 | `memory_team_share` |  | `itemId`*: string, `itemType`*: string | Share a memory or observation with team members. |
 | `memory_timeline` |  | `anchor`*: string, `project`: string, `before`: number, `after`: number | Chronological observations around an anchor point. |
-| `memory_verify` |  | `id`*: string | Verify a memory or observation by tracing its citation chain back to source observations and session context. Returns provenance information including confidence scores. |
+| `memory_verify` |  | `id`*: string | Verify a memory, lesson, or observation by tracing its citation or correction chain and source context. |
 | `memory_vision_search` |  | `queryText`: string, `queryImageRef`: string, `queryImageBase64`: string, `topK`: number, `sessionId`: string | Cross-modal image search via CLIP embeddings. Pass queryText to find screenshots matching a description, or queryImageBase64/queryImageRef to find similar images. Requires AGENTMEMORY_IMAGE_EMBEDDINGS=true. |
 
 `*` marks required parameters.

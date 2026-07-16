@@ -7,6 +7,7 @@ import {
   buildViewerCsp,
 } from "../auth.js";
 import { VERSION } from "../version.js";
+import { getEnvVar } from "../config.js";
 
 const VIEWER_VERSION_PLACEHOLDER = "__AGENTMEMORY_VERSION__";
 const VIEWER_CONFIG_SCRIPT_PLACEHOLDER = "__AGENTMEMORY_VIEWER_CONFIG_SCRIPT__";
@@ -19,8 +20,8 @@ function parsePositiveNumber(raw: string | undefined): number | null {
 }
 
 function buildViewerConfigScript(nonce: string): string {
-  const warningMs = parsePositiveNumber(process.env.AGENTMEMORY_AVG_LATENCY_WARNING_MS);
-  const criticalMs = parsePositiveNumber(process.env.AGENTMEMORY_AVG_LATENCY_CRITICAL_MS);
+  const warningMs = parsePositiveNumber(getEnvVar("AGENTMEMORY_AVG_LATENCY_WARNING_MS"));
+  const criticalMs = parsePositiveNumber(getEnvVar("AGENTMEMORY_AVG_LATENCY_CRITICAL_MS"));
   const avgLatencyThresholds: Record<string, number> = {};
   if (warningMs !== null) avgLatencyThresholds.warningMs = warningMs;
   if (criticalMs !== null) avgLatencyThresholds.criticalMs = criticalMs;

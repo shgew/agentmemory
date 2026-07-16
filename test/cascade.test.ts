@@ -5,8 +5,40 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerCascadeFunction } from "../src/functions/cascade.js";
-import type { Memory, GraphNode, GraphEdge } from "../src/types.js";
+import type {
+  Memory,
+  GraphNode,
+  GraphEdge,
+  GraphSnapshot,
+} from "../src/types.js";
 import { mockKV, mockSdk } from "./helpers/mocks.js";
+
+async function seedGraphSnapshot(
+  kv: ReturnType<typeof mockKV>,
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+): Promise<void> {
+  const topDegrees: Record<string, number> = {};
+  for (const node of nodes) topDegrees[node.id] = 0;
+  for (const edge of edges) {
+    topDegrees[edge.sourceNodeId] = (topDegrees[edge.sourceNodeId] ?? 0) + 1;
+    topDegrees[edge.targetNodeId] = (topDegrees[edge.targetNodeId] ?? 0) + 1;
+  }
+  await kv.set("mem:graph:snapshot", "current", {
+    version: 1,
+    topNodes: nodes,
+    topEdges: edges,
+    topDegrees,
+    stats: {
+      totalNodes: nodes.filter((node) => !node.stale).length,
+      totalEdges: edges.filter((edge) => !edge.stale).length,
+      nodesByType: {},
+      edgesByType: {},
+    },
+    updatedAt: "2026-03-01T00:00:00Z",
+    dirty: false,
+  });
+}
 
 describe("Cascade Update Function", () => {
   let sdk: ReturnType<typeof mockSdk>;
@@ -34,6 +66,44 @@ describe("Cascade Update Function", () => {
     })) as { success: boolean; error: string };
     expect(result.success).toBe(false);
     expect(result.error).toBe("superseded memory not found");
+  });
+
+  it("refuses graph mutation when the snapshot is unavailable", async () => {
+    const memory: Memory = {
+      id: "mem_no_snapshot",
+      createdAt: "2026-03-01T00:00:00Z",
+      updatedAt: "2026-03-01T00:00:00Z",
+      type: "fact",
+      title: "Old fact",
+      content: "Old content",
+      concepts: [],
+      files: [],
+      sessionIds: [],
+      strength: 5,
+      version: 1,
+      isLatest: false,
+      sourceObservationIds: ["obs_a"],
+    };
+    const node: GraphNode = {
+      id: "node_no_snapshot",
+      type: "concept",
+      name: "react",
+      properties: {},
+      sourceObservationIds: ["obs_a"],
+      createdAt: "2026-03-01T00:00:00Z",
+    };
+    await kv.set("mem:memories", memory.id, memory);
+    await kv.set("mem:graph:nodes", node.id, node);
+
+    const result = (await sdk.trigger("mem::cascade-update", {
+      supersededMemoryId: memory.id,
+    })) as { success: boolean; error: string };
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/snapshot unavailable/);
+    expect(
+      (await kv.get<GraphNode>("mem:graph:nodes", node.id))?.stale,
+    ).toBeUndefined();
   });
 
   it("flags graph nodes referencing superseded observation IDs", async () => {
@@ -73,6 +143,7 @@ describe("Cascade Update Function", () => {
       createdAt: "2026-03-01T00:00:00Z",
     };
     await kv.set("mem:graph:nodes", "node_2", unrelatedNode);
+    await seedGraphSnapshot(kv, [node, unrelatedNode], []);
 
     const result = (await sdk.trigger("mem::cascade-update", {
       supersededMemoryId: "mem_old",
@@ -86,6 +157,11 @@ describe("Cascade Update Function", () => {
 
     const unchanged = await kv.get<GraphNode>("mem:graph:nodes", "node_2");
     expect(unchanged!.stale).toBeUndefined();
+    const snapshot = await kv.get<{ topNodes: GraphNode[] }>(
+      "mem:graph:snapshot",
+      "current",
+    );
+    expect(snapshot?.topNodes.map((item) => item.id)).toEqual(["node_2"]);
   });
 
   it("flags graph edges referencing superseded observation IDs", async () => {
@@ -116,6 +192,7 @@ describe("Cascade Update Function", () => {
       createdAt: "2026-03-01T00:00:00Z",
     };
     await kv.set("mem:graph:edges", "edge_1", edge);
+    await seedGraphSnapshot(kv, [], [edge]);
 
     const result = (await sdk.trigger("mem::cascade-update", {
       supersededMemoryId: "mem_old2",
@@ -126,6 +203,72 @@ describe("Cascade Update Function", () => {
 
     const updated = await kv.get<GraphEdge>("mem:graph:edges", "edge_1");
     expect(updated!.stale).toBe(true);
+  });
+
+  it("flags edges whose endpoint becomes stale", async () => {
+    const memory: Memory = {
+      id: "mem_endpoint",
+      createdAt: "2026-03-01T00:00:00Z",
+      updatedAt: "2026-03-01T00:00:00Z",
+      type: "fact",
+      title: "Old endpoint",
+      content: "Old endpoint content",
+      concepts: [],
+      files: [],
+      sessionIds: [],
+      strength: 5,
+      version: 1,
+      isLatest: false,
+      sourceObservationIds: ["obs_old"],
+    };
+    const doomedNode: GraphNode = {
+      id: "node_old",
+      type: "concept",
+      name: "old",
+      properties: {},
+      sourceObservationIds: ["obs_old"],
+      createdAt: "2026-03-01T00:00:00Z",
+    };
+    const liveNode: GraphNode = {
+      id: "node_live",
+      type: "concept",
+      name: "live",
+      properties: {},
+      sourceObservationIds: ["obs_live"],
+      createdAt: "2026-03-01T00:00:00Z",
+    };
+    const incidentEdge: GraphEdge = {
+      id: "edge_incident",
+      type: "related_to",
+      sourceNodeId: doomedNode.id,
+      targetNodeId: liveNode.id,
+      weight: 1,
+      sourceObservationIds: ["obs_live"],
+      createdAt: "2026-03-01T00:00:00Z",
+    };
+    await kv.set("mem:memories", memory.id, memory);
+    await kv.set("mem:graph:nodes", doomedNode.id, doomedNode);
+    await kv.set("mem:graph:nodes", liveNode.id, liveNode);
+    await kv.set("mem:graph:edges", incidentEdge.id, incidentEdge);
+    await seedGraphSnapshot(kv, [doomedNode, liveNode], [incidentEdge]);
+
+    const result = (await sdk.trigger("mem::cascade-update", {
+      supersededMemoryId: memory.id,
+    })) as { success: boolean; flagged: { nodes: number; edges: number } };
+
+    expect(result).toMatchObject({
+      success: true,
+      flagged: { nodes: 1, edges: 1 },
+    });
+    expect(
+      (await kv.get<GraphEdge>("mem:graph:edges", incidentEdge.id))?.stale,
+    ).toBe(true);
+    const snapshot = await kv.get<GraphSnapshot>(
+      "mem:graph:snapshot",
+      "current",
+    );
+    expect(snapshot?.topEdges).toEqual([]);
+    expect(snapshot?.stats.totalEdges).toBe(0);
   });
 
   it("counts sibling memories sharing 2+ concepts", async () => {
@@ -214,6 +357,7 @@ describe("Cascade Update Function", () => {
       stale: true,
     };
     await kv.set("mem:graph:nodes", "node_stale", node);
+    await seedGraphSnapshot(kv, [node], []);
 
     const result = (await sdk.trigger("mem::cascade-update", {
       supersededMemoryId: "mem_skip",

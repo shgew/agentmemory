@@ -10,15 +10,18 @@ import type {
   GraphNode,
   GraphEdge,
   GraphQueryResult,
+  GraphSnapshot,
 } from "../src/types.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
+  const setCalls: Array<{ scope: string; key: string }> = [];
   return {
     get: async <T>(scope: string, key: string): Promise<T | null> => {
       return (store.get(scope)?.get(key) as T) ?? null;
     },
     set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+      setCalls.push({ scope, key });
       if (!store.has(scope)) store.set(scope, new Map());
       store.get(scope)!.set(key, data);
       return data;
@@ -30,6 +33,7 @@ function mockKV() {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
+    setCalls,
   };
 }
 
@@ -104,6 +108,78 @@ describe("Graph Functions", () => {
     const edges = await kv.list<GraphEdge>("mem:graph:edges");
     expect(edges.length).toBe(1);
     expect(edges[0].type).toBe("uses");
+  });
+
+  it("persists snapshot provenance when extraction only merges existing rows", async () => {
+    await sdk.trigger("mem::graph-extract", { observations: [testObs] });
+    kv.setCalls.length = 0;
+
+    await sdk.trigger("mem::graph-extract", {
+      observations: [{ ...testObs, id: "obs_2" }],
+    });
+
+    expect(
+      kv.setCalls.some(
+        (call) =>
+          call.scope === "mem:graph:snapshot" && call.key === "current",
+      ),
+    ).toBe(true);
+    const snapshot = await kv.get<{
+      topNodes: GraphNode[];
+      topEdges: GraphEdge[];
+    }>("mem:graph:snapshot", "current");
+    expect(
+      snapshot?.topNodes.every((node) =>
+        node.sourceObservationIds.includes("obs_2"),
+      ),
+    ).toBe(true);
+    expect(snapshot?.topEdges[0].sourceObservationIds).toContain("obs_2");
+  });
+
+  it("restores snapshot stats and degrees when extraction revives an edge", async () => {
+    await sdk.trigger("mem::graph-extract", { observations: [testObs] });
+    const [edge] = await kv.list<GraphEdge>("mem:graph:edges");
+    const snapshot = await kv.get<GraphSnapshot>(
+      "mem:graph:snapshot",
+      "current",
+    );
+    await kv.set("mem:graph:edges", edge.id, { ...edge, stale: true });
+    await kv.set("mem:graph:tombstones", edge.id, {
+      id: edge.id,
+      kind: "edge",
+      reason: "cascade",
+      indexKey: `${edge.sourceNodeId}|${edge.targetNodeId}|${edge.type}`,
+      tombstonedAt: "2026-02-01T10:00:00Z",
+      observedSourceCount: 1,
+      edgeType: edge.type,
+      sourceNodeId: edge.sourceNodeId,
+      targetNodeId: edge.targetNodeId,
+    });
+    snapshot!.topEdges = [];
+    snapshot!.stats.totalEdges = 0;
+    snapshot!.stats.edgesByType = {};
+    snapshot!.topDegrees[edge.sourceNodeId] = 0;
+    snapshot!.topDegrees[edge.targetNodeId] = 0;
+    await kv.set("mem:graph:node-degree", edge.sourceNodeId, 0);
+    await kv.set("mem:graph:node-degree", edge.targetNodeId, 0);
+    await kv.set("mem:graph:snapshot", "current", snapshot!);
+
+    await sdk.trigger("mem::graph-extract", {
+      observations: [{ ...testObs, id: "obs_2" }],
+    });
+
+    const revived = await kv.get<GraphEdge>("mem:graph:edges", edge.id);
+    const revivedSnapshot = await kv.get<GraphSnapshot>(
+      "mem:graph:snapshot",
+      "current",
+    );
+    expect(revived?.stale).toBe(false);
+    expect(revived?.sourceObservationIds.sort()).toEqual(["obs_1", "obs_2"]);
+    expect(revivedSnapshot?.stats.totalEdges).toBe(1);
+    expect(revivedSnapshot?.topEdges.map((item) => item.id)).toEqual([edge.id]);
+    expect(revivedSnapshot?.topDegrees[edge.sourceNodeId]).toBe(1);
+    expect(revivedSnapshot?.topDegrees[edge.targetNodeId]).toBe(1);
+    expect(await kv.get("mem:graph:tombstones", edge.id)).toBeNull();
   });
 
   it("graph-extract accepts self-closing entity tags", async () => {
@@ -379,7 +455,7 @@ describe("Graph Functions", () => {
       limit: 10,
       offset: 0,
     })) as GraphQueryResult;
-    // The cross-page edge should not appear in the page response —
+    // The cross-page edge should not appear in the page response.
     // otherwise the viewer renders a dangling line to a node it
     // doesn't have.
     expect(page.edges.find((e) => e.id === "cross")).toBeUndefined();
@@ -495,7 +571,7 @@ describe("Graph Functions", () => {
 
     it("graph-extract updates snapshot inline (no kv.list, dirty stays false)", async () => {
       // Post-#814 v2 the snapshot is updated incrementally on every
-      // extract — no dirty flag bounces. Test asserts that after an
+      // extract, with no dirty flag changes. Test asserts that after an
       // extract the snapshot reflects the new nodes/edges.
       await sdk.trigger("mem::graph-extract", { observations: [testObs] });
 
@@ -530,7 +606,7 @@ describe("Graph Functions", () => {
     });
 
     it("graph-stats returns empty envelope + warning when no snapshot exists", async () => {
-      // Seed nodes but never rebuild the snapshot — simulates a legacy
+      // Seed nodes but never rebuild the snapshot, simulating a legacy
       // corpus on a post-#814 upgrade.
       await seed(5, 5);
 
@@ -744,7 +820,7 @@ describe("getGraphExtractTimeoutMs", () => {
   });
 
   it("falls back to default on malformed string", () => {
-    process.env.AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS = "abc";
+    process.env.AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS = "600000ms";
     expect(getGraphExtractTimeoutMs()).toBe(180000);
   });
 
@@ -909,11 +985,51 @@ describe("mem::graph-extract chunking", () => {
 
     const result = (await sdk.trigger("mem::graph-extract", {
       observations: [obs("obs_x"), obs("obs_y")],
+    })) as {
+      success: boolean;
+      partial: boolean;
+      error: string;
+      failedChunks: number;
+      totalChunks: number;
+      failedObservationIds: string[];
+    };
+
+    expect(result).toMatchObject({
+      success: false,
+      partial: true,
+      error: "partial_chunks_failed",
+      failedChunks: 1,
+      totalChunks: 2,
+      failedObservationIds: ["obs_x"],
+    });
+    const nodes = await kv.list<GraphNode>("mem:graph:nodes");
+    expect(nodes.some((n) => n.name === "Survivor")).toBe(true);
+  });
+
+  it("rewrites chunk-local edge endpoints to canonical node ids", async () => {
+    process.env.GRAPH_CHUNK_SIZE = "1";
+    process.env.GRAPH_CHUNK_CONCURRENCY = "1";
+    mockProvider.compress.mockResolvedValue(`<entities>
+<entity type="concept" name="Alpha"/>
+<entity type="concept" name="Beta"/>
+</entities>
+<relationships>
+<relationship type="related_to" source="Alpha" target="Beta"/>
+</relationships>`);
+
+    const result = (await sdk.trigger("mem::graph-extract", {
+      observations: [obs("obs_a"), obs("obs_b")],
     })) as { success: boolean };
 
     expect(result.success).toBe(true);
     const nodes = await kv.list<GraphNode>("mem:graph:nodes");
-    expect(nodes.some((n) => n.name === "Survivor")).toBe(true);
+    const edges = await kv.list<GraphEdge>("mem:graph:edges");
+    const nodeIds = new Set(nodes.map((node) => node.id));
+    expect(nodes).toHaveLength(2);
+    expect(edges).toHaveLength(1);
+    expect(nodeIds.has(edges[0].sourceNodeId)).toBe(true);
+    expect(nodeIds.has(edges[0].targetNodeId)).toBe(true);
+    expect(edges[0].sourceObservationIds.sort()).toEqual(["obs_a", "obs_b"]);
   });
 
   it("returns all_chunks_failed when every chunk throws", async () => {
@@ -948,7 +1064,7 @@ describe("getGraphChunkSize / getGraphChunkConcurrency", () => {
     expect(getGraphChunkSize()).toBe(60);
   });
   it("getGraphChunkSize falls back on malformed, zero, or negative", () => {
-    process.env.GRAPH_CHUNK_SIZE = "abc";
+    process.env.GRAPH_CHUNK_SIZE = "60 observations";
     expect(getGraphChunkSize()).toBe(150);
     process.env.GRAPH_CHUNK_SIZE = "0";
     expect(getGraphChunkSize()).toBe(150);
@@ -961,7 +1077,7 @@ describe("getGraphChunkSize / getGraphChunkConcurrency", () => {
   it("getGraphChunkConcurrency parses an override and falls back otherwise", () => {
     process.env.GRAPH_CHUNK_CONCURRENCY = "3";
     expect(getGraphChunkConcurrency()).toBe(3);
-    process.env.GRAPH_CHUNK_CONCURRENCY = "nope";
+    process.env.GRAPH_CHUNK_CONCURRENCY = "3 workers";
     expect(getGraphChunkConcurrency()).toBe(6);
   });
 });

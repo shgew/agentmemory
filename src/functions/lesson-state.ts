@@ -2,6 +2,7 @@ import type { StateKV } from "../state/kv.js";
 import { fingerprintId, jaccardSimilarity, KV } from "../state/schema.js";
 import { stem } from "../state/stemmer.js";
 import type { Lesson } from "../types.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 
 export const LESSON_NEAR_DUPLICATE_THRESHOLD = 0.7;
 
@@ -73,7 +74,54 @@ export function lessonContentSimilarity(left: string, right: string): number {
   return jaccardSimilarity(normalizeForSimilarity(left), normalizeForSimilarity(right));
 }
 
+export function withLessonWriteLock<T>(operation: () => Promise<T>): Promise<T> {
+  return withKeyedLock("lessons:write", operation);
+}
+
 export async function saveLesson(
+  kv: StateKV,
+  data: LessonSaveInput,
+): Promise<LessonSaveResult> {
+  if (!data || typeof data.content !== "string") {
+    return { success: false, error: "content is required" };
+  }
+  for (const [field, value] of [
+    ["tags", data.tags],
+    ["sourceIds", data.sourceIds],
+    ["corrects", data.corrects],
+  ] as const) {
+    if (
+      value !== undefined &&
+      (!Array.isArray(value) ||
+        value.some((entry) => typeof entry !== "string" || !entry.trim()))
+    ) {
+      return { success: false, error: `${field} must be an array of strings` };
+    }
+  }
+  if (data.context !== undefined && typeof data.context !== "string") {
+    return { success: false, error: "context must be a string" };
+  }
+  if (data.project !== undefined && typeof data.project !== "string") {
+    return { success: false, error: "project must be a string" };
+  }
+  if (
+    data.confidence !== undefined &&
+    (typeof data.confidence !== "number" ||
+      !Number.isFinite(data.confidence))
+  ) {
+    return { success: false, error: "confidence must be a finite number" };
+  }
+  if (
+    data.source !== undefined &&
+    !["crystal", "manual", "consolidation"].includes(data.source)
+  ) {
+    return { success: false, error: "source must be crystal, manual, or consolidation" };
+  }
+
+  return withLessonWriteLock(() => saveLessonUnlocked(kv, data));
+}
+
+async function saveLessonUnlocked(
   kv: StateKV,
   data: LessonSaveInput,
 ): Promise<LessonSaveResult> {
@@ -81,14 +129,6 @@ export async function saveLesson(
   if (!content) {
     return { success: false, error: "content is required" };
   }
-  if (
-    data.corrects !== undefined &&
-    (!Array.isArray(data.corrects) ||
-      data.corrects.some((id) => typeof id !== "string" || !id.trim()))
-  ) {
-    return { success: false, error: "corrects must be an array of lesson ids" };
-  }
-
   const project = data.project?.trim() || undefined;
   const normalizedContent = content.toLowerCase();
   const correctionIds = uniqueStrings(data.corrects ?? []);

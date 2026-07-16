@@ -22,6 +22,7 @@ import { registerEventTriggers } from "../src/triggers/events.js";
 import type {
   CompressedObservation,
   MemoryProvider,
+  RawObservation,
   Session,
   SessionSummary,
 } from "../src/types.js";
@@ -239,6 +240,73 @@ describe("session sweep final summary", () => {
     expect(sdk.calls.filter((call) => call.function_id === "mem::summarize")).toHaveLength(1);
     expect(await kv.get<SessionSummary>(KV.summaries, sessionId)).toMatchObject({
       title: "Final session summary",
+      observationCount: 2,
+    });
+  });
+
+  it("recovers pending compression from a completed no-delta session", async () => {
+    const sessionId = "ses_pending_compression";
+    const provider = makeProvider();
+    const { sdk, kv, graphExtract } = await setupSession(
+      sessionId,
+      1,
+      1,
+      provider,
+    );
+    const session = await kv.get<Session>(KV.sessions, sessionId);
+    const anchor = session?.updatedAt ?? session!.startedAt;
+    const timestamp = new Date(new Date(anchor).getTime() + 1_000).toISOString();
+    await kv.update<Session>(KV.sessions, sessionId, [
+      {
+        type: "set",
+        path: "status",
+        value: "completed",
+      },
+      {
+        type: "set",
+        path: "lastCheckpointAt",
+        value: anchor,
+      },
+    ]);
+    const raw: RawObservation = {
+      id: "obs_pending",
+      sessionId,
+      timestamp,
+      hookType: "prompt_submit",
+      raw: { prompt: "retain this" },
+      userPrompt: "retain this",
+    };
+    await kv.set(KV.rawPayloads, raw.id, raw);
+    const compress = vi.fn(async () => {
+      await kv.set(
+        KV.observations(sessionId),
+        raw.id,
+        makeObservation(sessionId, raw.id, timestamp),
+      );
+      return { success: true };
+    });
+    sdk.registerFunction("mem::compress", compress);
+
+    const result = await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: [sessionId], mode: "finalize" },
+    });
+
+    expect(result).toMatchObject({
+      swept: [],
+      checkpointed: [sessionId],
+      failed: [],
+    });
+    expect(compress).toHaveBeenCalledOnce();
+    expect(graphExtract).toHaveBeenCalledWith(
+      expect.objectContaining({
+        observations: expect.arrayContaining([
+          expect.objectContaining({ id: "obs_0" }),
+          expect.objectContaining({ id: raw.id }),
+        ]),
+      }),
+    );
+    expect(await kv.get<SessionSummary>(KV.summaries, sessionId)).toMatchObject({
       observationCount: 2,
     });
   });

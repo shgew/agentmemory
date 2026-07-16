@@ -204,6 +204,7 @@ export interface FunctionMetrics {
   failureCount: number;
   avgLatencyMs: number;
   avgQualityScore: number;
+  qualityScoreCount?: number;
 }
 
 export interface HealthSnapshot {
@@ -523,11 +524,12 @@ export interface GraphTombstone {
   // edge: `${sourceNodeId}|${targetNodeId}|${type}` (KV.graphEdgeKey key)
   indexKey: string;
   tombstonedAt: string;
-  // Prune-sweep only: source count observed when the tombstone was recorded.
-  // The vacuum skips deletion when the live row's sourceObservationIds length
-  // has since changed, so a row that gained a live source via merge after being
-  // doomed is never physically deleted.
   observedSourceCount?: number;
+  observedSourceFingerprint?: string;
+  nodeType?: GraphNode["type"];
+  edgeType?: GraphEdge["type"];
+  sourceNodeId?: string;
+  targetNodeId?: string;
 }
 
 export type ConsolidationTier =
@@ -614,6 +616,7 @@ export interface AuditEntry {
     | "action_create"
     | "action_update"
     | "lease_acquire"
+    | "lease_renew"
     | "lease_release"
     | "routine_run"
     | "signal_send"
@@ -880,6 +883,7 @@ export interface Insight {
   decayRate: number;
   deleted?: boolean;
   reflectClusterFp?: string;
+  reflectClusterFps?: string[];
   reflectClusterFpVersion?: number;
 }
 
@@ -963,7 +967,7 @@ export interface RetentionScore {
   memoryId: string;
   // Which KV scope this row came from. Needed by mem::retention-evict
   // so the delete loop routes to KV.memories or KV.semantic correctly.
-  // Missing on pre-0.8.10 rows — callers must treat `undefined` as
+  // Missing on pre-0.8.10 rows, so callers must treat `undefined` as
   // "unknown" and probe both scopes for backwards-compat. See #124.
   source?: "episodic" | "semantic";
   score: number;
@@ -985,7 +989,7 @@ export interface DecayConfig {
 }
 
 /**
- * KV.state scope — long-lived system counters + flags keyed by string.
+ * KV.state scope for long-lived system counters and flags keyed by string.
  * Keep keys/types in sync with the state-scope callers (e.g.,
  * disk-size-manager) so TypeScript enforces consistent value shapes
  * instead of every caller using ad-hoc `<number>` generics.

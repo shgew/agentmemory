@@ -12,12 +12,6 @@ import type {
 declare const process: { env: Record<string, string | undefined> };
 const env = process.env;
 
-// Regression coverage for the deployed-budget lessons starvation:
-// at TOKEN_BUDGET=5000 the whole "## Lessons Learned" block was dropped
-// because (a) its recency (days-old) sorted it behind today's pinned
-// slots + session summaries and (b) the monolithic 10-lesson block was
-// too large to ever fit alongside the load-bearing slots.
-
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
   return {
@@ -54,7 +48,17 @@ function wireContext(kv: ReturnType<typeof mockKV>, budget: number) {
   } as unknown as import("iii-sdk").ISdk;
   registerContextFunction(sdk, kv as never, budget);
   if (!handler) throw new Error("mem::context not registered");
-  return handler;
+  return async (data: Parameters<ContextHandler>[0]) => {
+    await kv.set(KV.sessions, data.sessionId, {
+      id: data.sessionId,
+      project: data.project,
+      cwd: data.project,
+      startedAt: NOW,
+      status: "active",
+      observationCount: 0,
+    });
+    return handler(data);
+  };
 }
 
 const PROJECT = "/tmp/proj";
@@ -136,7 +140,7 @@ async function seedSessionWithSummary(
   await kv.set(KV.summaries, id, summary);
 }
 
-describe("mem::context — lessons survive the deployed token budget", () => {
+describe("mem::context lessons survive the deployed token budget", () => {
   const ORIGINAL_SLOTS_ENV = env["AGENTMEMORY_SLOTS"];
 
   beforeEach(() => {
@@ -155,11 +159,9 @@ describe("mem::context — lessons survive the deployed token budget", () => {
     const kv = mockKV();
     const handler = wireContext(kv, 5000);
 
-    // Load-bearing pinned slots (~1.6k tokens) must stay first.
     await seedSlot(kv, "tool_guidelines", "SLOT-GUIDE " + "g".repeat(2400));
     await seedSlot(kv, "project_context", "SLOT-CTX " + "p".repeat(2400), "project");
 
-    // Days-old lessons — the block sorts behind everything from today.
     for (let i = 0; i < 4; i++) {
       await seedLesson(kv, {
         id: `lesson_${i}`,
@@ -169,17 +171,13 @@ describe("mem::context — lessons survive the deployed token budget", () => {
       });
     }
 
-    // Several of today's sessions with fat summaries that greedily fill
-    // the remaining budget before the days-old lessons block is reached.
     for (let i = 0; i < 5; i++) {
       await seedSessionWithSummary(kv, `ses_today_${i}`, 1800);
     }
 
     const result = await handler({ sessionId: "ses_current", project: PROJECT });
 
-    // Slots must still be present (never displaced).
     expect(result.context).toContain("SLOT-GUIDE");
-    // The lessons block must survive.
     expect(result.context).toContain("Lessons Learned");
     expect(result.context).toContain("LESSON-MARKER-0");
   });
@@ -191,8 +189,6 @@ describe("mem::context — lessons survive the deployed token budget", () => {
     await seedSlot(kv, "tool_guidelines", "SLOT-GUIDE " + "g".repeat(2400));
     await seedSlot(kv, "project_context", "SLOT-CTX " + "p".repeat(2400), "project");
 
-    // 10 large lessons -> a monolithic block far bigger than the whole
-    // budget. It must be trimmed to a reserved sub-budget, not skipped.
     for (let i = 0; i < 10; i++) {
       await seedLesson(kv, {
         id: `huge_${i}`,
@@ -206,13 +202,10 @@ describe("mem::context — lessons survive the deployed token budget", () => {
 
     expect(result.context).toContain("SLOT-GUIDE");
     expect(result.context).toContain("Lessons Learned");
-    // Highest-confidence lesson must be the one that survives the trim.
     expect(result.context).toContain("HUGE-LESSON-0");
-    // The block is bounded: it cannot contain all 10 huge lessons.
     const matched = result.context.match(/HUGE-LESSON-/g) ?? [];
     expect(matched.length).toBeLessThan(10);
     expect(matched.length).toBeGreaterThan(0);
-    // Total budget respected.
     expect(result.tokens).toBeLessThanOrEqual(5000);
   });
 

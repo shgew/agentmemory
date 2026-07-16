@@ -175,7 +175,7 @@ describe("api::session::start", () => {
         cwd: "/incoming",
         title: "resumed title",
         agentId: "reviewer",
-        parentID: "different-parent",
+        parentID: "original-parent",
       }),
     )) as StartResponse;
 
@@ -227,12 +227,10 @@ describe("api::session::start", () => {
       request({ sessionId: existing.id, project: "incoming-project", cwd: existing.cwd }),
     )) as StartResponse;
 
+    expect(result.status_code).toBe(409);
     expect(result.body.session.project).toBe(existing.project);
     expect(result.body.projectConflict).toBe(true);
-    expect(sdk.contextPayloads).toContainEqual({
-      sessionId: existing.id,
-      project: existing.project,
-    });
+    expect(sdk.contextPayloads).toEqual([]);
     expect(logger.warn).toHaveBeenCalledWith(
       "Session project conflict on start",
       {
@@ -241,6 +239,29 @@ describe("api::session::start", () => {
         incomingProject: "incoming-project",
       },
     );
+  });
+
+  it("rejects a parent conflict before enriching durable metadata", async () => {
+    const existing = session({
+      cwd: "",
+      summary: "",
+      parentSessionId: "original-parent",
+    });
+    kv.seed(KV.sessions, existing.id, existing);
+
+    const result = (await start(
+      request({
+        sessionId: existing.id,
+        project: existing.project,
+        cwd: "/incoming",
+        title: "incoming title",
+        parentID: "different-parent",
+      }),
+    )) as StartResponse;
+
+    expect(result.status_code).toBe(409);
+    expect(await kv.get<Session>(KV.sessions, existing.id)).toEqual(existing);
+    expect(kv.updateCalls).toEqual([]);
   });
 
   it("serializes concurrent starts into one create and one enrich", async () => {

@@ -50,19 +50,8 @@ function isFileUnderProject(file: string, project: string): boolean {
   return file === base || file.startsWith(base + "/");
 }
 
-// Canonicalize a tracked file path into a stable, portable form.
-// The audit found profiles storing a mix of absolute and relative
-// paths for the same logical file; absolute paths embed a machine-
-// specific prefix (/Users/... , /home/...) and are not portable.
-//   - normalizes separators (\\ -> /), collapses ./ ../ + dup slashes,
-//     strips a trailing slash and a leading ./
-//   - a slug project (canonical, non-path): an absolute path carrying
-//     the slug as a segment is relativized from it, stripping the
-//     machine-specific prefix so abs + rel forms of the same file
-//     converge (this is where the audit's mix actually occurs — under
-//     an absolute project root relative files are already filtered out)
-//   - absolute-project / already-relative paths pass through normalized
-// Idempotent: canonicalizeFilePath(canonicalizeFilePath(x)) === once.
+// Slug projects make matching absolute paths project-relative. Absolute
+// project roots and already-relative paths keep their normalized form.
 export function canonicalizeFilePath(file: unknown, project: string): string {
   if (typeof file !== "string") return "";
   let f = file.trim().replace(/\\/g, "/");

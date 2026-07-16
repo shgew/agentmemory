@@ -11,10 +11,11 @@ import type {
   Session,
 } from "../types.js";
 import { recordAudit } from "./audit.js";
+import { getEnvVar } from "../config.js";
 const DEFAULT_EXPORT_ROOT = join(homedir(), ".agentmemory");
 
 function getExportRoot(): string {
-  return resolve(process.env["AGENTMEMORY_EXPORT_ROOT"] || DEFAULT_EXPORT_ROOT);
+  return resolve(getEnvVar("AGENTMEMORY_EXPORT_ROOT") || DEFAULT_EXPORT_ROOT);
 }
 
 function resolveVaultDir(vaultDir?: string): string | null {

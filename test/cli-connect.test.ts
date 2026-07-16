@@ -9,6 +9,7 @@ import {
   resolveAdapter,
 } from "../src/cli/connect/index.js";
 import type { ConnectAdapter } from "../src/cli/connect/types.js";
+import { readJsoncSafe } from "../src/cli/connect/util.js";
 
 const EXPECTED_COPILOT_MCP_COMMAND =
   process.platform === "win32"
@@ -248,6 +249,8 @@ describe("agentmemory connect — opencode adapter (#872)", () => {
 
   const cfgPath = () =>
     join(tmpHome, ".config", "opencode", "opencode.json");
+  const cfgJsoncPath = () =>
+    join(tmpHome, ".config", "opencode", "opencode.jsonc");
 
   async function loadOpencode(): Promise<ConnectAdapter> {
     const mod = await import("../src/cli/connect/opencode.js?t=" + Date.now());
@@ -293,6 +296,170 @@ describe("agentmemory connect — opencode adapter (#872)", () => {
     const result = await a.install({ dryRun: true, force: false });
     expect(result.kind).toBe("installed");
     expect(readFileSync(cfgPath(), "utf-8")).toBe(before);
+  });
+
+  it("updates existing JSONC in place and preserves comments and plugin tuples", async () => {
+    require("node:fs").mkdirSync(join(tmpHome, ".config", "opencode"), {
+      recursive: true,
+    });
+    const jsonConfig = JSON.stringify({ untouched: true });
+    const jsoncConfig = [
+      "{",
+      "  // preserve root comment",
+      '  "plugin": [',
+      '    ["npm-plugin", {',
+      '      "flag": true,',
+      "    }],",
+      "  ],",
+      '  "mcp": {',
+      "    // preserve server comment",
+      '    "other": { "type": "local", "command": ["other"] },',
+      "  },",
+      "}",
+      "",
+    ].join("\n");
+    writeFileSync(cfgPath(), jsonConfig);
+    writeFileSync(cfgJsoncPath(), jsoncConfig);
+
+    const a = await loadOpencode();
+    const result = await a.install({
+      dryRun: false,
+      force: false,
+      withPlugin: true,
+    });
+
+    expect(result).toMatchObject({
+      kind: "installed",
+      mutatedPath: cfgJsoncPath(),
+    });
+    if (result.kind === "installed") {
+      expect(result.backupPath).toMatch(/\.jsonc$/);
+    }
+    const raw = readFileSync(cfgJsoncPath(), "utf-8");
+    expect(raw).toContain("// preserve root comment");
+    expect(raw).toContain("// preserve server comment");
+    const config = readJsoncSafe<{
+      plugin: unknown;
+      mcp: {
+        other: { command: string[] };
+        agentmemory: { command: string[] };
+      };
+    }>(cfgJsoncPath());
+    expect(config?.plugin).toEqual([["npm-plugin", { flag: true }]]);
+    expect(config?.mcp.other.command).toEqual(["other"]);
+    expect(config?.mcp.agentmemory.command).toContain("@agentmemory/mcp");
+    expect(readFileSync(cfgPath(), "utf-8")).toBe(jsonConfig);
+  });
+
+  it("adds the mcp object to JSONC that does not have one", async () => {
+    require("node:fs").mkdirSync(join(tmpHome, ".config", "opencode"), {
+      recursive: true,
+    });
+    const before = [
+      "{",
+      "  // keep existing config",
+      '  "theme": "https://example.com/theme",',
+      "}",
+      "",
+    ].join("\n");
+    writeFileSync(cfgJsoncPath(), before);
+
+    const a = await loadOpencode();
+    const result = await a.install({ dryRun: false, force: false });
+
+    expect(result.kind).toBe("installed");
+    const raw = readFileSync(cfgJsoncPath(), "utf-8");
+    expect(raw).toContain("// keep existing config");
+    const config = readJsoncSafe<{
+      theme: string;
+      mcp: { agentmemory: { command: string[] } };
+    }>(cfgJsoncPath());
+    expect(config?.theme).toBe("https://example.com/theme");
+    expect(config?.mcp.agentmemory.command).toContain("@agentmemory/mcp");
+    expect(existsSync(cfgPath())).toBe(false);
+  });
+
+  it("replaces an existing JSONC agentmemory entry without dropping comments", async () => {
+    require("node:fs").mkdirSync(join(tmpHome, ".config", "opencode"), {
+      recursive: true,
+    });
+    const before = [
+      "{",
+      '  "mcp": {',
+      "    // keep entry comment",
+      '    "agentmemory": { "type": "local", "command": ["old"] },',
+      "  },",
+      "}",
+      "",
+    ].join("\n");
+    writeFileSync(cfgJsoncPath(), before);
+
+    const a = await loadOpencode();
+    const result = await a.install({ dryRun: false, force: false });
+
+    expect(result.kind).toBe("installed");
+    const raw = readFileSync(cfgJsoncPath(), "utf-8");
+    expect(raw).toContain("// keep entry comment");
+    const config = readJsoncSafe<{
+      mcp: { agentmemory: { command: string[] } };
+    }>(cfgJsoncPath());
+    expect(config?.mcp.agentmemory.command).toContain("@agentmemory/mcp");
+  });
+
+  it("does not rewrite already-wired JSONC while installing plugin assets", async () => {
+    require("node:fs").mkdirSync(join(tmpHome, ".config", "opencode"), {
+      recursive: true,
+    });
+    const before = [
+      "{",
+      "  // keep exact formatting",
+      '  "plugin": [["npm-plugin", { "flag": true }]],',
+      '  "mcp": {',
+      '    "agentmemory": {',
+      '      "type": "local",',
+      '      "command": ["npx", "-y", "@agentmemory/mcp"],',
+      '      "enabled": true,',
+      "    },",
+      "  },",
+      "}",
+      "",
+    ].join("\n");
+    writeFileSync(cfgJsoncPath(), before);
+
+    const a = await loadOpencode();
+    const result = await a.install({
+      dryRun: false,
+      force: false,
+      withPlugin: true,
+    });
+
+    expect(result.kind).toBe("already-wired");
+    expect(readFileSync(cfgJsoncPath(), "utf-8")).toBe(before);
+    expect(
+      existsSync(
+        join(
+          tmpHome,
+          ".config",
+          "opencode",
+          "plugins",
+          "agentmemory-capture.ts",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("skips invalid JSONC without creating a competing JSON config", async () => {
+    require("node:fs").mkdirSync(join(tmpHome, ".config", "opencode"), {
+      recursive: true,
+    });
+    writeFileSync(cfgJsoncPath(), "{ // incomplete\n");
+
+    const a = await loadOpencode();
+    const result = await a.install({ dryRun: false, force: false });
+
+    expect(result).toEqual({ kind: "skipped", reason: "invalid-config" });
+    expect(existsSync(cfgPath())).toBe(false);
+    expect(readFileSync(cfgJsoncPath(), "utf-8")).toBe("{ // incomplete\n");
   });
 
   it("honors OPENCODE_CONFIG_DIR when set, writing config under that dir", async () => {

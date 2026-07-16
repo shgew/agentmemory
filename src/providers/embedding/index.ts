@@ -21,7 +21,7 @@ export {
 let imageEmbeddingProvider: EmbeddingProvider | null = null;
 
 export function createImageEmbeddingProvider(): EmbeddingProvider | null {
-  if (process.env["AGENTMEMORY_IMAGE_EMBEDDINGS"] !== "true") return null;
+  if (getEnvVar("AGENTMEMORY_IMAGE_EMBEDDINGS") !== "true") return null;
   if (imageEmbeddingProvider) return imageEmbeddingProvider;
   imageEmbeddingProvider = withDimensionGuard(new ClipEmbeddingProvider());
   return imageEmbeddingProvider;

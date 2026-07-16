@@ -16,7 +16,7 @@ import {
 } from "../functions/graph-retrieval.js";
 import { extractEntitiesFromQuery } from "../functions/query-expansion.js";
 import { rerank } from "./reranker.js";
-import { isGraphSearchEnabled } from "../config.js";
+import { getEnvVar, isGraphSearchEnabled } from "../config.js";
 
 const RRF_K = 60;
 
@@ -37,7 +37,7 @@ export class HybridSearch {
     private bm25Weight = 0.4,
     private vectorWeight = 0.6,
     private graphWeight = 0.3,
-    private rerankEnabled = process.env.RERANK_ENABLED === "true",
+    private rerankEnabled = getEnvVar("RERANK_ENABLED") === "true",
     private graphSearchEnabled = isGraphSearchEnabled(),
   ) {
     this.graphRetrieval = new GraphRetrieval(kv);

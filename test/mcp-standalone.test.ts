@@ -16,7 +16,14 @@ vi.mock("../src/mcp/transport.js", () => ({
 }));
 
 vi.mock("../src/config.js", () => ({
+  getAgentId: vi.fn(() => process.env["AGENT_ID"] || undefined),
+  getEnvVar: vi.fn((key: string) => process.env[key]),
   getStandalonePersistPath: vi.fn(() => "/tmp/test-standalone.json"),
+  isAgentScopeIsolated: vi.fn(
+    () =>
+      Boolean(process.env["AGENT_ID"]) &&
+      process.env["AGENTMEMORY_AGENT_SCOPE"] === "isolated",
+  ),
 }));
 
 import {
@@ -158,6 +165,7 @@ describe("handleToolCall", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     (globalThis as { fetch: typeof fetch }).fetch = originalFetch;
     resetHandleForTests();
   });
@@ -473,6 +481,18 @@ describe("handleToolCall", () => {
     expect(parsed.results[0].project).toBe("foo");
   });
 
+  it("rejects an invalid project instead of running an unscoped search", async () => {
+    const kv = new InMemoryKV();
+
+    await expect(
+      handleToolCall(
+        "memory_recall",
+        { query: "auth", project: " " },
+        kv,
+      ),
+    ).rejects.toThrow("project must be a non-empty string");
+  });
+
   it("memory_smart_search filters local fallback by project", async () => {
     const kv = new InMemoryKV();
     await handleToolCall(
@@ -514,6 +534,27 @@ describe("handleToolCall", () => {
     );
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.results).toHaveLength(2);
+  });
+
+  it("isolates local fallback memories by server identity", async () => {
+    const kv = new InMemoryKV();
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    vi.stubEnv("AGENT_ID", "agent-a");
+    await handleToolCall("memory_save", { content: "agent a memory" }, kv);
+
+    vi.stubEnv("AGENT_ID", "agent-b");
+    await handleToolCall("memory_save", { content: "agent b memory" }, kv);
+    const result = await handleToolCall(
+      "memory_recall",
+      { query: "memory", agentId: "*" },
+      kv,
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    const contents = parsed.results.map(
+      (memory: { content: string }) => memory.content,
+    );
+    expect(contents).toEqual(["agent b memory"]);
   });
 
   it("memory_recall with project also matches legacy memories without a project field", async () => {

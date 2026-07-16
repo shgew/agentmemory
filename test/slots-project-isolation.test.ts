@@ -207,6 +207,57 @@ describe("project slot isolation", () => {
     });
   });
 
+  it("does not mutate a global slot when a project override is missing", async () => {
+    await call(handlers, "mem::slot-replace", {
+      label: "persona",
+      content: "global-persona",
+    });
+
+    const replace = await call(handlers, "mem::slot-replace", {
+      label: "persona",
+      content: "project-persona",
+      project: "project-a",
+    });
+    const append = await call(handlers, "mem::slot-append", {
+      label: "persona",
+      text: "project suffix",
+      project: "project-a",
+    });
+    const remove = await call(handlers, "mem::slot-delete", {
+      label: "persona",
+      project: "project-a",
+    });
+    const global = await call(handlers, "mem::slot-get", {
+      label: "persona",
+    });
+
+    expect(replace["success"]).toBe(false);
+    expect(append["success"]).toBe(false);
+    expect(remove["success"]).toBe(false);
+    expect(global["slot"]).toMatchObject({ content: "global-persona" });
+  });
+
+  it("fills missing defaults after a partial project seed", async () => {
+    await kv.set(KV.slots, "project-a:pending_items", {
+      ...legacyProjectSlot("pending_items", "keep me"),
+      project: "project-a",
+    });
+
+    await call(handlers, "mem::slot-list", { project: "project-a" });
+
+    expect(await kv.get(KV.slots, "project-a:pending_items")).toMatchObject({
+      content: "keep me",
+    });
+    expect(await kv.get(KV.slots, "project-a:project_context")).toMatchObject({
+      project: "project-a",
+      content: "",
+    });
+    expect(await kv.get(KV.slots, "project-a:guidance")).toMatchObject({
+      project: "project-a",
+      content: "",
+    });
+  });
+
   it("writes slot reflection only to the acting session project", async () => {
     const sessionId = "session-reflect-project";
     const timestamp = new Date().toISOString();

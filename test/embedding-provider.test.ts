@@ -155,6 +155,11 @@ describe("OpenAIEmbeddingProvider", () => {
     expect(() => new OpenAIEmbeddingProvider("test-key")).toThrow(
       /OPENAI_EMBEDDING_DIMENSIONS must be a positive integer/,
     );
+
+    process.env["OPENAI_EMBEDDING_DIMENSIONS"] = "768px";
+    expect(() => new OpenAIEmbeddingProvider("test-key")).toThrow(
+      /OPENAI_EMBEDDING_DIMENSIONS must be a positive integer/,
+    );
   });
 
   it("performs a single POST when input count is at or below the default max (256)", async () => {
@@ -331,6 +336,21 @@ describe("OpenAIEmbeddingProvider", () => {
     expect(() => new OpenAIEmbeddingProvider("test-key")).toThrow(
       /OPENAI_EMBEDDING_MAX_BATCH must be a positive integer/,
     );
+
+    process.env["OPENAI_EMBEDDING_MAX_BATCH"] = "9".repeat(400);
+    expect(() => new OpenAIEmbeddingProvider("test-key")).toThrow(
+      /OPENAI_EMBEDDING_MAX_BATCH must be a positive integer/,
+    );
+  });
+
+  it("returns immediately for an empty embedding batch", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const provider = new OpenAIEmbeddingProvider("test-key");
+
+    await expect(provider.embedBatch([])).resolves.toEqual([]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+
+    fetchSpy.mockRestore();
   });
 });
 

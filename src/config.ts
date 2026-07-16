@@ -491,13 +491,9 @@ export function isProceduralExtractionEnabled(): boolean {
   return getMergedEnv()["PROCEDURAL_EXTRACTION_ENABLED"] === "true";
 }
 
-// Kill switch for graph *consumption* in hybrid search. OFF by default, and
-// deliberately decoupled from GRAPH_EXTRACTION_ENABLED: extraction can be
-// frozen while previously-built graph data stays queryable, and graph search
-// can be disabled without touching extraction. Follows the exact same pattern
-// as isGraphExtractionEnabled (exact-match "true" only). When false,
-// HybridSearch never loads the graph snapshot and never runs GraphRetrieval —
-// a true bypass, not a graphWeight=0 that still traverses then multiplies out.
+// Graph search and extraction can be disabled independently. When false,
+// HybridSearch never loads the graph snapshot and never runs GraphRetrieval,
+// instead of traversing before multiplying the graph weight by zero.
 export function isGraphSearchEnabled(): boolean {
   return getMergedEnv()["GRAPH_SEARCH_ENABLED"] === "true";
 }

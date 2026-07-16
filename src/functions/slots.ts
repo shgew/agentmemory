@@ -123,6 +123,10 @@ function projectSlotKey(project: string, label: string): string {
   return `${project}:${label}`;
 }
 
+function slotLockKey(scope: SlotScope, key: string): string {
+  return `slot:${scope}:${key}`;
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -175,6 +179,27 @@ async function readSlotInScope(
   return kv.get<MemorySlot>(KV.slots, projectSlotKey(project, label));
 }
 
+async function readWritableSlot(
+  kv: StateKV,
+  label: string,
+  project: string | null,
+): Promise<{ slot: MemorySlot | null; scope: SlotScope; key: string }> {
+  if (project) {
+    await ensureProjectDefaults(kv, project);
+    const key = projectSlotKey(project, label);
+    return {
+      slot: await kv.get<MemorySlot>(KV.slots, key),
+      scope: "project",
+      key,
+    };
+  }
+  return {
+    slot: await kv.get<MemorySlot>(KV.globalSlots, label),
+    scope: "global",
+    key: label,
+  };
+}
+
 function validateScope(raw: unknown): SlotScope | null {
   if (raw === undefined || raw === null) return "project";
   if (raw === "project" || raw === "global") return raw;
@@ -221,25 +246,19 @@ async function ensureProjectDefaults(
   project: string,
 ): Promise<void> {
   await withKeyedLock(`slot-seed:${project}`, async () => {
-    const projectSlots = (await kv.list<MemorySlot>(KV.slots)).filter(
-      (slot) => slot.scope === "project" && slot.project === project,
-    );
-    if (projectSlots.length > 0) return;
     const ts = nowIso();
     await Promise.all(
       DEFAULT_SLOTS.filter((slot) => slot.scope === "project").map(
         async (template) => {
+          const key = projectSlotKey(project, template.label);
+          if (await kv.get<MemorySlot>(KV.slots, key)) return;
           const slot: MemorySlot = {
             ...template,
             project,
             createdAt: ts,
             updatedAt: ts,
           };
-          await kv.set(
-            KV.slots,
-            projectSlotKey(project, template.label),
-            slot,
-          );
+          await kv.set(KV.slots, key, slot);
         },
       ),
     );
@@ -388,7 +407,7 @@ export function registerSlotsFunctions(sdk: ISdk, kv: StateKV): void {
         key = projectSlotKey(project, label);
         slotProject = project;
       }
-      return withKeyedLock(`slot:${scope}:${key}`, async () => {
+      return withKeyedLock(slotLockKey(scope, key), async () => {
         // Duplicate check is scope-local so a project slot can shadow a
         // global slot with the same label — matches the read precedence.
         const existing = await readSlotInScope(kv, label, scope, project);
@@ -429,8 +448,10 @@ export function registerSlotsFunctions(sdk: ISdk, kv: StateKV): void {
       if (data?.project !== undefined && !project) {
         return { success: false, error: PROJECT_REQUIRED_ERROR };
       }
-      return withKeyedLock(`slot:${label}`, async () => {
-        const { slot, scope, key } = await readSlot(kv, label, project);
+      const scope: SlotScope = project ? "project" : "global";
+      const key = project ? projectSlotKey(project, label) : label;
+      return withKeyedLock(slotLockKey(scope, key), async () => {
+        const { slot } = await readWritableSlot(kv, label, project);
         if (!slot) {
           return {
             success: false,
@@ -474,8 +495,10 @@ export function registerSlotsFunctions(sdk: ISdk, kv: StateKV): void {
       if (data?.project !== undefined && !project) {
         return { success: false, error: PROJECT_REQUIRED_ERROR };
       }
-      return withKeyedLock(`slot:${label}`, async () => {
-        const { slot, scope, key } = await readSlot(kv, label, project);
+      const scope: SlotScope = project ? "project" : "global";
+      const key = project ? projectSlotKey(project, label) : label;
+      return withKeyedLock(slotLockKey(scope, key), async () => {
+        const { slot } = await readWritableSlot(kv, label, project);
         if (!slot) {
           return {
             success: false,
@@ -514,8 +537,10 @@ export function registerSlotsFunctions(sdk: ISdk, kv: StateKV): void {
       if (data?.project !== undefined && !project) {
         return { success: false, error: PROJECT_REQUIRED_ERROR };
       }
-      return withKeyedLock(`slot:${label}`, async () => {
-        const { slot, scope, key } = await readSlot(kv, label, project);
+      const scope: SlotScope = project ? "project" : "global";
+      const key = project ? projectSlotKey(project, label) : label;
+      return withKeyedLock(slotLockKey(scope, key), async () => {
+        const { slot } = await readWritableSlot(kv, label, project);
         if (!slot) {
           return {
             success: false,
@@ -591,7 +616,8 @@ export function registerSlotsFunctions(sdk: ISdk, kv: StateKV): void {
       let applied = 0;
 
       if (patternCounts.size > 0) {
-        const patternsApplied = await withKeyedLock(`slot:${project}:session_patterns`, async () => {
+        const patternsKey = projectSlotKey(project, "session_patterns");
+        const patternsApplied = await withKeyedLock(slotLockKey("project", patternsKey), async () => {
           const slot = await readSlotInScope(
             kv,
             "session_patterns",
@@ -618,7 +644,8 @@ export function registerSlotsFunctions(sdk: ISdk, kv: StateKV): void {
       }
 
       if (files.size > 0) {
-        const ctxApplied = await withKeyedLock(`slot:${project}:project_context`, async () => {
+        const contextKey = projectSlotKey(project, "project_context");
+        const ctxApplied = await withKeyedLock(slotLockKey("project", contextKey), async () => {
           const slot = await readSlotInScope(
             kv,
             "project_context",

@@ -92,7 +92,7 @@ if (!version) {
 
 const restEndpoints = safeCountMatches(
   join(repoRoot, "src", "triggers", "api.ts"),
-  /config:\s*\{\s*api_path:\s*"/g,
+  /api_path:\s*["`]/g,
 );
 const mcpTools = safeCountMatches(
   join(repoRoot, "src", "mcp", "tools-registry.ts"),

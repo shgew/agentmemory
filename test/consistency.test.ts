@@ -31,8 +31,20 @@ describe("Consistency checks", () => {
 
   it("plugin.json version matches package.json", () => {
     const pkg = JSON.parse(readText("package.json"));
-    const plugin = JSON.parse(readText("plugin/.claude-plugin/plugin.json"));
-    expect(plugin.version).toBe(pkg.version);
+    const manifests = [
+      "plugin/.claude-plugin/plugin.json",
+      "plugin/.codex-plugin/plugin.json",
+      "plugin/plugin.json",
+      "plugin/opencode/plugin.json",
+      "packages/mcp/package.json",
+    ];
+
+    for (const manifest of manifests) {
+      expect(JSON.parse(readText(manifest)).version, manifest).toBe(pkg.version);
+    }
+
+    const websiteMeta = JSON.parse(readText("website/lib/generated-meta.json"));
+    expect(websiteMeta.version).toBe(pkg.version);
   });
 
   it("export-import.ts supports current version", () => {
@@ -52,11 +64,27 @@ describe("Consistency checks", () => {
     const readme = readText("README.md");
     const agents = readText("AGENTS.md");
     const index = readText("src/index.ts");
+    const websiteMeta = JSON.parse(readText("website/lib/generated-meta.json"));
 
     expect(restEndpointCount).toBeGreaterThan(0);
     expect(readme).toContain(`${restEndpointCount} endpoints on port`);
     expect(agents).toContain(`${restEndpointCount} REST endpoints`);
     expect(index).toContain(`REST API: ${restEndpointCount} endpoints`);
+    expect(websiteMeta.restEndpoints).toBe(restEndpointCount);
+  });
+
+  it("generated REST reference keeps each method and path registration", () => {
+    const reference = readText(
+      "plugin/skills/agentmemory-rest-api/REFERENCE.md",
+    );
+    const rows = reference.match(
+      /^\| [A-Z]+ \| `\/agentmemory\/[^`]+` \|$/gm,
+    );
+
+    expect(reference).toContain(`${restEndpointCount} registered endpoints:`);
+    expect(rows).toHaveLength(restEndpointCount);
+    expect(reference).toContain("| GET | `/agentmemory/relations` |");
+    expect(reference).toContain("| POST | `/agentmemory/relations` |");
   });
 
   it("all tool names are unique", () => {

@@ -41,12 +41,8 @@ function buildGraphContext(
 export class GraphRetrieval {
   constructor(private kv: StateKV) {}
 
-  // #825: smart-search calls this on every query. The graph MUST come from
-  // the bounded snapshot (one kv.get) - kv.list over the full graphNodes /
-  // graphEdges scopes serializes a multi-MB frame that blocks the iii worker
-  // heartbeat ("Invocation stopped"). topEdges can carry stale or orphaned
-  // entries when graph-extract evicts a top node without pruning them, so
-  // filter to live edges whose endpoints are both still in topNodes.
+  // Full graph scope reads can block the iii worker heartbeat. Snapshot edges
+  // can outlive an evicted node, so keep only edges with live endpoints.
   private async snapshotSubgraph(): Promise<{
     allNodes: GraphNode[];
     allEdges: GraphEdge[];

@@ -8,13 +8,14 @@ import type {
 import { KV, STREAM } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { isReflectEnabled } from "../functions/slots.js";
-import { isGraphExtractionEnabled } from "../config.js";
+import { getEnvVar, isGraphExtractionEnabled } from "../config.js";
 import { logger } from "../logger.js";
-import { isAfter } from "../state/timestamp-compare.js";
+import { isAfter, isAtOrBefore } from "../state/timestamp-compare.js";
 import { getSummarizeTimeoutMs } from "../functions/summarize.js";
 import { getGraphExtractTimeoutMs } from "../functions/graph.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { upsertSession } from "../functions/session-upsert.js";
+import { drainPendingCompression } from "../functions/pending-compression.js";
 
 // Consolidation runs through a bounded pool (CONSOLIDATION_CONCURRENCY, default
 // 1 = serial). Each task holds withKeyedLock("session:consolidate:<id>") so two
@@ -25,22 +26,49 @@ let activeConsolidations = 0;
 const pendingConsolidations: Array<() => void> = [];
 
 const CONSOLIDATION_CONCURRENCY_DEFAULT = 1;
+const CONSOLIDATION_CONCURRENCY_MAX = 32;
 
 function consolidationConcurrency(): number {
-  const raw = process.env.CONSOLIDATION_CONCURRENCY;
-  if (!raw) return CONSOLIDATION_CONCURRENCY_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : CONSOLIDATION_CONCURRENCY_DEFAULT;
+  const value = getEnvVar("CONSOLIDATION_CONCURRENCY")?.trim();
+  const parsed = value && /^\d+$/.test(value) ? Number(value) : Number.NaN;
+  return Number.isSafeInteger(parsed) &&
+    parsed > 0 &&
+    parsed <= CONSOLIDATION_CONCURRENCY_MAX
+    ? parsed
+    : CONSOLIDATION_CONCURRENCY_DEFAULT;
 }
 
 const consolidationLimit = consolidationConcurrency();
 
-type SessionStoppedPayload = { sessionId: string; since?: string; until?: string; waitForCompletion?: boolean; reason?: string; summaryOnly?: boolean };
-type SessionStoppedQueued = { queued: true; sessionId: string; queueDepth: number };
+type SessionStoppedPayload = {
+  sessionId: string;
+  since?: string;
+  until?: string;
+  waitForCompletion?: boolean;
+  reason?: string;
+  summaryOnly?: boolean;
+};
+type SessionStoppedQueued = {
+  queued: true;
+  sessionId: string;
+  queueDepth: number;
+};
 type QueuedSessionStopped = SessionStoppedQueued & { done: Promise<unknown> };
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function triggerFailure(functionId: string, result: unknown): Error | null {
+  if (
+    !result ||
+    typeof result !== "object" ||
+    (result as { success?: boolean }).success !== false
+  ) {
+    return null;
+  }
+  const error = (result as { error?: unknown }).error ?? "unknown";
+  return new Error(`${functionId} returned failure: ${errorMessage(error)}`);
 }
 
 function enqueueSessionStopped(
@@ -48,8 +76,7 @@ function enqueueSessionStopped(
   reason: string,
   run: () => Promise<unknown>,
 ): QueuedSessionStopped {
-  const queueDepth =
-    activeConsolidations + pendingConsolidations.length + 1;
+  const queueDepth = activeConsolidations + pendingConsolidations.length + 1;
 
   const exec = async (): Promise<unknown> => {
     try {
@@ -104,14 +131,21 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction(
     "event::session::started",
     async (data: { sessionId: string; project: string; cwd: string }) => {
-      const { session, projectConflict } = await upsertSession(kv, data);
-      if (projectConflict) {
+      const { session, projectConflict, identityConflict } =
+        await upsertSession(kv, data);
+      if (identityConflict) {
         logger.warn("Session project conflict on start", {
           sessionId: data.sessionId,
-          existingProject: session.project,
+          existingProject: session?.project,
           incomingProject: data.project,
         });
+        return {
+          success: false,
+          error: `session identity conflict: ${identityConflict}`,
+          session,
+        };
       }
+      if (!session) throw new Error("session upsert returned no session");
       const contextResult = await sdk.trigger<
         { sessionId: string; project: string },
         { context: string }
@@ -119,7 +153,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
         function_id: "mem::context",
         payload: { sessionId: data.sessionId, project: session.project },
       });
-      return { session, context: contextResult.context };
+      return { session, context: contextResult.context, projectConflict };
     },
   );
   sdk.registerTrigger({
@@ -151,14 +185,33 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     // backlog outpace intake. The final summary is produced on session stop
     // or end; until then the graph and raw observations stay current.
     let shouldSummarize = reason !== "idle-checkpoint";
-    const session = summaryOnly === undefined
-      ? await kv.get<Session>(KV.sessions, sessionId)
-      : null;
-    const runsFullConsolidation = !(summaryOnly ?? Boolean(session?.parentSessionId));
-    const runsGraphExtraction = runsFullConsolidation && isGraphExtractionEnabled();
-    const observationsPromise = shouldSummarize || runsGraphExtraction
-      ? kv.list<CompressedObservation>(KV.observations(sessionId))
-      : Promise.resolve<CompressedObservation[]>([]);
+    const session =
+      summaryOnly === undefined
+        ? await kv.get<Session>(KV.sessions, sessionId)
+        : null;
+    const runsFullConsolidation = !(
+      summaryOnly ?? Boolean(session?.parentSessionId)
+    );
+    const runsGraphExtraction =
+      runsFullConsolidation && isGraphExtractionEnabled();
+    let windowSince = since;
+    let windowUntil = until;
+    if (shouldSummarize || runsGraphExtraction) {
+      const drain = await drainPendingCompression(sdk, kv, sessionId);
+      if (drain.remainingIds.length > 0) {
+        throw new Error(
+          `pending_compression_failed: ${drain.remainingIds.length} observation(s) remain`,
+        );
+      }
+      if (drain.completed > 0) {
+        windowSince = undefined;
+        windowUntil = undefined;
+      }
+    }
+    const observationsPromise =
+      shouldSummarize || runsGraphExtraction
+        ? kv.list<CompressedObservation>(KV.observations(sessionId))
+        : Promise.resolve<CompressedObservation[]>([]);
     let expectedSummaryObservationCount: number | null = null;
     if (shouldSummarize) {
       const [existingSummary, observations] = await Promise.all([
@@ -166,41 +219,51 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
         observationsPromise,
       ]);
       expectedSummaryObservationCount = observations.length;
-      shouldSummarize = existingSummary?.observationCount !== observations.length;
+      shouldSummarize =
+        existingSummary?.observationCount !== observations.length;
     }
-    const graphPromise: Promise<void> = runsGraphExtraction
+    const graphPromise: Promise<Error | null> = runsGraphExtraction
       ? (async () => {
           try {
             const observations = await observationsPromise;
-            const compressed = observations.filter((o) => o.title);
+            const compressed = observations.filter(
+              (observation) =>
+                Boolean(observation.title) &&
+                (!windowSince || isAfter(observation.timestamp, windowSince)) &&
+                (!windowUntil ||
+                  isAtOrBefore(observation.timestamp, windowUntil)),
+            );
             if (compressed.length > 0) {
-              await sdk.trigger({
+              const result = await sdk.trigger({
                 function_id: "mem::graph-extract",
                 payload: {
                   observations: compressed,
-                  ...(since ? { since } : {}),
-                  ...(until ? { until } : {}),
+                  ...(windowSince ? { since: windowSince } : {}),
+                  ...(windowUntil ? { until: windowUntil } : {}),
                 },
                 timeoutMs: getGraphExtractTimeoutMs(),
               });
+              return triggerFailure("mem::graph-extract", result);
             }
+            return null;
           } catch (err) {
-            logger.warn("graph-extract trigger failed", {
-              sessionId,
-              error: errorMessage(err),
-            });
+            return err instanceof Error ? err : new Error(errorMessage(err));
           }
         })()
-      : Promise.resolve();
+      : Promise.resolve(null);
 
     let summarizeError: Error | null = null;
     let summarizeWasNoOp = false;
+    let summarizeNoOpReason: string | undefined;
     let summary: unknown;
     if (shouldSummarize) {
       try {
         summary = await sdk.trigger({
           function_id: "mem::summarize",
-          payload: { sessionId, ...(until ? { until } : {}) },
+          payload: {
+            sessionId,
+            ...(windowUntil ? { until: windowUntil } : {}),
+          },
           timeoutMs: getSummarizeTimeoutMs(),
         });
         if (
@@ -211,6 +274,7 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
           const error = (summary as { error?: string }).error ?? "unknown";
           if (error === "no_provider" || error === "no_observations") {
             summarizeWasNoOp = true;
+            summarizeNoOpReason = error;
             logger.info("Summarize skipped as no-op, pipeline continues", {
               sessionId,
               error,
@@ -239,70 +303,85 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
       }
     }
 
+    let reflectError: Error | null = null;
     if (runsFullConsolidation && !summarizeError && isReflectEnabled()) {
       try {
-        await sdk.trigger({
+        const result = await sdk.trigger({
           function_id: "mem::slot-reflect",
           payload: {
             sessionId,
-            ...(since ? { since } : {}),
-            ...(until ? { until } : {}),
+            ...(windowSince ? { since: windowSince } : {}),
+            ...(windowUntil ? { until: windowUntil } : {}),
           },
         });
+        reflectError = triggerFailure("mem::slot-reflect", result);
       } catch (err) {
-        logger.warn("slot-reflect trigger failed", {
-          sessionId,
-          error: errorMessage(err),
-        });
+        reflectError =
+          err instanceof Error ? err : new Error(errorMessage(err));
       }
     }
 
-    await graphPromise;
+    const graphError = await graphPromise;
 
     if (summarizeError) throw summarizeError;
+    if (graphError) throw graphError;
+    if (reflectError) throw reflectError;
+    if (summarizeWasNoOp) {
+      return { success: true, noOp: true, reason: summarizeNoOpReason };
+    }
     return summary;
   };
 
-  sdk.registerFunction("event::session::stopped", async (data: SessionStoppedPayload) => {
-    const reason = data.reason ?? "stopped";
-    const queued = enqueueSessionStopped(data.sessionId, reason, async () =>
-      runSessionConsolidation({
-        sessionId: data.sessionId,
-        since: data.since,
-        until: data.until,
-        reason,
-        summaryOnly: data.summaryOnly,
-      }),
-    );
-    return data.waitForCompletion ? queued.done : {
-      queued: true,
-      sessionId: queued.sessionId,
-      queueDepth: queued.queueDepth,
-    };
-  });
+  sdk.registerFunction(
+    "event::session::stopped",
+    async (data: SessionStoppedPayload) => {
+      const reason = data.reason ?? "stopped";
+      const queued = enqueueSessionStopped(data.sessionId, reason, async () =>
+        runSessionConsolidation({
+          sessionId: data.sessionId,
+          since: data.since,
+          until: data.until,
+          reason,
+          summaryOnly: data.summaryOnly,
+        }),
+      );
+      return data.waitForCompletion
+        ? queued.done
+        : {
+            queued: true,
+            sessionId: queued.sessionId,
+            queueDepth: queued.queueDepth,
+          };
+    },
+  );
   sdk.registerTrigger({
     type: "durable:subscriber",
     function_id: "event::session::stopped",
     config: { topic: "agentmemory.session.stopped" },
   });
 
-  sdk.registerFunction("event::session::checkpoint", async (data: SessionStoppedPayload) => {
-    const reason = data.reason ?? "checkpoint";
-    const queued = enqueueSessionStopped(data.sessionId, reason, async () =>
-      runSessionConsolidation({
-        sessionId: data.sessionId,
-        since: data.since,
-        until: data.until,
-        reason,
-        summaryOnly: data.summaryOnly,
-      }),
-    );
-    return data.waitForCompletion ? queued.done : {
-      queued: true,
-      sessionId: queued.sessionId,
-      queueDepth: queued.queueDepth,
-    };
-  });
+  sdk.registerFunction(
+    "event::session::checkpoint",
+    async (data: SessionStoppedPayload) => {
+      const reason = data.reason ?? "checkpoint";
+      const queued = enqueueSessionStopped(data.sessionId, reason, async () =>
+        runSessionConsolidation({
+          sessionId: data.sessionId,
+          since: data.since,
+          until: data.until,
+          reason,
+          summaryOnly: data.summaryOnly,
+        }),
+      );
+      return data.waitForCompletion
+        ? queued.done
+        : {
+            queued: true,
+            sessionId: queued.sessionId,
+            queueDepth: queued.queueDepth,
+          };
+    },
+  );
   sdk.registerTrigger({
     type: "durable:subscriber",
     function_id: "event::session::checkpoint",

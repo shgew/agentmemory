@@ -1,6 +1,6 @@
 import type { ISdk } from "iii-sdk";
 import type {
-  ContextBlock,
+  ContextBlock, Session,
   ProjectProfile, MemorySlot, Lesson,
 } from "../types.js";
 import { KV } from "../state/schema.js";
@@ -32,7 +32,10 @@ export function registerContextFunction(
     async (data: { sessionId: string; project: string; budget?: number }) => {
       const budget = data.budget || tokenBudget;
       const blocks: ContextBlock[] = [];
-      const header = `<agentmemory-context project="${escapeXmlAttr(data.project)}">`;
+      const currentSession = await kv.get<Session>(KV.sessions, data.sessionId);
+      if (!currentSession) return { context: "", blocks: 0, tokens: 0 };
+      const project = currentSession.project;
+      const header = `<agentmemory-context project="${escapeXmlAttr(project)}">`;
       const footer = `</agentmemory-context>`;
       const wrapperTokens = estimateTokens(header) + estimateTokens(footer);
       const slotBlocks: ContextBlock[] = [];
@@ -40,10 +43,10 @@ export function registerContextFunction(
 
       const [pinnedSlots, profile, lessons] = await Promise.all([
         isSlotsEnabled()
-          ? listPinnedSlots(kv, data.project).catch(() => [] as MemorySlot[])
+          ? listPinnedSlots(kv, project).catch(() => [] as MemorySlot[])
           : Promise.resolve([] as MemorySlot[]),
         kv
-          .get<ProjectProfile>(KV.profiles, data.project)
+          .get<ProjectProfile>(KV.profiles, project)
           .catch(() => null),
         kv.list<Lesson>(KV.lessons).catch(() => [] as Lesson[]),
       ]);
@@ -99,16 +102,11 @@ export function registerContextFunction(
         }
       }
 
-      // Lessons — closes the loop opened by mem::lesson-save / mem::reflect.
-      // Without this block, lessons sit in KV and only surface when the agent
-      // thinks to call memory_lesson_recall. Ranking puts project-scoped
-      // lessons ahead of global ones, then weights by confidence; we cap at
-      // 10 before packing. #457.
       const relevantLessons = filterSupersededLessons(lessons)
-        .filter((l) => !l.project || l.project === data.project)
+        .filter((l) => !l.project || l.project === project)
         .sort((a, b) => {
-          const scoreA = (a.project === data.project ? 1.5 : 1) * a.confidence;
-          const scoreB = (b.project === data.project ? 1.5 : 1) * b.confidence;
+          const scoreA = (a.project === project ? 1.5 : 1) * a.confidence;
+          const scoreB = (b.project === project ? 1.5 : 1) * b.confidence;
           return scoreB - scoreA;
         })
         .slice(0, 10);
@@ -117,17 +115,12 @@ export function registerContextFunction(
         const lessonHeader = "## Lessons Learned";
         const lines = relevantLessons.map(
           (l) =>
-            `- (${l.confidence.toFixed(2)}) ${l.content}${l.context ? ` — ${l.context}` : ""}`,
+            `- (${l.confidence.toFixed(2)}) ${l.content}${l.context ? `: ${l.context}` : ""}`,
         );
         const fullContent = `${lessonHeader}\n${lines.join("\n")}`;
 
-        // Capacity-aware packing. The lessons block used to be emitted whole,
-        // so a real corpus (up to 10 lessons of hundreds of tokens each) blew
-        // past the budget and was dropped wholesale by the packing loop below,
-        // starving lessons out of every session with recent activity. Reserve
-        // the tokens the higher-priority slots/profile blocks will actually
-        // consume, then keep the full block when it fits, else pack the
-        // highest-ranked lessons up to a soft sub-budget. #457 starvation fix.
+        // Reserve higher-priority block capacity before fitting lessons so the
+        // packing loop cannot discard the entire lessons block.
         let reservedBeforeLessons = wrapperTokens;
         for (const slotBlock of slotBlocks) {
           if (reservedBeforeLessons + slotBlock.tokens > budget) continue;
@@ -179,7 +172,9 @@ export function registerContextFunction(
         }
       }
 
-      blocks.push(...(await buildSessionContextBlocks(kv, data)));
+      blocks.push(
+        ...(await buildSessionContextBlocks(kv, { ...data, project })),
+      );
 
       blocks.sort((a, b) => {
         const pa = a.priority ?? 0;
@@ -207,7 +202,7 @@ export function registerContextFunction(
       }
 
       if (selected.length === 0) {
-        logger.info("No context available", { project: data.project });
+        logger.info("No context available", { project });
         return { context: "", blocks: 0, tokens: 0 };
       }
 

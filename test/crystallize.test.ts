@@ -353,10 +353,6 @@ describe("Crystallize Functions", () => {
   });
 
   describe("mem::auto-crystallize", () => {
-    // These tests exercise the real crystallization work of the automatic
-    // entry point, which is now gated behind AUTO_CRYSTALLIZE_ENABLED. Enable
-    // the flag so the enabled-path behavior is characterized here; the
-    // "kill switch" block below covers the disabled path.
     beforeEach(() => {
       process.env.AUTO_CRYSTALLIZE_ENABLED = "true";
     });
@@ -531,11 +527,6 @@ describe("Crystallize Functions", () => {
     });
   });
 
-  // Kill switch: AUTO_CRYSTALLIZE_ENABLED gates ONLY the automatic entry
-  // point (mem::auto-crystallize). Manual mem::crystallize is never gated.
-  // Baseline (pinned by the "mem::auto-crystallize" block above): with no
-  // flag set today the auto path does real crystallization work. These tests
-  // pin the NEW behavior — with the flag unset/false the auto path must skip.
   describe("mem::auto-crystallize kill switch", () => {
     afterEach(() => {
       delete process.env.AUTO_CRYSTALLIZE_ENABLED;
@@ -555,7 +546,6 @@ describe("Crystallize Functions", () => {
         skipped: true,
         reason: "AUTO_CRYSTALLIZE_ENABLED=false",
       });
-      // MISLEADING SUCCESS OUTPUT guard: the skip must not look like a run.
       expect(result.success).toBeUndefined();
       expect(result.crystalIds).toBeUndefined();
       expect(result.groupCount).toBeUndefined();
@@ -586,10 +576,7 @@ describe("Crystallize Functions", () => {
 
       const crystals = await kv.list("mem:crystals");
       expect(crystals).toEqual([]);
-      // No crystallization work means the LLM provider is never touched, so a
-      // skip is distinguishable from "ran and found nothing to crystallize".
       expect(provider.summarize).not.toHaveBeenCalled();
-      // STALE STATE guard: the skipped action stays un-crystallized.
       const untouched = await kv.get<Action>("mem:actions", "act_ks3");
       expect(untouched!.crystallizedInto).toBeUndefined();
     });

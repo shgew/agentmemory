@@ -30,6 +30,229 @@ import { StateKV } from "../state/kv.js";
 import { VERSION } from "../version.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import {
+  buildSnapshotFromArrays,
+  edgeIndexKey,
+  nameIndexKey,
+} from "./graph.js";
+import { SNAPSHOT_KEY } from "../state/graph-snapshot.js";
+import { flushIndexSave, rebuildIndex } from "./search.js";
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateImportRows(
+  name: string,
+  value: unknown,
+  maxRows: number,
+  requiredFields: string[],
+): string | null {
+  if (!Array.isArray(value)) return `${name} must be an array`;
+  if (value.length > maxRows) return `Too many ${name} (max ${maxRows})`;
+  for (let index = 0; index < value.length; index++) {
+    const row = value[index];
+    if (!isRecord(row)) return `${name}[${index}] must be an object`;
+    for (const field of requiredFields) {
+      const fieldValue = row[field];
+      if (typeof fieldValue !== "string" || fieldValue.trim().length === 0) {
+        return `${name}[${index}].${field} must be a non-empty string`;
+      }
+    }
+  }
+  return null;
+}
+
+async function clearImportedState(kv: StateKV): Promise<void> {
+  const sessions = await kv.list<Session>(KV.sessions);
+  const observations = await Promise.all(
+    sessions.map(async (session) => ({
+      sessionId: session.id,
+      rows: await kv.list<CompressedObservation>(KV.observations(session.id)),
+    })),
+  );
+  const [
+    rawPayloads,
+    memories,
+    summaries,
+    actions,
+    actionEdges,
+    routines,
+    signals,
+    checkpoints,
+    sentinels,
+    sketches,
+    crystals,
+    facets,
+    lessons,
+    insights,
+    graphNodes,
+    graphEdges,
+    graphTombstones,
+    semantic,
+    procedural,
+    profiles,
+    accessLogs,
+  ] = await Promise.all([
+    kv.list<RawObservation>(KV.rawPayloads),
+    kv.list<Memory>(KV.memories),
+    kv.list<SessionSummary>(KV.summaries),
+    kv.list<Action>(KV.actions),
+    kv.list<ActionEdge>(KV.actionEdges),
+    kv.list<Routine>(KV.routines),
+    kv.list<Signal>(KV.signals),
+    kv.list<Checkpoint>(KV.checkpoints),
+    kv.list<Sentinel>(KV.sentinels),
+    kv.list<Sketch>(KV.sketches),
+    kv.list<Crystal>(KV.crystals),
+    kv.list<Facet>(KV.facets),
+    kv.list<Lesson>(KV.lessons),
+    kv.list<Insight>(KV.insights),
+    kv.list<GraphNode>(KV.graphNodes),
+    kv.list<GraphEdge>(KV.graphEdges),
+    kv.list<{ id: string }>(KV.graphTombstones),
+    kv.list<SemanticMemory>(KV.semantic),
+    kv.list<ProceduralMemory>(KV.procedural),
+    kv.list<ProjectProfile>(KV.profiles),
+    kv.list<AccessLogExport>(KV.accessLog),
+  ]);
+
+  for (const session of sessions) await kv.delete(KV.sessions, session.id);
+  for (const bucket of observations) {
+    for (const observation of bucket.rows) {
+      await kv.delete(KV.observations(bucket.sessionId), observation.id);
+    }
+  }
+  for (const row of rawPayloads) await kv.delete(KV.rawPayloads, row.id);
+  for (const row of memories) await kv.delete(KV.memories, row.id);
+  for (const row of summaries) await kv.delete(KV.summaries, row.sessionId);
+  for (const row of actions) await kv.delete(KV.actions, row.id);
+  for (const row of actionEdges) await kv.delete(KV.actionEdges, row.id);
+  for (const row of routines) await kv.delete(KV.routines, row.id);
+  for (const row of signals) await kv.delete(KV.signals, row.id);
+  for (const row of checkpoints) await kv.delete(KV.checkpoints, row.id);
+  for (const row of sentinels) await kv.delete(KV.sentinels, row.id);
+  for (const row of sketches) await kv.delete(KV.sketches, row.id);
+  for (const row of crystals) await kv.delete(KV.crystals, row.id);
+  for (const row of facets) await kv.delete(KV.facets, row.id);
+  for (const row of lessons) await kv.delete(KV.lessons, row.id);
+  for (const row of insights) await kv.delete(KV.insights, row.id);
+  for (const row of graphEdges) {
+    await kv.delete(KV.graphEdges, row.id);
+    await kv.delete(
+      KV.graphEdgeKey,
+      edgeIndexKey(row.sourceNodeId, row.targetNodeId, row.type),
+    );
+  }
+  for (const row of graphNodes) {
+    await kv.delete(KV.graphNodes, row.id);
+    await kv.delete(KV.graphNameIndex, nameIndexKey(row.type, row.name));
+    await kv.delete(KV.graphNodeDegree, row.id);
+  }
+  for (const row of graphTombstones) {
+    await kv.delete(KV.graphTombstones, row.id);
+  }
+  await kv.delete(KV.graphSnapshot, SNAPSHOT_KEY);
+  for (const row of semantic) await kv.delete(KV.semantic, row.id);
+  for (const row of procedural) await kv.delete(KV.procedural, row.id);
+  for (const row of profiles) await kv.delete(KV.profiles, row.project);
+  for (const row of accessLogs) await kv.delete(KV.accessLog, row.memoryId);
+}
+
+async function collectImageReferenceCounts(
+  kv: StateKV,
+): Promise<Map<string, number>> {
+  const [sessions, rawPayloads, memories] = await Promise.all([
+    kv.list<Session>(KV.sessions),
+    kv.list<RawObservation>(KV.rawPayloads),
+    kv.list<Memory>(KV.memories),
+  ]);
+  const observations = await Promise.all(
+    sessions.map((session) =>
+      kv.list<CompressedObservation>(KV.observations(session.id)),
+    ),
+  );
+  const owners = new Map<string, Set<string>>();
+  const add = (owner: string, value: unknown) => {
+    if (typeof value !== "string" || value.length === 0) return;
+    const refs = owners.get(owner) ?? new Set<string>();
+    refs.add(value);
+    owners.set(owner, refs);
+  };
+  for (const raw of rawPayloads) add(`observation:${raw.id}`, raw.imageData);
+  for (const bucket of observations) {
+    for (const observation of bucket) {
+      const owner = `observation:${observation.id}`;
+      add(owner, observation.imageData);
+      add(owner, observation.imageRef);
+    }
+  }
+  for (const memory of memories) {
+    const owner = `memory:${memory.id}`;
+    add(owner, memory.imageData);
+    add(owner, memory.imageRef);
+  }
+  const counts = new Map<string, number>();
+  for (const refs of owners.values()) {
+    for (const ref of refs) counts.set(ref, (counts.get(ref) ?? 0) + 1);
+  }
+  return counts;
+}
+
+async function rebuildImageReferenceCounts(
+  kv: StateKV,
+  previousRefs: ReadonlySet<string>,
+): Promise<number> {
+  const counts = await collectImageReferenceCounts(kv);
+  await Promise.all(
+    Array.from(counts, ([ref, count]) => kv.set(KV.imageRefs, ref, count)),
+  );
+  await Promise.all(
+    [...previousRefs]
+      .filter((ref) => !counts.has(ref))
+      .map((ref) => kv.delete(KV.imageRefs, ref)),
+  );
+  return counts.size;
+}
+
+async function rebuildImportedGraphState(kv: StateKV): Promise<void> {
+  const [nodes, edges] = await Promise.all([
+    kv.list<GraphNode>(KV.graphNodes),
+    kv.list<GraphEdge>(KV.graphEdges),
+  ]);
+  const liveNodes = nodes.filter((node) => !node.stale);
+  const liveEdges = edges.filter((edge) => !edge.stale);
+  const degrees = new Map<string, number>();
+  for (const edge of liveEdges) {
+    degrees.set(edge.sourceNodeId, (degrees.get(edge.sourceNodeId) ?? 0) + 1);
+    degrees.set(edge.targetNodeId, (degrees.get(edge.targetNodeId) ?? 0) + 1);
+  }
+  const batchSize = 100;
+  for (let offset = 0; offset < liveNodes.length; offset += batchSize) {
+    await Promise.all(
+      liveNodes.slice(offset, offset + batchSize).flatMap((node) => [
+        kv.set(KV.graphNameIndex, nameIndexKey(node.type, node.name), node.id),
+        kv.set(KV.graphNodeDegree, node.id, degrees.get(node.id) ?? 0),
+      ]),
+    );
+  }
+  for (let offset = 0; offset < liveEdges.length; offset += batchSize) {
+    await Promise.all(
+      liveEdges.slice(offset, offset + batchSize).map((edge) =>
+        kv.set(
+          KV.graphEdgeKey,
+          edgeIndexKey(edge.sourceNodeId, edge.targetNodeId, edge.type),
+          edge.id,
+        ),
+      ),
+    );
+  }
+  await kv.set(
+    KV.graphSnapshot,
+    SNAPSHOT_KEY,
+    buildSnapshotFromArrays(nodes, edges),
+  );
+}
 
 export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::export", 
@@ -51,7 +274,6 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         paginatedSessions.map((session) =>
           kv
             .list<CompressedObservation>(KV.observations(session.id))
-            .catch(() => [] as CompressedObservation[])
             .then((obs) => ({ sessionId: session.id, obs })),
         ),
       );
@@ -63,15 +285,15 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       const exportedSessionIds = new Set(
         paginatedSessions.map((session) => session.id),
       );
-      const rawPayloads = (
-        await kv.list<RawObservation>(KV.rawPayloads).catch(() => [])
-      ).filter((raw) => exportedSessionIds.has(raw.sessionId));
+      const rawPayloads = (await kv.list<RawObservation>(KV.rawPayloads)).filter(
+        (raw) => exportedSessionIds.has(raw.sessionId),
+      );
 
       const profiles: ProjectProfile[] = [];
       const uniqueProjects = [...new Set(paginatedSessions.map((s) => s.project))];
       const profileResults = await Promise.all(
         uniqueProjects.map((project) =>
-          kv.get<ProjectProfile>(KV.profiles, project).catch(() => null),
+          kv.get<ProjectProfile>(KV.profiles, project),
         ),
       );
       for (const profile of profileResults) {
@@ -96,22 +318,22 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         checkpoints,
         accessLogs,
       ] = await Promise.all([
-        kv.list<GraphNode>(KV.graphNodes).catch(() => []),
-        kv.list<GraphEdge>(KV.graphEdges).catch(() => []),
-        kv.list<SemanticMemory>(KV.semantic).catch(() => []),
-        kv.list<ProceduralMemory>(KV.procedural).catch(() => []),
-        kv.list<Action>(KV.actions).catch(() => []),
-        kv.list<ActionEdge>(KV.actionEdges).catch(() => []),
-        kv.list<Sentinel>(KV.sentinels).catch(() => []),
-        kv.list<Sketch>(KV.sketches).catch(() => []),
-        kv.list<Crystal>(KV.crystals).catch(() => []),
-        kv.list<Facet>(KV.facets).catch(() => []),
-        kv.list<Lesson>(KV.lessons).catch(() => []),
-        kv.list<Insight>(KV.insights).catch(() => []),
-        kv.list<Routine>(KV.routines).catch(() => []),
-        kv.list<Signal>(KV.signals).catch(() => []),
-        kv.list<Checkpoint>(KV.checkpoints).catch(() => []),
-        kv.list<AccessLogExport>(KV.accessLog).catch(() => []),
+        kv.list<GraphNode>(KV.graphNodes),
+        kv.list<GraphEdge>(KV.graphEdges),
+        kv.list<SemanticMemory>(KV.semantic),
+        kv.list<ProceduralMemory>(KV.procedural),
+        kv.list<Action>(KV.actions),
+        kv.list<ActionEdge>(KV.actionEdges),
+        kv.list<Sentinel>(KV.sentinels),
+        kv.list<Sketch>(KV.sketches),
+        kv.list<Crystal>(KV.crystals),
+        kv.list<Facet>(KV.facets),
+        kv.list<Lesson>(KV.lessons),
+        kv.list<Insight>(KV.insights),
+        kv.list<Routine>(KV.routines),
+        kv.list<Signal>(KV.signals),
+        kv.list<Checkpoint>(KV.checkpoints),
+        kv.list<AccessLogExport>(KV.accessLog),
       ]);
 
       const exportData: ExportData = {
@@ -181,6 +403,9 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         return { success: false, error: "exportData with string version is required" };
       }
       const strategy = data.strategy || "merge";
+      if (!["merge", "replace", "skip"].includes(strategy)) {
+        return { success: false, error: "strategy must be merge, replace, or skip" };
+      }
       const importData = data.exportData;
 
       const supportedVersions = new Set(["0.3.0", "0.4.0", "0.5.0", "0.6.0", "0.6.1", "0.7.0", "0.7.2", "0.7.3", "0.7.4", "0.7.5", "0.7.6", "0.7.7", "0.7.9", "0.8.0", "0.8.1", "0.8.2", "0.8.3", "0.8.4", "0.8.5", "0.8.6", "0.8.7", "0.8.8", "0.8.9", "0.8.10", "0.8.11", "0.8.12", "0.8.13", "0.9.0", "0.9.1", "0.9.2", "0.9.3", "0.9.4", "0.9.5", "0.9.6", "0.9.7", "0.9.8", "0.9.9", "0.9.10", "0.9.11", "0.9.12", "0.9.13", "0.9.14", "0.9.15", "0.9.16", "0.9.17", "0.9.18", "0.9.19", "0.9.20", "0.9.21", "0.9.22", "0.9.23", "0.9.24", "0.9.25", "0.9.26", "0.9.27"]);
@@ -191,6 +416,29 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         };
       }
 
+      if (strategy === "replace" && importData.pagination !== undefined) {
+        const pagination = importData.pagination as unknown;
+        const isCompletePage =
+          isRecord(pagination) &&
+          pagination.offset === 0 &&
+          typeof pagination.limit === "number" &&
+          Number.isSafeInteger(pagination.limit) &&
+          pagination.limit > 0 &&
+          typeof pagination.total === "number" &&
+          Number.isSafeInteger(pagination.total) &&
+          pagination.total >= 0 &&
+          pagination.hasMore === false &&
+          Array.isArray(importData.sessions) &&
+          pagination.total === importData.sessions.length &&
+          pagination.limit >= pagination.total;
+        if (!isCompletePage) {
+          return {
+            success: false,
+            error: "replace requires an export containing all sessions",
+          };
+        }
+      }
+
       const MAX_SESSIONS = 10_000;
       const MAX_MEMORIES = 50_000;
       const MAX_SUMMARIES = 10_000;
@@ -199,47 +447,26 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       const MAX_ACCESS_LOGS = 50_000;
       const MAX_RAW_PAYLOADS = 500_000;
 
-      if (!Array.isArray(importData.sessions)) {
-        return { success: false, error: "sessions must be an array" };
-      }
-      if (!Array.isArray(importData.memories)) {
-        return { success: false, error: "memories must be an array" };
-      }
-      if (!Array.isArray(importData.summaries)) {
-        return { success: false, error: "summaries must be an array" };
-      }
-      if (
-        typeof importData.observations !== "object" ||
-        importData.observations === null ||
-        Array.isArray(importData.observations)
-      ) {
-        return { success: false, error: "observations must be an object" };
-      }
-      if (
-        importData.rawPayloads !== undefined &&
-        !Array.isArray(importData.rawPayloads)
-      ) {
-        return { success: false, error: "rawPayloads must be an array" };
+      const requiredCollections = [
+        ["sessions", importData.sessions, MAX_SESSIONS, ["id", "project"]],
+        ["memories", importData.memories, MAX_MEMORIES, ["id"]],
+        ["summaries", importData.summaries, MAX_SUMMARIES, ["sessionId"]],
+        [
+          "rawPayloads",
+          importData.rawPayloads ?? [],
+          MAX_RAW_PAYLOADS,
+          ["id", "sessionId"],
+        ],
+      ] as const;
+      for (const [name, value, maxRows, fields] of requiredCollections) {
+        const error = validateImportRows(name, value, maxRows, [...fields]);
+        if (error) return { success: false, error };
       }
 
-      if (importData.sessions.length > MAX_SESSIONS) {
-        return {
-          success: false,
-          error: `Too many sessions (max ${MAX_SESSIONS})`,
-        };
+      if (!isRecord(importData.observations)) {
+        return { success: false, error: "observations must be an object" };
       }
-      if (importData.memories.length > MAX_MEMORIES) {
-        return {
-          success: false,
-          error: `Too many memories (max ${MAX_MEMORIES})`,
-        };
-      }
-      if (importData.summaries.length > MAX_SUMMARIES) {
-        return {
-          success: false,
-          error: `Too many summaries (max ${MAX_SUMMARIES})`,
-        };
-      }
+
       const MAX_OBS_BUCKETS = 10_000;
       const obsBuckets = Object.keys(importData.observations);
       if (obsBuckets.length > MAX_OBS_BUCKETS) {
@@ -250,14 +477,25 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       }
 
       let totalObservations = 0;
-      for (const [, obs] of Object.entries(importData.observations)) {
-        if (!Array.isArray(obs)) {
-          return { success: false, error: "observation values must be arrays" };
+      for (const [sessionId, obs] of Object.entries(importData.observations)) {
+        if (!sessionId.trim()) {
+          return { success: false, error: "observation bucket ids must be non-empty" };
         }
-        if (obs.length > MAX_OBS_PER_SESSION) {
+        const error = validateImportRows(
+          `observations.${sessionId}`,
+          obs,
+          MAX_OBS_PER_SESSION,
+          ["id", "sessionId"],
+        );
+        if (error) return { success: false, error };
+        if (
+          obs.some(
+            (observation) => observation.sessionId !== sessionId,
+          )
+        ) {
           return {
             success: false,
-            error: `Too many observations per session (max ${MAX_OBS_PER_SESSION})`,
+            error: `observations.${sessionId} contains a mismatched sessionId`,
           };
         }
         totalObservations += obs.length;
@@ -268,11 +506,35 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           error: `Too many total observations (max ${MAX_TOTAL_OBSERVATIONS})`,
         };
       }
-      if ((importData.rawPayloads?.length ?? 0) > MAX_RAW_PAYLOADS) {
-        return {
-          success: false,
-          error: `Too many raw payloads (max ${MAX_RAW_PAYLOADS})`,
-        };
+      const optionalCollections = [
+        ["profiles", 10_000, ["project"]],
+        ["graphNodes", 500_000, ["id", "type", "name"]],
+        [
+          "graphEdges",
+          500_000,
+          ["id", "sourceNodeId", "targetNodeId", "type"],
+        ],
+        ["semanticMemories", 100_000, ["id"]],
+        ["proceduralMemories", 100_000, ["id"]],
+        ["actions", 100_000, ["id"]],
+        ["actionEdges", 100_000, ["id"]],
+        ["routines", 100_000, ["id"]],
+        ["signals", 100_000, ["id"]],
+        ["checkpoints", 100_000, ["id"]],
+        ["sentinels", 100_000, ["id"]],
+        ["sketches", 100_000, ["id"]],
+        ["crystals", 100_000, ["id"]],
+        ["facets", 100_000, ["id"]],
+        ["lessons", 100_000, ["id"]],
+        ["insights", 100_000, ["id"]],
+        ["accessLogs", MAX_ACCESS_LOGS, ["memoryId"]],
+      ] as const;
+      const importRecord = importData as unknown as Record<string, unknown>;
+      for (const [name, maxRows, fields] of optionalCollections) {
+        const value = importRecord[name];
+        if (value === undefined) continue;
+        const error = validateImportRows(name, value, maxRows, [...fields]);
+        if (error) return { success: false, error };
       }
 
       const stats = {
@@ -283,83 +545,11 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         summaries: 0,
         skipped: 0,
       };
+      const previousImageRefs = new Set(
+        (await collectImageReferenceCounts(kv)).keys(),
+      );
 
-      if (strategy === "replace") {
-        const existing = await kv.list<Session>(KV.sessions);
-        for (const session of existing) {
-          await kv.delete(KV.sessions, session.id);
-          const obs = await kv
-            .list<CompressedObservation>(KV.observations(session.id))
-            .catch(() => []);
-          for (const o of obs) {
-            await kv.delete(KV.observations(session.id), o.id);
-          }
-        }
-        for (const raw of await kv
-          .list<RawObservation>(KV.rawPayloads)
-          .catch(() => [])) {
-          await kv.delete(KV.rawPayloads, raw.id);
-        }
-        const existingMem = await kv.list<Memory>(KV.memories);
-        for (const m of existingMem) {
-          await kv.delete(KV.memories, m.id);
-        }
-        const existingSummaries = await kv.list<SessionSummary>(KV.summaries);
-        for (const s of existingSummaries) {
-          await kv.delete(KV.summaries, s.sessionId);
-        }
-        for (const a of await kv.list<Action>(KV.actions).catch(() => [])) {
-          await kv.delete(KV.actions, a.id);
-        }
-        for (const e of await kv.list<ActionEdge>(KV.actionEdges).catch(() => [])) {
-          await kv.delete(KV.actionEdges, e.id);
-        }
-        for (const r of await kv.list<Routine>(KV.routines).catch(() => [])) {
-          await kv.delete(KV.routines, r.id);
-        }
-        for (const s of await kv.list<Signal>(KV.signals).catch(() => [])) {
-          await kv.delete(KV.signals, s.id);
-        }
-        for (const c of await kv.list<Checkpoint>(KV.checkpoints).catch(() => [])) {
-          await kv.delete(KV.checkpoints, c.id);
-        }
-        for (const s of await kv.list<Sentinel>(KV.sentinels).catch(() => [])) {
-          await kv.delete(KV.sentinels, s.id);
-        }
-        for (const s of await kv.list<Sketch>(KV.sketches).catch(() => [])) {
-          await kv.delete(KV.sketches, s.id);
-        }
-        for (const c of await kv.list<Crystal>(KV.crystals).catch(() => [])) {
-          await kv.delete(KV.crystals, c.id);
-        }
-        for (const f of await kv.list<Facet>(KV.facets).catch(() => [])) {
-          await kv.delete(KV.facets, f.id);
-        }
-        for (const l of await kv.list<Lesson>(KV.lessons).catch(() => [])) {
-          await kv.delete(KV.lessons, l.id);
-        }
-        for (const i of await kv.list<Insight>(KV.insights).catch(() => [])) {
-          await kv.delete(KV.insights, i.id);
-        }
-        for (const n of await kv.list<{ id: string }>(KV.graphNodes).catch(() => [])) {
-          await kv.delete(KV.graphNodes, n.id);
-        }
-        for (const e of await kv.list<{ id: string }>(KV.graphEdges).catch(() => [])) {
-          await kv.delete(KV.graphEdges, e.id);
-        }
-        for (const s of await kv.list<{ id: string }>(KV.semantic).catch(() => [])) {
-          await kv.delete(KV.semantic, s.id);
-        }
-        for (const p of await kv.list<{ id: string }>(KV.procedural).catch(() => [])) {
-          await kv.delete(KV.procedural, p.id);
-        }
-        for (const profile of await kv.list<ProjectProfile>(KV.profiles).catch(() => [])) {
-          await kv.delete(KV.profiles, profile.project);
-        }
-        for (const a of await kv.list<AccessLogExport>(KV.accessLog).catch(() => [])) {
-          await kv.delete(KV.accessLog, a.memoryId);
-        }
-      }
+      if (strategy === "replace") await clearImportedState(kv);
 
       for (const session of importData.sessions) {
         if (strategy === "skip") {
@@ -415,11 +605,10 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
             continue;
           }
         }
-        // Older exports + hand-edited dumps can omit this field.
-        if (!Array.isArray(memory.sessionIds)) {
-          memory.sessionIds = [];
-        }
-        await kv.set(KV.memories, memory.id, memory);
+        const normalizedMemory = Array.isArray(memory.sessionIds)
+          ? memory
+          : { ...memory, sessionIds: [] };
+        await kv.set(KV.memories, memory.id, normalizedMemory);
         stats.memories++;
       }
 
@@ -439,20 +628,56 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
 
       if (importData.graphNodes) {
         for (const node of importData.graphNodes) {
-          if (strategy === "skip") {
-            const existing = await kv.get(KV.graphNodes, node.id).catch(() => null);
-            if (existing) { stats.skipped++; continue; }
+          const existing = await kv
+            .get<GraphNode>(KV.graphNodes, node.id)
+            .catch(() => null);
+          if (strategy === "skip" && existing) {
+            stats.skipped++;
+            continue;
+          }
+          if (
+            existing &&
+            nameIndexKey(existing.type, existing.name) !==
+              nameIndexKey(node.type, node.name)
+          ) {
+            await kv.delete(
+              KV.graphNameIndex,
+              nameIndexKey(existing.type, existing.name),
+            );
           }
           await kv.set(KV.graphNodes, node.id, node);
+          await kv.delete(KV.graphTombstones, node.id);
         }
       }
       if (importData.graphEdges) {
         for (const edge of importData.graphEdges) {
-          if (strategy === "skip") {
-            const existing = await kv.get(KV.graphEdges, edge.id).catch(() => null);
-            if (existing) { stats.skipped++; continue; }
+          const existing = await kv
+            .get<GraphEdge>(KV.graphEdges, edge.id)
+            .catch(() => null);
+          if (strategy === "skip" && existing) {
+            stats.skipped++;
+            continue;
+          }
+          if (
+            existing &&
+            edgeIndexKey(
+              existing.sourceNodeId,
+              existing.targetNodeId,
+              existing.type,
+            ) !==
+              edgeIndexKey(edge.sourceNodeId, edge.targetNodeId, edge.type)
+          ) {
+            await kv.delete(
+              KV.graphEdgeKey,
+              edgeIndexKey(
+                existing.sourceNodeId,
+                existing.targetNodeId,
+                existing.type,
+              ),
+            );
           }
           await kv.set(KV.graphEdges, edge.id, edge);
+          await kv.delete(KV.graphTombstones, edge.id);
         }
       }
       if (importData.semanticMemories) {
@@ -616,12 +841,30 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         }
       }
 
-      logger.info("Import complete", { strategy, ...stats });
+      if (
+        strategy === "replace" ||
+        (importData.graphNodes?.length ?? 0) > 0 ||
+        (importData.graphEdges?.length ?? 0) > 0
+      ) {
+        await rebuildImportedGraphState(kv);
+      }
+      const imageRefs = await rebuildImageReferenceCounts(kv, previousImageRefs);
+      const indexEntries = await rebuildIndex(kv, { strict: true });
+      await flushIndexSave();
+
+      logger.info("Import complete", {
+        strategy,
+        imageRefs,
+        indexEntries,
+        ...stats,
+      });
       await recordAudit(kv, "import", "mem::import", [], {
         strategy,
+        imageRefs,
+        indexEntries,
         stats,
       });
-      return { success: true, strategy, ...stats };
+      return { success: true, strategy, imageRefs, indexEntries, ...stats };
     },
   );
 }

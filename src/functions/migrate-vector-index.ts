@@ -3,6 +3,10 @@ import { VectorIndex } from "../state/vector-index.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
+import {
+  clipEmbedInput,
+  getRebuildEmbedBatchSize,
+} from "../state/embedding-input.js";
 
 export interface MigrateVectorIndexResult {
   success: boolean;
@@ -19,21 +23,78 @@ export interface MigrateVectorIndexResult {
 // provider returning the wrong-length Float32Array would silently corrupt
 // the rebuilt index (per #248).
 function isValidEmbedding(
-  embedding: Float32Array,
+  embedding: Float32Array | undefined,
   provider: EmbeddingProvider,
   context: { kind: "memory" | "observation"; id: string },
 ): boolean {
-  if (embedding.length !== provider.dimensions) {
+  if (!embedding || embedding.length !== provider.dimensions) {
     logger.warn("migrateVectorIndex: dimension mismatch — skipping", {
       kind: context.kind,
       id: context.id,
       provider: provider.name,
       expected: provider.dimensions,
-      received: embedding.length,
+      received: embedding?.length ?? null,
     });
     return false;
   }
   return true;
+}
+
+type MigrationJob = {
+  id: string;
+  sessionId: string;
+  text: string;
+  kind: "memory" | "observation";
+};
+
+async function embedJobs(
+  jobs: MigrationJob[],
+  provider: EmbeddingProvider,
+  index: VectorIndex,
+): Promise<{ processed: number; failed: number }> {
+  let processed = 0;
+  let failed = 0;
+  const batchSize = getRebuildEmbedBatchSize();
+  for (let offset = 0; offset < jobs.length; offset += batchSize) {
+    const batch = jobs.slice(offset, offset + batchSize);
+    let embeddings: Float32Array[];
+    try {
+      embeddings = await provider.embedBatch(
+        batch.map((job) => clipEmbedInput(job.text)),
+      );
+    } catch (err) {
+      logger.warn("migrateVectorIndex: embedding batch failed", {
+        batchSize: batch.length,
+        provider: provider.name,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      failed += batch.length;
+      continue;
+    }
+    if (embeddings.length !== batch.length) {
+      logger.warn("migrateVectorIndex: provider returned wrong batch length", {
+        batchSize: batch.length,
+        returned: embeddings.length,
+        provider: provider.name,
+      });
+      failed += batch.length;
+      continue;
+    }
+    for (let indexInBatch = 0; indexInBatch < batch.length; indexInBatch++) {
+      const job = batch[indexInBatch];
+      const embedding = embeddings[indexInBatch];
+      if (!isValidEmbedding(embedding, provider, {
+        kind: job.kind,
+        id: job.id,
+      })) {
+        failed++;
+        continue;
+      }
+      index.add(job.id, job.sessionId, embedding);
+      processed++;
+    }
+  }
+  return { processed, failed };
 }
 
 // Rebuilds a fresh VectorIndex against `newProvider`, re-embedding every
@@ -55,41 +116,28 @@ export async function migrateVectorIndex(
   // textMems is declared outside the try so the catch can attribute the
   // batch-level failure to the correct number of missed embeddings (the
   // size of the batch we were about to embed), not a flat +1.
-  let textMems: Memory[] = [];
   try {
     const memories = await kv.list<Memory>(KV.memories);
-    textMems = memories.filter(
+    const textMems = memories.filter(
       (m) => m.isLatest !== false && m.title && m.content && m.content.trim() !== "",
     );
-    const texts = textMems.map((m) => m.title + " " + m.content);
-
-    if (texts.length > 0) {
-      const embeddings = await newProvider.embedBatch(texts);
-      for (let i = 0; i < textMems.length; i++) {
-        if (!isValidEmbedding(embeddings[i], newProvider, { kind: "memory", id: textMems[i].id })) {
-          failed++;
-          continue;
-        }
-        newIndex.add(
-          textMems[i].id,
-          textMems[i].sessionIds[0] ?? "memory",
-          embeddings[i],
-        );
-        processed++;
-      }
-    }
+    const result = await embedJobs(
+      textMems.map((memory) => ({
+        id: memory.id,
+        sessionId: memory.sessionIds[0] ?? "memory",
+        text: `${memory.title} ${memory.content}`,
+        kind: "memory",
+      })),
+      newProvider,
+      newIndex,
+    );
+    processed += result.processed;
+    failed += result.failed;
   } catch (err) {
-    // If kv.list threw before textMems was populated, the batch size is
-    // unknown — count as +1 (something failed but we don't know what).
-    // If embedBatch threw, textMems.length is the real number of missed
-    // memories. Caller relying on `failed` for retry math needs this
-    // attribution to be accurate.
-    const missed = textMems.length > 0 ? textMems.length : 1;
     logger.warn("migrateVectorIndex: failed to re-embed memories", {
-      missed,
       error: err instanceof Error ? err.message : String(err),
     });
-    failed += missed;
+    failed++;
   }
 
   // --- Observations phase (per-session isolation) ------------------------
@@ -121,18 +169,19 @@ export async function migrateVectorIndex(
         KV.observations(session.id),
       );
       const textObs = observations.filter((o) => o.title);
-      const texts = textObs.map((o) => o.title + " " + (o.narrative || ""));
-      if (texts.length === 0) continue;
-
-      const embeddings = await newProvider.embedBatch(texts);
-      for (let i = 0; i < textObs.length; i++) {
-        if (!isValidEmbedding(embeddings[i], newProvider, { kind: "observation", id: textObs[i].id })) {
-          failed++;
-          continue;
-        }
-        newIndex.add(textObs[i].id, textObs[i].sessionId, embeddings[i]);
-        processed++;
-      }
+      const result = await embedJobs(
+        textObs.map((observation) => ({
+          id: observation.id,
+          sessionId: observation.sessionId,
+          text: `${observation.title} ${observation.narrative || ""}`,
+          kind: "observation",
+        })),
+        newProvider,
+        newIndex,
+      );
+      processed += result.processed;
+      failed += result.failed;
+      if (result.failed > 0) failedSessions.push(session.id);
     } catch (err) {
       logger.warn("migrateVectorIndex: failed to re-embed session", {
         sessionId: session.id,

@@ -1,4 +1,12 @@
-import { readFileSync, writeFileSync, readdirSync, mkdirSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+} from "node:fs";
+import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -72,6 +80,7 @@ export interface ClassifyResult {
 }
 
 const DEFAULT_TOP_N = 500;
+const NEAR_TOTAL_PRUNE_RATIO = 0.9;
 
 // Relevance is reachability from live data: a node is relevant when it is not
 // stale and at least one of its source observation ids is still in the live set
@@ -213,7 +222,7 @@ export function classifyGraph(input: ClassifyInput): ClassifyResult {
   };
 }
 
-interface CliArgs {
+export interface CliArgs {
   nodes?: string;
   edges?: string;
   obsDir?: string;
@@ -221,9 +230,11 @@ interface CliArgs {
   resetAt?: string;
   top?: number;
   out?: string;
+  allowEmptyLiveSet?: boolean;
+  allowNearTotalPrune?: boolean;
 }
 
-function parseArgs(argv: string[]): CliArgs {
+export function parseArgs(argv: string[]): CliArgs {
   const args: CliArgs = {};
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
@@ -250,14 +261,26 @@ function parseArgs(argv: string[]): CliArgs {
         i += 1;
         break;
       case "--top": {
-        const parsed = Number.parseInt(value ?? "", 10);
-        if (!Number.isNaN(parsed)) args.top = parsed;
+        if (!value || !/^[1-9]\d*$/.test(value)) {
+          throw new Error("--top must be a positive integer");
+        }
+        const parsed = Number(value);
+        if (!Number.isSafeInteger(parsed)) {
+          throw new Error("--top must be a positive integer");
+        }
+        args.top = parsed;
         i += 1;
         break;
       }
       case "--out":
         args.out = value;
         i += 1;
+        break;
+      case "--allow-empty-live-set":
+        args.allowEmptyLiveSet = true;
+        break;
+      case "--allow-near-total-prune":
+        args.allowNearTotalPrune = true;
         break;
       default:
         break;
@@ -339,19 +362,92 @@ function collectLiveIds(
   return liveSet;
 }
 
-function main(argv: string[]): void {
+function assertSafePrune(
+  result: ClassifyResult,
+  allowNearTotalPrune: boolean,
+): void {
+  if (allowNearTotalPrune) return;
+
+  const totalRows = result.report.totalNodes + result.report.totalEdges;
+  const keptRows = result.report.keptNodes + result.report.keptEdges;
+  if (totalRows === 0 || keptRows === 0) {
+    throw new Error(
+      "prune would produce an empty graph; rerun with --allow-near-total-prune after verifying inputs",
+    );
+  }
+
+  const pruneRatios: Array<[string, number]> = [
+    [
+      "nodes",
+      result.report.totalNodes === 0
+        ? 0
+        : result.report.doomedNodes / result.report.totalNodes,
+    ],
+    [
+      "edges",
+      result.report.totalEdges === 0
+        ? 0
+        : result.report.doomedEdges / result.report.totalEdges,
+    ],
+  ];
+  for (const [resource, pruneRatio] of pruneRatios) {
+    if (pruneRatio >= NEAR_TOTAL_PRUNE_RATIO) {
+      throw new Error(
+        `prune would remove ${(pruneRatio * 100).toFixed(1)}% of ${resource}; rerun with --allow-near-total-prune after verifying inputs`,
+      );
+    }
+  }
+}
+
+function writeOutputsAtomically(
+  outDir: string,
+  result: ClassifyResult,
+): void {
+  mkdirSync(outDir, { recursive: true });
+  const outputs: Array<[string, unknown]> = [
+    ["report.json", result.report],
+    ["manifest.json", result.manifest],
+    ["pruned-snapshot.json", result.prunedSnapshot],
+  ];
+  const pending = outputs.map(([name, value]) => ({
+    target: join(outDir, name),
+    temporary: join(outDir, `.${name}.${process.pid}.${randomUUID()}.tmp`),
+    contents: JSON.stringify(value, null, 2),
+  }));
+
+  try {
+    for (const output of pending) {
+      writeFileSync(output.temporary, output.contents, { flag: "wx" });
+    }
+    for (const output of pending) {
+      renameSync(output.temporary, output.target);
+    }
+  } finally {
+    for (const output of pending) rmSync(output.temporary, { force: true });
+  }
+}
+
+export function runPruneClassifier(argv: string[]): ClassifyResult {
   const args = parseArgs(argv);
   if (!args.nodes || !args.edges || !args.out) {
-    console.error(
-      "usage: prune-classify --nodes <path> --edges <path> --obs-dir <dir> --memories <path> [--reset-at <iso>] [--top <n>] --out <dir>",
+    throw new Error(
+      "usage: prune-classify --nodes <path> --edges <path> --obs-dir <dir> --memories <path> [--reset-at <iso>] [--top <n>] [--allow-empty-live-set] [--allow-near-total-prune] --out <dir>",
     );
-    process.exit(2);
-    return;
+  }
+  if ((!args.obsDir || !args.memories) && !args.allowEmptyLiveSet) {
+    throw new Error(
+      "--obs-dir and --memories are required live-source inputs; use --allow-empty-live-set only after verifying an incomplete source set is intentional",
+    );
   }
 
   const nodes = readRows<GraphNode>(args.nodes);
   const edges = readRows<GraphEdge>(args.edges);
   const liveSet = collectLiveIds(args.obsDir, args.memories);
+  if (liveSet.size === 0 && !args.allowEmptyLiveSet) {
+    throw new Error(
+      "live-source inputs contain no IDs; use --allow-empty-live-set only after verifying this is intentional",
+    );
+  }
   const result = classifyGraph({
     nodes,
     edges,
@@ -360,25 +456,20 @@ function main(argv: string[]): void {
     topN: args.top,
   });
 
-  mkdirSync(args.out, { recursive: true });
-  writeFileSync(
-    join(args.out, "report.json"),
-    JSON.stringify(result.report, null, 2),
-  );
-  writeFileSync(
-    join(args.out, "manifest.json"),
-    JSON.stringify(result.manifest, null, 2),
-  );
-  writeFileSync(
-    join(args.out, "pruned-snapshot.json"),
-    JSON.stringify(result.prunedSnapshot, null, 2),
-  );
-  console.log(JSON.stringify(result.report, null, 2));
+  assertSafePrune(result, args.allowNearTotalPrune === true);
+  writeOutputsAtomically(args.out, result);
+  return result;
 }
 
 const invokedDirectly =
   process.argv[1] !== undefined &&
   import.meta.url === pathToFileURL(process.argv[1]).href;
 if (invokedDirectly) {
-  main(process.argv.slice(2));
+  try {
+    const result = runPruneClassifier(process.argv.slice(2));
+    console.log(JSON.stringify(result.report, null, 2));
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 2;
+  }
 }

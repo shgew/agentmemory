@@ -13,8 +13,11 @@ export function registerHealthMonitor(
   let prevCpuUsage = process.cpuUsage();
   let prevCpuTime = Date.now();
 
-  if (typeof sdk.on === "function") {
-    sdk.on("connection_state", (state?: unknown) => {
+  const connectionAwareSdk = sdk as ISdk & {
+    on?: (event: string, listener: (state?: unknown) => void) => void;
+  };
+  if (typeof connectionAwareSdk.on === "function") {
+    connectionAwareSdk.on("connection_state", (state?: unknown) => {
       connectionState = state as string;
     });
   }

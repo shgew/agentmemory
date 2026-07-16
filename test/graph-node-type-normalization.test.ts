@@ -76,7 +76,7 @@ const obs: CompressedObservation = {
   importance: 5,
 };
 
-describe("Graph node-type normalization (Task 16 Item 3)", () => {
+describe("graph node-type normalization", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
 
@@ -86,7 +86,6 @@ describe("Graph node-type normalization (Task 16 Item 3)", () => {
     registerGraphFunction(sdk as never, kv as never, provider as never);
   });
 
-  // time — the node never lands in the graph at all.
   it("recovers entities with malformed types by trimming + typo-correcting at write time", async () => {
     xmlResponse = `<entities>
 <entity type=" file" name="foo.ts"/>
@@ -123,7 +122,6 @@ describe("Graph node-type normalization (Task 16 Item 3)", () => {
       nodesByType: Record<string, number>;
     };
 
-    // Only the salvageable node survives; empty/blank types stay dropped.
     expect(stats.totalNodes).toBe(1);
     expect(stats.nodesByType).toEqual({ file: 1 });
   });
@@ -136,7 +134,6 @@ describe("Graph node-type normalization (Task 16 Item 3)", () => {
     expect(normalizeGraphNodeType("")).toBeUndefined();
     expect(normalizeGraphNodeType("   ")).toBeUndefined();
     expect(normalizeGraphNodeType(42)).toBeUndefined();
-    // Idempotent on an already-normal value.
     expect(normalizeGraphNodeType("concept")).toBe("concept");
   });
 
@@ -161,6 +158,7 @@ describe("Graph node-type normalization (Task 16 Item 3)", () => {
     };
     await kv.set(KV.graphNodes, badNode.id, badNode);
     await kv.set(KV.graphNodes, goodNode.id, goodNode);
+    await kv.set(KV.graphNameIndex, " file|legacy.ts", badNode.id);
     const snap: GraphSnapshot = {
       version: 1,
       topNodes: [badNode, goodNode],
@@ -187,6 +185,8 @@ describe("Graph node-type normalization (Task 16 Item 3)", () => {
 
     const storedBad = (await kv.get(KV.graphNodes, "gn_bad")) as GraphNode;
     expect(storedBad.type).toBe("file");
+    expect(await kv.get(KV.graphNameIndex, " file|legacy.ts")).toBeNull();
+    expect(await kv.get(KV.graphNameIndex, "file|legacy.ts")).toBe("gn_bad");
 
     const after = (await sdk.trigger("mem::graph-stats", {})) as {
       nodesByType: Record<string, number>;
@@ -201,5 +201,78 @@ describe("Graph node-type normalization (Task 16 Item 3)", () => {
     };
     expect(second.fixed).toBe(0);
     expect(second.snapshotUpdated).toBe(false);
+
+    xmlResponse = `<entities><entity type="file" name="legacy.ts"/></entities>`;
+    await sdk.trigger("mem::graph-extract", { observations: [obs] });
+    expect(await kv.list(KV.graphNodes)).toHaveLength(2);
+  });
+
+  it("fails closed when stored nodes cannot be enumerated", async () => {
+    const originalList = kv.list;
+    kv.list = async <T>(scope: string): Promise<T[]> => {
+      if (scope === KV.graphNodes) throw new Error("state unavailable");
+      return originalList<T>(scope);
+    };
+
+    const result = (await sdk.trigger("mem::graph-normalize-types", {})) as {
+      success: boolean;
+      fixed: number;
+      error: string;
+    };
+
+    expect(result).toMatchObject({
+      success: false,
+      fixed: 0,
+      error: "state unavailable",
+    });
+  });
+
+  it("does not mutate rows, indexes, or snapshot copies during dry run", async () => {
+    const malformed = {
+      id: "gn_dry",
+      type: " file" as GraphNode["type"],
+      name: "dry.ts",
+      properties: {},
+      sourceObservationIds: ["obs_1"],
+      createdAt: "2026-02-01T10:00:00Z",
+    };
+    const snapshot: GraphSnapshot = {
+      version: 1,
+      topNodes: [malformed],
+      topEdges: [],
+      topDegrees: { gn_dry: 0 },
+      stats: {
+        totalNodes: 1,
+        totalEdges: 0,
+        nodesByType: { " file": 1 },
+        edgesByType: {},
+      },
+      updatedAt: "2026-02-01T10:00:00Z",
+      dirty: false,
+    };
+    await kv.set(KV.graphNodes, malformed.id, malformed);
+    await kv.set(KV.graphNameIndex, " file|dry.ts", malformed.id);
+    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snapshot);
+
+    const result = (await sdk.trigger("mem::graph-normalize-types", {
+      dryRun: true,
+    })) as { success: boolean; fixed: number; snapshotUpdated: boolean };
+
+    expect(result).toMatchObject({
+      success: true,
+      fixed: 1,
+      snapshotUpdated: true,
+    });
+    expect(
+      (await kv.get<GraphNode>(KV.graphNodes, malformed.id))?.type,
+    ).toBe(" file");
+    expect(await kv.get(KV.graphNameIndex, " file|dry.ts")).toBe(
+      malformed.id,
+    );
+    expect(await kv.get(KV.graphNameIndex, "file|dry.ts")).toBeNull();
+    expect(
+      (await kv.get<GraphSnapshot>(KV.graphSnapshot, SNAPSHOT_KEY))?.topNodes[0]
+        .type,
+    ).toBe(" file");
   });
 });

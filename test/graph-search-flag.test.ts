@@ -4,7 +4,7 @@ import { isGraphSearchEnabled } from "../src/config.js";
 // Deliverable #1: GRAPH_SEARCH_ENABLED is a true kill switch for graph
 // consumption in hybrid search. It follows the exact same pattern as
 // isGraphExtractionEnabled: default false, `true` only when the value is
-// exactly the string "true" (adversarial MALFORMED INPUT class — "TRUE" / "1"
+// exactly the string "true" (adversarial MALFORMED INPUT class: "TRUE" / "1"
 // / "" must all read as false).
 describe("isGraphSearchEnabled", () => {
   const original = process.env.GRAPH_SEARCH_ENABLED;

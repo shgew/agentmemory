@@ -8,6 +8,7 @@ import {
   filterSupersededLessons,
   reinforceLesson,
   saveLesson,
+  withLessonWriteLock,
   type LessonSaveInput,
 } from "./lesson-state.js";
 
@@ -131,25 +132,25 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
         return { success: false, error: "lessonId is required" };
       }
 
-      const lesson = await kv.get<Lesson>(KV.lessons, data.lessonId);
-      if (!lesson || lesson.deleted) {
-        return { success: false, error: "lesson not found" };
-      }
+      return withLessonWriteLock(async () => {
+        const lesson = await kv.get<Lesson>(KV.lessons, data.lessonId);
+        if (!lesson || lesson.deleted) {
+          return { success: false, error: "lesson not found" };
+        }
 
-      reinforceLesson(lesson);
+        reinforceLesson(lesson);
+        await kv.set(KV.lessons, lesson.id, lesson);
+        await safeAudit(kv, "lesson_strengthen", "mem::lesson-strengthen", [
+          lesson.id,
+        ]);
 
-      await kv.set(KV.lessons, lesson.id, lesson);
-
-      await safeAudit(kv, "lesson_strengthen", "mem::lesson-strengthen", [
-        lesson.id,
-      ]);
-
-      return { success: true, lesson };
+        return { success: true, lesson };
+      });
     },
   );
 
   sdk.registerFunction("mem::lesson-decay-sweep", 
-    async () => {
+    async () => withLessonWriteLock(async () => {
       const lessons = await kv.list<Lesson>(KV.lessons);
       let decayed = 0;
       let softDeleted = 0;
@@ -223,6 +224,6 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
       );
 
       return { success: true, decayed, softDeleted, total: lessons.length };
-    },
+    }),
   );
 }

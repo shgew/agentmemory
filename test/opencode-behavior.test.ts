@@ -173,6 +173,142 @@ describe("OpenCode plugin behavior: sanitizeOutput recurses into nested structur
     const observe = calls.find((c) => c.url.endsWith("/agentmemory/observe") && c.body.data?.call_id === "dataurl-1");
     expect(observe!.body.data.tool_output).toMatch(/<blob:stripped:/);
   });
+
+  it("replaces objects beyond the depth limit instead of returning raw data", async () => {
+    const { plugin, calls } = await loadPlugin();
+    const longBase64 = "iVBORw0KGgo" + "A".repeat(500);
+    const deep = { a: { b: { c: { d: { e: { f: { image: longBase64 } } } } } } };
+    await plugin["tool.execute.after"]!(
+      { tool: "Screenshot", sessionID: "s-depth-limit", callID: "depth-limit", args: {} } as any,
+      { output: deep, title: "shot", metadata: {} } as any,
+    );
+    const observe = calls.find((c) => c.body.data?.call_id === "depth-limit");
+    expect(observe!.body.data.tool_output).toContain("<truncated:max-depth>");
+    expect(observe!.body.data.tool_output).not.toContain("iVBORw0KGgo");
+  });
+});
+
+describe("OpenCode plugin behavior: file enrichment", () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
+
+  it("captures paths from lowercase file tools", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await plugin["tool.execute.before"]!(
+      { tool: "read", sessionID: "s-file-read", callID: "read-1" } as any,
+      { args: { filePath: "src/index.ts" } } as any,
+    );
+    await plugin["experimental.chat.system.transform"]!(
+      { sessionID: "s-file-read" } as any,
+      { system: [] } as any,
+    );
+
+    const enrich = calls.find((c) => c.url.endsWith("/agentmemory/enrich"));
+    expect(enrich?.body.files).toEqual(["src/index.ts"]);
+  });
+
+  it("does not treat a grep pattern as a file path", async () => {
+    const { plugin, calls } = await loadPlugin();
+    await plugin["tool.execute.before"]!(
+      { tool: "grep", sessionID: "s-file-grep", callID: "grep-1" } as any,
+      { args: { path: "src", pattern: "AGENTMEMORY_SECRET" } } as any,
+    );
+    await plugin["experimental.chat.system.transform"]!(
+      { sessionID: "s-file-grep" } as any,
+      { system: [] } as any,
+    );
+
+    const enrich = calls.find((c) => c.url.endsWith("/agentmemory/enrich"));
+    expect(enrich?.body.files).toEqual(["src"]);
+  });
+});
+
+describe("OpenCode plugin behavior: context retry", () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(async () => { await teardownPlugin(); });
+
+  it("retries context injection after a failed request", async () => {
+    const calls: PostCall[] = [];
+    let contextAttempts = 0;
+    vi.stubGlobal("fetch", vi.fn(async (input: any, init?: any) => {
+      const url = typeof input === "string" ? input : input?.url ?? "";
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : null;
+      calls.push({ url, body });
+      if (url.endsWith("/agentmemory/context") && contextAttempts++ === 0) {
+        return { ok: false, status: 503, json: async () => ({}) } as any;
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ context: "<recovered-context>" }),
+      } as any;
+    }));
+    const plugin = await AgentmemoryCapturePlugin(FAKE_CTX);
+    activePlugin = plugin;
+    const first = { system: [] as string[] };
+    const second = { system: [] as string[] };
+
+    await plugin["experimental.chat.system.transform"]!(
+      { sessionID: "s-context-retry" } as any,
+      first as any,
+    );
+    await plugin["experimental.chat.system.transform"]!(
+      { sessionID: "s-context-retry" } as any,
+      second as any,
+    );
+
+    expect(first.system).toEqual([]);
+    expect(second.system).toContain("<recovered-context>");
+    expect(
+      calls.filter((call) => call.url.endsWith("/agentmemory/context")),
+    ).toHaveLength(2);
+  });
+});
+
+describe("OpenCode plugin behavior: instance isolation", () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("keeps active session, project, and cwd scoped to each plugin instance", async () => {
+    const calls = installFetchMock();
+    const pluginA = await AgentmemoryCapturePlugin({
+      ...FAKE_CTX,
+      directory: "/tmp/project-a",
+    });
+    const pluginB = await AgentmemoryCapturePlugin({
+      ...FAKE_CTX,
+      directory: "/tmp/project-b",
+    });
+
+    try {
+      await pluginA.event!({
+        event: { type: "session.created", properties: { info: { id: "session-a" } } } as any,
+      });
+      await pluginB.event!({
+        event: { type: "session.created", properties: { info: { id: "session-b" } } } as any,
+      });
+      calls.length = 0;
+
+      await pluginA.event!({
+        event: {
+          type: "file.watcher.updated",
+          properties: { file: "src/a.ts", event: "change" },
+        } as any,
+      });
+
+      const observe = calls.find((call) =>
+        call.url.endsWith("/agentmemory/observe"),
+      );
+      expect(observe?.body).toMatchObject({
+        sessionId: "session-a",
+        project: "project-a",
+        cwd: "/tmp/project-a",
+      });
+    } finally {
+      await pluginA.dispose?.();
+      await pluginB.dispose?.();
+    }
+  });
 });
 
 describe("OpenCode plugin behavior: permission.asked v2 payload", () => {

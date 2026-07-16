@@ -1,15 +1,20 @@
 import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
-import type { Memory, GraphNode, GraphEdge } from "../types.js";
+import type { Memory, GraphNode, GraphEdge, GraphSnapshot } from "../types.js";
 import { recordAudit } from "./audit.js";
 import { readGraphSnapshot, SNAPSHOT_KEY } from "../state/graph-snapshot.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import { nameIndexKey, edgeIndexKey, recordGraphTombstone } from "./graph.js";
+import {
+  buildSnapshotFromArrays,
+  nameIndexKey,
+  edgeIndexKey,
+  recordGraphTombstone,
+} from "./graph.js";
 
 // Above this many live nodes, enumerating the full graphNodes/graphEdges
 // scopes serializes a multi-MB frame that stalls the iii worker heartbeat
-// (#814/#825). At or above it, cascade scopes itself to the bounded snapshot:
+// At or above it, cascade scopes itself to the bounded snapshot:
 // every reader already reads only the snapshot, so evicting the overlapping
 // top-degree rows there is read-correct, and those rows are tombstoned for
 // physical reclaim by mem::graph-vacuum. Mirrors REBUILD_SAFE_NODE_CEILING.
@@ -22,27 +27,33 @@ async function decrementNodeDegree(kv: StateKV, nodeId: string): Promise<void> {
   }
 }
 
-// Snapshot-scoped cascade for large corpora. Marks stale + evicts + tombstones
-// only the snapshot-resident nodes/edges tied to the superseded observations,
-// decrements their stats and endpoint degrees, and persists the snapshot.
-// Enumeration-free. The caller holds the graph:merge lock so this cannot race
-// an in-flight extract mutating the same snapshot.
+// The caller holds the graph:merge lock so snapshot cascade cannot race an
+// extract mutating the same snapshot.
 async function cascadeStaleInSnapshot(
   kv: StateKV,
+  snap: GraphSnapshot,
   obsIds: Set<string>,
   now: string,
 ): Promise<{ nodes: number; edges: number }> {
-  const snap = await readGraphSnapshot(kv);
-  if (!snap) return { nodes: 0, edges: 0 };
-
   let nodes = 0;
   let edges = 0;
+  const staleNodeIds = new Set(
+    snap.topNodes
+      .filter(
+        (node) =>
+          !node.stale &&
+          (node.sourceObservationIds ?? []).some((id) => obsIds.has(id)),
+      )
+      .map((node) => node.id),
+  );
 
   const keptEdges: GraphEdge[] = [];
   for (const edge of snap.topEdges) {
     const overlap =
       !edge.stale &&
-      (edge.sourceObservationIds ?? []).some((id) => obsIds.has(id));
+      ((edge.sourceObservationIds ?? []).some((id) => obsIds.has(id)) ||
+        staleNodeIds.has(edge.sourceNodeId) ||
+        staleNodeIds.has(edge.targetNodeId));
     if (!overlap) {
       keptEdges.push(edge);
       continue;
@@ -54,6 +65,10 @@ async function cascadeStaleInSnapshot(
       kind: "edge",
       reason: "cascade",
       indexKey: edgeIndexKey(edge.sourceNodeId, edge.targetNodeId, edge.type),
+      observedSourceIds: edge.sourceObservationIds,
+      edgeType: edge.type,
+      sourceNodeId: edge.sourceNodeId,
+      targetNodeId: edge.targetNodeId,
     });
     snap.stats.totalEdges = Math.max(0, snap.stats.totalEdges - 1);
     snap.stats.edgesByType[edge.type] = Math.max(
@@ -68,9 +83,7 @@ async function cascadeStaleInSnapshot(
 
   const keptNodes: GraphNode[] = [];
   for (const node of snap.topNodes) {
-    const overlap =
-      !node.stale &&
-      (node.sourceObservationIds ?? []).some((id) => obsIds.has(id));
+    const overlap = staleNodeIds.has(node.id);
     if (!overlap) {
       keptNodes.push(node);
       continue;
@@ -83,6 +96,8 @@ async function cascadeStaleInSnapshot(
       kind: "node",
       reason: "cascade",
       indexKey: nameIndexKey(node.type, node.name),
+      observedSourceIds: node.sourceObservationIds,
+      nodeType: node.type,
     });
     snap.stats.totalNodes = Math.max(0, snap.stats.totalNodes - 1);
     snap.stats.nodesByType[node.type] = Math.max(
@@ -99,6 +114,80 @@ async function cascadeStaleInSnapshot(
     await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
   }
   return { nodes, edges };
+}
+
+async function cascadeStaleInFullGraph(
+  kv: StateKV,
+  snap: GraphSnapshot,
+  obsIds: Set<string>,
+  now: string,
+): Promise<{ nodes: number; edges: number }> {
+  const [nodes, edges] = await Promise.all([
+    kv.list<GraphNode>(KV.graphNodes),
+    kv.list<GraphEdge>(KV.graphEdges),
+  ]);
+  let flaggedNodes = 0;
+  let flaggedEdges = 0;
+  const staleNodeIds = new Set(
+    nodes
+      .filter(
+        (node) =>
+          !node.stale &&
+          (node.sourceObservationIds ?? []).some((id) => obsIds.has(id)),
+      )
+      .map((node) => node.id),
+  );
+
+  for (const edge of edges) {
+    if (
+      edge.stale ||
+      (!(edge.sourceObservationIds ?? []).some((id) => obsIds.has(id)) &&
+        !staleNodeIds.has(edge.sourceNodeId) &&
+        !staleNodeIds.has(edge.targetNodeId))
+    ) {
+      continue;
+    }
+    edge.stale = true;
+    await kv.set(KV.graphEdges, edge.id, edge);
+    await decrementNodeDegree(kv, edge.sourceNodeId);
+    await decrementNodeDegree(kv, edge.targetNodeId);
+    await recordGraphTombstone(kv, {
+      id: edge.id,
+      kind: "edge",
+      reason: "cascade",
+      indexKey: edgeIndexKey(edge.sourceNodeId, edge.targetNodeId, edge.type),
+      observedSourceIds: edge.sourceObservationIds,
+      edgeType: edge.type,
+      sourceNodeId: edge.sourceNodeId,
+      targetNodeId: edge.targetNodeId,
+    });
+    flaggedEdges++;
+  }
+
+  for (const node of nodes) {
+    if (!staleNodeIds.has(node.id)) {
+      continue;
+    }
+    node.stale = true;
+    node.updatedAt = now;
+    await kv.set(KV.graphNodes, node.id, node);
+    await recordGraphTombstone(kv, {
+      id: node.id,
+      kind: "node",
+      reason: "cascade",
+      indexKey: nameIndexKey(node.type, node.name),
+      observedSourceIds: node.sourceObservationIds,
+      nodeType: node.type,
+    });
+    flaggedNodes++;
+  }
+
+  if (flaggedNodes > 0 || flaggedEdges > 0) {
+    const rebuilt = buildSnapshotFromArrays(nodes, edges);
+    rebuilt.resetAt = snap.resetAt;
+    await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, rebuilt);
+  }
+  return { nodes: flaggedNodes, edges: flaggedEdges };
 }
 
 export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
@@ -121,65 +210,38 @@ export function registerCascadeFunction(sdk: ISdk, kv: StateKV): void {
 
       if (obsIds.size > 0) {
         const now = new Date().toISOString();
-        const snap = await readGraphSnapshot(kv);
-        const totalNodes = snap?.stats.totalNodes ?? 0;
-
-        if (totalNodes >= CASCADE_SNAPSHOT_CEILING) {
-          // Large corpus: a full kv.list would stall the worker heartbeat, so
-          // scope to the snapshot under the merge lock (cannot race extract).
-          const result = await withKeyedLock("graph:merge", () =>
-            cascadeStaleInSnapshot(kv, obsIds, now),
-          );
-          flaggedNodes = result.nodes;
-          flaggedEdges = result.edges;
-          if (flaggedNodes > 0 || flaggedEdges > 0) {
-            await recordAudit(kv, "consolidate", "mem::cascade-update", [], {
-              change:
-                "marked stale + tombstoned from superseded memory (snapshot-scoped)",
-              supersededMemoryId: data.supersededMemoryId,
-              flaggedNodes,
-              flaggedEdges,
-            });
-          }
-        } else {
-          // Small corpus: the full-scope scan is safe and preserves rebuild
-          // correctness (rebuild filters !stale).
-          const nodes = await kv.list<GraphNode>(KV.graphNodes);
-          for (const node of nodes) {
-            if (node.stale) continue;
-            const overlap = (node.sourceObservationIds ?? []).some((id) =>
-              obsIds.has(id),
-            );
-            if (overlap) {
-              node.stale = true;
-              node.updatedAt = now;
-              await kv.set(KV.graphNodes, node.id, node);
-              await recordAudit(kv, "consolidate", "mem::cascade-update", [node.id], {
-                resourceType: "GraphNode",
-                change: "marked stale from superseded memory",
-                supersededMemoryId: data.supersededMemoryId,
-              });
-              flaggedNodes++;
-            }
-          }
-
-          const edges = await kv.list<GraphEdge>(KV.graphEdges);
-          for (const edge of edges) {
-            if (edge.stale) continue;
-            const overlap = (edge.sourceObservationIds ?? []).some((id) =>
-              obsIds.has(id),
-            );
-            if (overlap) {
-              edge.stale = true;
-              await kv.set(KV.graphEdges, edge.id, edge);
-              await recordAudit(kv, "consolidate", "mem::cascade-update", [edge.id], {
-                resourceType: "GraphEdge",
-                change: "marked stale from superseded memory",
-                supersededMemoryId: data.supersededMemoryId,
-              });
-              flaggedEdges++;
-            }
-          }
+        let cascadeResult: { nodes: number; edges: number } | null;
+        try {
+          cascadeResult = await withKeyedLock("graph:merge", async () => {
+            const snap = await readGraphSnapshot(kv);
+            if (!snap) return null;
+            return snap.stats.totalNodes >= CASCADE_SNAPSHOT_CEILING
+              ? cascadeStaleInSnapshot(kv, snap, obsIds, now)
+              : cascadeStaleInFullGraph(kv, snap, obsIds, now);
+          });
+        } catch (err) {
+          return {
+            success: false,
+            error: `graph cascade failed: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          };
+        }
+        if (!cascadeResult) {
+          return {
+            success: false,
+            error: "graph snapshot unavailable; cascade refused",
+          };
+        }
+        flaggedNodes = cascadeResult.nodes;
+        flaggedEdges = cascadeResult.edges;
+        if (flaggedNodes > 0 || flaggedEdges > 0) {
+          await recordAudit(kv, "consolidate", "mem::cascade-update", [], {
+            change: "marked stale and tombstoned from superseded memory",
+            supersededMemoryId: data.supersededMemoryId,
+            flaggedNodes,
+            flaggedEdges,
+          });
         }
       }
 

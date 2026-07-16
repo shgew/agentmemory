@@ -1,4 +1,5 @@
-import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, rmdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, rmdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import * as p from "@clack/prompts";
@@ -8,7 +9,8 @@ import {
   logAlreadyWired,
   logBackup,
   logInstalled,
-  readJsonSafe,
+  readJsoncSafe,
+  upsertJsoncNestedPropertyAtomic,
   writeJsonAtomic,
 } from "./util.js";
 import { findPluginRoot } from "./codex-hooks.js";
@@ -18,31 +20,25 @@ import { findPluginRoot } from "./codex-hooks.js";
 // and `enabled` (docs: README "OpenCode (MCP only)"). So it needs its own
 // adapter rather than createJsonMcpAdapter.
 
-// `--with-plugin` resolves the bundled `plugin/opencode/agentmemory-capture.ts`
-// from the installed @agentmemory/agentmemory package, copies it under
-// the opencode config dir's plugins/, registers it in the top-level "plugin"
-// array of opencode.json, copies the agentmemory skills tree from
-// `plugin/skills/` to `<opencode-config>/skills/<name>/SKILL.md`, AND removes
-// any deprecated agentmemory legacy slash command files (recall.md,
-// remember.md, health.md) from `<opencode-config>/commands/` left behind by
-// earlier versions of this adapter (backed up to ~/.agentmemory/backups/
-// first). OpenCode's command registry merges skills into its slash command
-// palette as `source: "skill"`, so /recall, /remember, /health and the other
-// invocable skills all appear in the palette while reference skills load on
-// demand via the native `skill` tool. All paths are resolved lazily so
-// OPENCODE_CONFIG_DIR set per-invocation (and test isolation via process.env
-// mutation) takes effect.
 function opencodeDir(): string {
   return process.env["OPENCODE_CONFIG_DIR"]?.trim() || join(homedir(), ".config", "opencode");
 }
-function configPath(): string { return join(opencodeDir(), "opencode.json"); }
+function configPath(): string {
+  const jsonc = join(opencodeDir(), "opencode.jsonc");
+  if (existsSync(jsonc)) return jsonc;
+  return join(opencodeDir(), "opencode.json");
+}
 function detectDir(): string { return opencodeDir(); }
 function pluginsDir(): string { return join(opencodeDir(), "plugins"); }
 function skillsDir(): string { return join(opencodeDir(), "skills"); }
 const PLUGIN_FILENAME = "agentmemory-capture.ts";
-const PLUGIN_REL_PATH = `./plugins/${PLUGIN_FILENAME}`;
 const SKILL_SOURCE_REL = "skills";
 const LEGACY_COMMAND_FILES = ["recall.md", "remember.md", "health.md"];
+const LEGACY_COMMAND_HASHES: Record<string, string> = {
+  "recall.md": "3b05701dbade65e1192726592b922faace26bf0b659f31e7b54a6a584880e97b",
+  "remember.md": "8e27caf25ba2d2f1fd7944f0454c90cf9b4b5ff24054a91c5baeb242025fa6a9",
+  "health.md": "362ef5eb83ef59821e4cfcecfdb397cf5ad0d274a39e751f1c0ffc906abc78b6",
+};
 
 // No `environment` block: OpenCode does not expand shell-style
 // `${VAR:-default}` values, and writing them literally would override the
@@ -63,14 +59,6 @@ function entryMatches(entry: unknown): boolean {
   if (!entry || typeof entry !== "object") return false;
   const command = (entry as McpEntry)["command"];
   return Array.isArray(command) && command.includes("@agentmemory/mcp");
-}
-
-function mergePluginArray(existing: unknown, entry: string): string[] {
-  const current = Array.isArray(existing)
-    ? (existing as unknown[]).filter((v): v is string => typeof v === "string")
-    : [];
-  if (current.includes(entry)) return current;
-  return [...current, entry];
 }
 
 function copySkillTree(source: string, target: string): string[] {
@@ -95,6 +83,13 @@ function copySkillTree(source: string, target: string): string[] {
   return copied;
 }
 
+function isGeneratedLegacyCommand(path: string, name: string): boolean {
+  const expected = LEGACY_COMMAND_HASHES[name];
+  if (!expected) return false;
+  const actual = createHash("sha256").update(readFileSync(path)).digest("hex");
+  return actual === expected;
+}
+
 function cleanupLegacyCommands(dryRun: boolean): string[] {
   const removed: string[] = [];
   const legacyDir = join(opencodeDir(), "commands");
@@ -102,6 +97,7 @@ function cleanupLegacyCommands(dryRun: boolean): string[] {
   for (const name of LEGACY_COMMAND_FILES) {
     const legacyPath = join(legacyDir, name);
     if (!existsSync(legacyPath)) continue;
+    if (!isGeneratedLegacyCommand(legacyPath, name)) continue;
     if (dryRun) {
       p.log.info(`[dry-run] Would remove deprecated ${legacyPath} (backed up to ~/.agentmemory/backups/ first)`);
       removed.push(legacyPath);
@@ -124,9 +120,8 @@ function cleanupLegacyCommands(dryRun: boolean): string[] {
 }
 
 function installPluginAssets(
-  config: OpencodeConfig,
   opts: ConnectOptions,
-): { copied: string[]; pluginEntry: string } | { skipped: string } {
+): { copied: string[] } | { skipped: string } {
   let pluginRoot: string;
   try {
     pluginRoot = findPluginRoot();
@@ -157,10 +152,7 @@ function installPluginAssets(
       );
     }
     cleanupLegacyCommands(true);
-    p.log.info(
-      `[dry-run] Would merge "${PLUGIN_REL_PATH}" into top-level "plugin" array in ${configPath()}`,
-    );
-    return { copied: [], pluginEntry: PLUGIN_REL_PATH };
+    return { copied: [] };
   }
 
   mkdirSync(pluginsDir(), { recursive: true });
@@ -181,10 +173,20 @@ function installPluginAssets(
   const removedLegacy = cleanupLegacyCommands(false);
   copied.push(...removedLegacy);
 
-  config["plugin"] = mergePluginArray(config["plugin"], PLUGIN_REL_PATH);
-  // resolved entry: ./plugins/agentmemory-capture.ts
+  return { copied };
+}
 
-  return { copied, pluginEntry: PLUGIN_REL_PATH };
+function writeConfig(path: string, config: OpencodeConfig): void {
+  if (path.endsWith(".jsonc") && existsSync(path)) {
+    upsertJsoncNestedPropertyAtomic(
+      path,
+      "mcp",
+      "agentmemory",
+      OPENCODE_ENTRY,
+    );
+    return;
+  }
+  writeJsonAtomic(path, config);
 }
 
 export const adapter: ConnectAdapter = {
@@ -193,14 +195,26 @@ export const adapter: ConnectAdapter = {
   category: "mcp",
   docs: "https://github.com/rohitg00/agentmemory#other-agents",
   protocolNote:
-    "Using MCP via ~/.config/opencode/opencode.json (top-level `mcp` key). Pass --with-plugin to also install the auto-capture plugin and 16 skills (9 invocable: recall, remember, health, recap, handoff, forget, commit-context, commit-history, session-history; 7 reference). OpenCode surfaces invocable skills in the slash command palette automatically.",
+    "Using MCP via ~/.config/opencode/opencode.jsonc or opencode.json (top-level `mcp` key). Pass --with-plugin to also install the auto-capture plugin and 16 skills (9 invocable: recall, remember, health, recap, handoff, forget, commit-context, commit-history, session-history; 7 reference). OpenCode auto-discovers the copied plugin and surfaces invocable skills in the slash command palette.",
 
   detect(): boolean {
     return existsSync(detectDir());
   },
 
   async install(opts: ConnectOptions): Promise<ConnectResult> {
-    const existing = readJsonSafe<OpencodeConfig>(configPath());
+    const targetConfigPath = configPath();
+    const configExists = existsSync(targetConfigPath);
+    const parsed = readJsoncSafe<unknown>(targetConfigPath);
+    if (
+      configExists &&
+      (!parsed || typeof parsed !== "object" || Array.isArray(parsed))
+    ) {
+      p.log.error(
+        `OpenCode config is not valid JSON/JSONC: ${targetConfigPath}`,
+      );
+      return { kind: "skipped", reason: "invalid-config" };
+    }
+    const existing = parsed as OpencodeConfig | null;
     const next: OpencodeConfig = existing ? { ...existing } : {};
     const existingMcp = next["mcp"];
     const mcp: Record<string, McpEntry> =
@@ -212,37 +226,40 @@ export const adapter: ConnectAdapter = {
 
     const alreadyHas = entryMatches(mcp["agentmemory"]);
     if (alreadyHas && !opts.force) {
-      logAlreadyWired(this.displayName, configPath());
+      logAlreadyWired(this.displayName, targetConfigPath);
       if (opts.withPlugin) {
-        const pluginResult = installPluginAssets(next, opts);
+        const pluginResult = installPluginAssets(opts);
         if ("skipped" in pluginResult) {
           p.log.warn(
             `OpenCode plugin install skipped: ${pluginResult.skipped}.`,
           );
         } else if (!opts.dryRun) {
-          writeJsonAtomic(configPath(), next);
           logInstalled(`${this.displayName} plugin`, pluginsDir());
         }
       }
-      return { kind: "already-wired", mutatedPath: configPath() };
+      return { kind: "already-wired", mutatedPath: targetConfigPath };
     }
 
     if (opts.dryRun) {
       p.log.info(
-        `[dry-run] Would ${alreadyHas ? "overwrite" : "add"} mcp.agentmemory in ${configPath()}`,
+        `[dry-run] Would ${alreadyHas ? "overwrite" : "add"} mcp.agentmemory in ${targetConfigPath}`,
       );
       if (opts.withPlugin) {
-        installPluginAssets(next, opts);
+        installPluginAssets(opts);
       }
-      return { kind: "installed", mutatedPath: configPath() };
+      return { kind: "installed", mutatedPath: targetConfigPath };
     }
 
     let backupPath: string | undefined;
-    if (existsSync(configPath())) {
-      backupPath = backupFile(configPath(), this.name);
+    if (configExists) {
+      backupPath = backupFile(
+        targetConfigPath,
+        this.name,
+        targetConfigPath.endsWith(".jsonc") ? "jsonc" : "json",
+      );
       logBackup(backupPath);
     } else {
-      mkdirSync(dirname(configPath()), { recursive: true });
+      mkdirSync(dirname(targetConfigPath), { recursive: true });
     }
 
     mcp["agentmemory"] = { ...OPENCODE_ENTRY };
@@ -250,7 +267,7 @@ export const adapter: ConnectAdapter = {
 
     let pluginInstallNote: string | undefined;
     if (opts.withPlugin) {
-      const pluginResult = installPluginAssets(next, opts);
+      const pluginResult = installPluginAssets(opts);
       if ("skipped" in pluginResult) {
         pluginInstallNote = `Plugin install skipped: ${pluginResult.skipped}`;
         p.log.warn(pluginInstallNote);
@@ -259,24 +276,24 @@ export const adapter: ConnectAdapter = {
       }
     }
 
-    writeJsonAtomic(configPath(), next);
+    writeConfig(targetConfigPath, next);
 
-    const verify = readJsonSafe<OpencodeConfig>(configPath());
+    const verify = readJsoncSafe<OpencodeConfig>(targetConfigPath);
     const verifyMcp = verify?.["mcp"] as Record<string, McpEntry> | undefined;
     if (!entryMatches(verifyMcp?.["agentmemory"])) {
       p.log.error(
-        `Verification failed: ${configPath()} did not contain mcp.agentmemory after write.`,
+        `Verification failed: ${targetConfigPath} did not contain mcp.agentmemory after write.`,
       );
       return { kind: "skipped", reason: "verification-failed" };
     }
 
-    logInstalled(this.displayName, configPath());
+    logInstalled(this.displayName, targetConfigPath);
     if (opts.withPlugin && pluginInstallNote) {
       p.log.info(pluginInstallNote);
     }
     return {
       kind: "installed",
-      mutatedPath: configPath(),
+      mutatedPath: targetConfigPath,
       ...(backupPath !== undefined && { backupPath }),
     };
   },

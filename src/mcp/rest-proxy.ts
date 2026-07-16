@@ -1,3 +1,5 @@
+import { getEnvVar } from "../config.js";
+
 const DEFAULT_URL = "http://localhost:3111";
 const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 2_000;
 // Default per-call proxy timeout, overridable via AGENTMEMORY_MCP_CALL_TIMEOUT_MS.
@@ -7,21 +9,21 @@ const CALL_TIMEOUT_MS = 15_000;
 const LOCAL_MODE_TTL_MS = 30_000;
 
 function probeTimeoutMs(): number {
-  const raw = process.env["AGENTMEMORY_PROBE_TIMEOUT_MS"];
+  const raw = getEnvVar("AGENTMEMORY_PROBE_TIMEOUT_MS");
   if (!raw) return DEFAULT_HEALTH_PROBE_TIMEOUT_MS;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_HEALTH_PROBE_TIMEOUT_MS;
 }
 
 function callTimeoutMs(): number {
-  const raw = process.env["AGENTMEMORY_MCP_CALL_TIMEOUT_MS"];
+  const raw = getEnvVar("AGENTMEMORY_MCP_CALL_TIMEOUT_MS");
   if (!raw) return CALL_TIMEOUT_MS;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : CALL_TIMEOUT_MS;
 }
 
 function forceProxy(): boolean {
-  const raw = process.env["AGENTMEMORY_FORCE_PROXY"];
+  const raw = getEnvVar("AGENTMEMORY_FORCE_PROXY");
   return raw === "1" || raw === "true";
 }
 
@@ -49,7 +51,7 @@ let probeInFlight: Promise<Handle> | null = null;
 // (DNS failure). Strip any literal placeholder we see so the fallback
 // engages instead.
 export function resolveEnvOrEmpty(name: string): string {
-  const raw = process.env[name];
+  const raw = getEnvVar(name);
   if (!raw) return "";
   if (raw.startsWith("${") && raw.endsWith("}")) return "";
   return raw;

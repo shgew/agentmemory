@@ -239,6 +239,87 @@ describe("mem::graph-prune-orphans", () => {
     expect(await kv.get(KV.graphTombstones, "gn_orphan")).toBeNull();
   });
 
+  it("never seeds past the tombstone ceiling", async () => {
+    const { kv, sdk } = setup();
+    await kv.set(KV.graphTombstones, "existing", {
+      id: "existing",
+      kind: "node",
+      reason: "prune",
+      indexKey: "concept|existing",
+      tombstonedAt: "2026-04-01T00:00:00Z",
+    });
+    await kv.set(
+      KV.graphNodes,
+      "gn_one",
+      node("gn_one", "concept", "one", ["gone"]),
+    );
+    await kv.set(
+      KV.graphNodes,
+      "gn_two",
+      node("gn_two", "concept", "two", ["gone"]),
+    );
+
+    const res = (await sdk.trigger("mem::graph-prune-orphans", {
+      nodeIds: ["gn_one", "gn_two"],
+      tombstoneCeiling: 2,
+    })) as PruneResult;
+
+    expect(res.seeded).toBe(1);
+    expect(res.remainingCandidates).toBe(1);
+    expect(res.tombstoneQueueLen).toBe(2);
+    expect(await kv.list(KV.graphTombstones)).toHaveLength(2);
+  });
+
+  it("keeps the ceiling strict across concurrent seed calls", async () => {
+    const { kv, sdk } = setup();
+    await kv.set(
+      KV.graphNodes,
+      "gn_one",
+      node("gn_one", "concept", "one", ["gone"]),
+    );
+    await kv.set(
+      KV.graphNodes,
+      "gn_two",
+      node("gn_two", "concept", "two", ["gone"]),
+    );
+
+    const results = (await Promise.all([
+      sdk.trigger("mem::graph-prune-orphans", {
+        nodeIds: ["gn_one"],
+        tombstoneCeiling: 1,
+      }),
+      sdk.trigger("mem::graph-prune-orphans", {
+        nodeIds: ["gn_two"],
+        tombstoneCeiling: 1,
+      }),
+    ])) as PruneResult[];
+
+    expect(results.reduce((sum, result) => sum + result.seeded, 0)).toBe(1);
+    expect(results.some((result) => result.refused)).toBe(true);
+    expect(await kv.list(KV.graphTombstones)).toHaveLength(1);
+  });
+
+  it("fails closed when live sources cannot be enumerated", async () => {
+    const { kv, sdk } = setup({ throwListScopes: [KV.sessions] });
+    await kv.set(
+      KV.graphNodes,
+      "gn_orphan",
+      node("gn_orphan", "concept", "foo", ["obsGone"]),
+    );
+
+    const res = (await sdk.trigger("mem::graph-prune-orphans", {
+      nodeIds: ["gn_orphan"],
+    })) as PruneResult & { refused: boolean; reason: string };
+
+    expect(res).toMatchObject({
+      success: false,
+      refused: true,
+      seeded: 0,
+      reason: "live source enumeration failed",
+    });
+    expect(await kv.get(KV.graphTombstones, "gn_orphan")).toBeNull();
+  });
+
   it("never enumerates graphNodes or graphEdges (heartbeat-safe)", async () => {
     const { kv, sdk } = setup({
       throwListScopes: [KV.graphNodes, KV.graphEdges],

@@ -52,8 +52,6 @@ export function registerRecentSearchesSweepFunction(
     },
   );
 
-  // #771: read-back surface for `agentmemory status` and external
-  // dashboards that don't go through the OTEL collector.
   sdk.registerFunction(
     "mem::diagnostic::followup-stats",
     async (): Promise<{
@@ -62,7 +60,6 @@ export function registerRecentSearchesSweepFunction(
       agentInitiatedSearches: number;
       followupWithinWindow: number;
       rate: number;
-      // Task 16 Item 4: retrieval-outcome telemetry read-back.
       expandCallsWithSession: number;
       resultsExpandedFromPriorSearch: number;
       expandRate: number;

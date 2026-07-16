@@ -90,6 +90,14 @@ function mockSdk() {
   return sdk;
 }
 
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
 function makeSession(overrides: Partial<Session> = {}): Session {
   return {
     id: "ses_1",
@@ -362,6 +370,111 @@ describe("Session Sweep Function", () => {
 
     expect(result.swept).toContain("ses_good");
     expect(result.failed.map((f) => f.sessionId)).toContain("ses_bad");
+  });
+});
+
+describe("Session Sweep Scheduling", () => {
+  let sdk: ReturnType<typeof mockSdk>;
+  let kv: ReturnType<typeof mockKV>;
+
+  beforeEach(() => {
+    sdk = mockSdk();
+    kv = mockKV();
+    registerSessionSweepFunction(sdk as never, kv as never);
+  });
+
+  it("processes sessions with bounded parallelism", async () => {
+    const batchStarted = deferred();
+    const release = deferred();
+    let active = 0;
+    let maxActive = 0;
+    let started = 0;
+    sdk.registerFunction("event::session::stopped", async () => {
+      active += 1;
+      started += 1;
+      maxActive = Math.max(maxActive, active);
+      if (started === 4) batchStarted.resolve();
+      await release.promise;
+      active -= 1;
+      return { success: true };
+    });
+
+    for (let index = 0; index < 6; index++) {
+      const session = makeSession({
+        id: `ses_parallel_${index}`,
+        startedAt: new Date(
+          Date.now() - 10 * 60 * 60 * 1000,
+        ).toISOString(),
+      });
+      await kv.set(SESSIONS_SCOPE, session.id, session);
+    }
+
+    const sweep = sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    });
+    await batchStarted.promise;
+    expect(started).toBe(4);
+    expect(maxActive).toBe(4);
+
+    release.resolve();
+    const result = (await sweep) as { swept: string[] };
+    expect(result.swept).toHaveLength(6);
+    expect(maxActive).toBe(4);
+  });
+
+  it("serializes overlapping sweep requests", async () => {
+    const firstStarted = deferred();
+    const releaseFirst = deferred();
+    const calls: string[] = [];
+    let active = 0;
+    let maxActive = 0;
+    sdk.registerFunction(
+      "event::session::stopped",
+      async (payload: unknown) => {
+        const sessionId = (payload as { sessionId: string }).sessionId;
+        calls.push(sessionId);
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        if (sessionId === "ses_first") {
+          firstStarted.resolve();
+          await releaseFirst.promise;
+        }
+        active -= 1;
+        return { success: true };
+      },
+    );
+
+    const staleAt = new Date(
+      Date.now() - 10 * 60 * 60 * 1000,
+    ).toISOString();
+    await kv.set(
+      SESSIONS_SCOPE,
+      "ses_first",
+      makeSession({ id: "ses_first", startedAt: staleAt }),
+    );
+    await kv.set(
+      SESSIONS_SCOPE,
+      "ses_second",
+      makeSession({ id: "ses_second", startedAt: staleAt }),
+    );
+
+    const first = sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_first"] },
+    });
+    await firstStarted.promise;
+    const second = sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: ["ses_second"] },
+    });
+    await Promise.resolve();
+    expect(calls).toEqual(["ses_first"]);
+
+    releaseFirst.resolve();
+    await Promise.all([first, second]);
+    expect(calls).toEqual(["ses_first", "ses_second"]);
+    expect(maxActive).toBe(1);
   });
 });
 

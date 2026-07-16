@@ -162,6 +162,59 @@ describe("End-to-End Multimodal Flow", () => {
     expect(stored!.imageDescription).toBe("TEST_VISION_RESULT: I see a red dot");
     expect(stored!.imageRef).toBe(savedImagePath);
   });
+
+  it("coalesces compression retries for one observation", async () => {
+    const localKv = mockKV() as any;
+    let releaseProvider: (() => void) | undefined;
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const providerGate = new Promise<void>((resolve) => {
+      releaseProvider = resolve;
+    });
+    const compress = vi.fn(async () => {
+      markStarted?.();
+      await providerGate;
+      return VALID_COMPRESS_XML;
+    });
+    const provider: MemoryProvider = {
+      name: "mock",
+      compress,
+      summarize: async () => "",
+    };
+    let compressCallback: any = null;
+    const sdkMocker = {
+      ...mockSdk,
+      registerFunction: vi.fn((id, callback) => {
+        if (id === "mem::compress") compressCallback = callback;
+      }),
+    };
+    registerCompressFunction(sdkMocker, localKv, provider);
+    const raw: RawObservation = {
+      id: "obs_retry",
+      sessionId: "session_retry",
+      timestamp: "2026-07-16T12:00:00.000Z",
+      hookType: "post_tool_use",
+      raw: {},
+    };
+    const payload = {
+      observationId: raw.id,
+      sessionId: raw.sessionId,
+      raw,
+      skipIfCompressed: true,
+    };
+
+    const first = compressCallback(payload);
+    await started;
+    const second = compressCallback(payload);
+    releaseProvider?.();
+
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    expect(firstResult.success).toBe(true);
+    expect(secondResult).toMatchObject({ success: true, noOp: true });
+    expect(compress).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("Disk Size Manager", () => {

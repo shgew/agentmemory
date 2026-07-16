@@ -2,8 +2,17 @@
 
 import { InMemoryKV } from "./in-memory-kv.js";
 import { createStdioTransport } from "./transport.js";
-import { getAllTools, parseToolDisableList } from "./tools-registry.js";
-import { getStandalonePersistPath } from "../config.js";
+import {
+  getAllTools,
+  getVisibleTools,
+  isToolVisible,
+} from "./tools-registry.js";
+import {
+  getAgentId,
+  getEnvVar,
+  getStandalonePersistPath,
+  isAgentScopeIsolated,
+} from "../config.js";
 import { VERSION } from "../version.js";
 import { generateId } from "../state/schema.js";
 import {
@@ -40,7 +49,7 @@ const EXTENDED_TIMEOUT_TOOLS = new Set([
 const DEFAULT_EXTENDED_CALL_TIMEOUT_MS = 300_000;
 
 function extendedCallTimeoutMs(): number {
-  const raw = process.env["AGENTMEMORY_MCP_EXTENDED_TIMEOUT_MS"];
+  const raw = getEnvVar("AGENTMEMORY_MCP_EXTENDED_TIMEOUT_MS");
   if (!raw) return DEFAULT_EXTENDED_CALL_TIMEOUT_MS;
   const n = Number(raw);
   return Number.isFinite(n) && n > 0
@@ -61,7 +70,7 @@ function displayAgentmemoryUrl(): string {
   // Match the literal-placeholder guard in rest-proxy.ts so log lines
   // don't show `${AGENTMEMORY_URL}` when an MCP host passed the
   // placeholder through unexpanded.
-  const raw = process.env["AGENTMEMORY_URL"];
+  const raw = getEnvVar("AGENTMEMORY_URL");
   if (!raw || (raw.startsWith("${") && raw.endsWith("}"))) {
     return "http://localhost:3111";
   }
@@ -131,6 +140,20 @@ interface Validated {
   memoryIds?: string[];
   reason?: string;
   project?: string;
+  agentId?: string;
+  includeSubagents?: boolean;
+}
+
+function resolveAgentFilter(requestedAgentId: unknown): string | undefined {
+  if (isAgentScopeIsolated()) return getAgentId();
+  if (typeof requestedAgentId !== "string") return undefined;
+  const agentId = requestedAgentId.trim();
+  return agentId && agentId !== "*" ? agentId.slice(0, 128) : undefined;
+}
+
+function resolveWriteAgentId(requestedAgentId: unknown): string | undefined {
+  if (isAgentScopeIsolated()) return getAgentId();
+  return resolveAgentFilter(requestedAgentId) ?? getAgentId();
 }
 
 function validate(toolName: string, args: Record<string, unknown>): Validated {
@@ -148,8 +171,12 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
       v.type = (args["type"] as string) || "fact";
       v.concepts = normalizeList(args["concepts"]);
       v.files = normalizeList(args["files"]);
+      v.agentId = resolveWriteAgentId(args["agentId"]);
       const project = args["project"];
-      if (typeof project === "string" && project.trim()) {
+      if (project !== undefined) {
+        if (typeof project !== "string" || !project.trim()) {
+          throw new Error("project must be a non-empty string");
+        }
         v.project = project.trim();
       }
       return v;
@@ -174,13 +201,19 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
         if (Number.isFinite(n) && n > 0) v.tokenBudget = Math.floor(n);
       }
       const project = args["project"];
-      if (typeof project === "string" && project.trim()) {
+      if (project !== undefined) {
+        if (typeof project !== "string" || !project.trim()) {
+          throw new Error("project must be a non-empty string");
+        }
         v.project = project.trim();
       }
+      v.agentId = resolveAgentFilter(args["agentId"]);
       return v;
     }
     case "memory_sessions": {
       v.limit = parseLimit(args["limit"], 20);
+      v.agentId = resolveAgentFilter(args["agentId"]);
+      v.includeSubagents = args["includeSubagents"] === true;
       return v;
     }
     case "memory_governance_delete": {
@@ -215,6 +248,7 @@ async function handleProxy(
           concepts: v.concepts,
           files: v.files,
           ...(v.project && { project: v.project }),
+          ...(v.agentId && { agentId: v.agentId }),
         }),
       });
       return textResponse(result);
@@ -226,6 +260,8 @@ async function handleProxy(
         format: v.format ?? "full",
       };
       if (v.tokenBudget != null) body["token_budget"] = v.tokenBudget;
+      if (v.project != null) body["project"] = v.project;
+      if (v.agentId != null) body["agentId"] = v.agentId;
       const result = await handle.call("/agentmemory/search", {
         method: "POST",
         body: JSON.stringify(body),
@@ -236,6 +272,8 @@ async function handleProxy(
       const body: Record<string, unknown> = { query: v.query, limit: v.limit };
       if (v.format != null) body["format"] = v.format;
       if (v.tokenBudget != null) body["token_budget"] = v.tokenBudget;
+      if (v.project != null) body["project"] = v.project;
+      if (v.agentId != null) body["agentId"] = v.agentId;
       const result = await handle.call("/agentmemory/smart-search", {
         method: "POST",
         body: JSON.stringify(body),
@@ -243,8 +281,11 @@ async function handleProxy(
       return textResponse(result, true);
     }
     case "memory_sessions": {
+      const query = new URLSearchParams({ limit: String(v.limit) });
+      if (v.agentId) query.set("agentId", v.agentId);
+      if (v.includeSubagents) query.set("includeSubagents", "true");
       const result = await handle.call(
-        `/agentmemory/sessions?limit=${v.limit}`,
+        `/agentmemory/sessions?${query.toString()}`,
         { method: "GET" },
       );
       return textResponse(result, true);
@@ -288,6 +329,7 @@ async function handleLocal(
         concepts: v.concepts,
         files: v.files,
         ...(v.project && { project: v.project }),
+        ...(v.agentId && { agentId: v.agentId }),
         createdAt: isoNow,
         updatedAt: isoNow,
         strength: 7,
@@ -304,9 +346,12 @@ async function handleLocal(
       const query = (v.query || "").toLowerCase();
       const limit = v.limit ?? DEFAULT_LIMIT;
       const all = await kvInstance.list<Record<string, unknown>>("mem:memories");
-      const scoped = v.project
-        ? all.filter((m) => typeof m["project"] === "string" && m["project"] === v.project)
+      const agentScoped = v.agentId
+        ? all.filter((memory) => memory["agentId"] === v.agentId)
         : all;
+      const scoped = v.project
+        ? agentScoped.filter((memory) => memory["project"] === v.project)
+        : agentScoped;
       const results = scoped
         .filter((m) => {
           const text = [
@@ -329,7 +374,14 @@ async function handleLocal(
       const sessions =
         await kvInstance.list<Record<string, unknown>>("mem:sessions");
       const limit = v.limit ?? 20;
-      return textResponse({ sessions: sessions.slice(0, limit) }, true);
+      const filtered = sessions
+        .filter((session) =>
+          v.agentId ? session["agentId"] === v.agentId : true,
+        )
+        .filter((session) =>
+          v.includeSubagents ? true : !session["parentSessionId"],
+        );
+      return textResponse({ sessions: filtered.slice(0, limit) }, true);
     }
 
     case "memory_governance_delete": {
@@ -398,6 +450,9 @@ export async function handleToolCall(
   args: Record<string, unknown>,
   kvInstance: InMemoryKV = kv,
 ): Promise<{ content: Array<{ type: string; text: string }> }> {
+  if (!isToolVisible(toolName)) {
+    throw new Error(`Unknown or disabled tool: ${toolName}`);
+  }
   const handle = await resolveHandle();
   announceMode(handle);
 
@@ -436,17 +491,20 @@ export async function handleToolCall(
   return handleLocal(validated, kvInstance);
 }
 
-function applyToolDisable<T>(tools: T[], nameOf: (t: T) => string | undefined): T[] {
-  const disable = parseToolDisableList(process.env["AGENTMEMORY_TOOLS_DISABLE"]);
-  if (disable.size === 0) return tools;
+function applyToolVisibility<T>(
+  tools: T[],
+  nameOf: (tool: T) => string | undefined,
+): T[] {
+  const visible = new Set(getVisibleTools().map((tool) => tool.name));
   return tools.filter((t) => {
     const name = nameOf(t);
-    return name === undefined || !disable.has(name);
+    return name === undefined || visible.has(name);
   });
 }
 
 export async function handleToolsList(): Promise<{ tools: unknown[] }> {
-  const debug = process.env["AGENTMEMORY_DEBUG"] === "1" || process.env["AGENTMEMORY_DEBUG"] === "true";
+  const debugValue = getEnvVar("AGENTMEMORY_DEBUG");
+  const debug = debugValue === "1" || debugValue === "true";
   const handle = await resolveHandle();
   announceMode(handle);
   if (debug) {
@@ -470,7 +528,7 @@ export async function handleToolsList(): Promise<{ tools: unknown[] }> {
         );
       }
       if (remote && Array.isArray(remote.tools)) {
-        const filtered = applyToolDisable(remote.tools, (t) =>
+        const filtered = applyToolVisibility(remote.tools, (t) =>
           typeof t === "object" && t !== null && typeof (t as { name?: unknown }).name === "string"
             ? ((t as { name: string }).name)
             : undefined,
@@ -478,7 +536,7 @@ export async function handleToolsList(): Promise<{ tools: unknown[] }> {
         if (debug) {
           const dropped = remote.tools.length - filtered.length;
           process.stderr.write(
-            `[@agentmemory/mcp] tools/list: returning ${filtered.length} tools from server${dropped > 0 ? ` (${dropped} dropped via AGENTMEMORY_TOOLS_DISABLE)` : ""}\n`,
+            `[@agentmemory/mcp] tools/list: returning ${filtered.length} tools from server${dropped > 0 ? ` (${dropped} hidden locally)` : ""}\n`,
           );
         }
         return { tools: filtered };
@@ -493,9 +551,8 @@ export async function handleToolsList(): Promise<{ tools: unknown[] }> {
       invalidateHandle();
     }
   }
-  const fallback = applyToolDisable(
-    getAllTools().filter((t) => IMPLEMENTED_TOOLS.has(t.name)),
-    (t) => t.name,
+  const fallback = getVisibleTools().filter((tool) =>
+    IMPLEMENTED_TOOLS.has(tool.name),
   );
   if (debug) {
     process.stderr.write(

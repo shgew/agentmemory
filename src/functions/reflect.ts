@@ -10,13 +10,18 @@ import type {
   Lesson,
   Crystal,
   MemoryProvider,
+  Memory,
+  Session,
+  SessionSummary,
 } from "../types.js";
 import { recordAudit } from "./audit.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 import { readGraphSnapshot } from "../state/graph-snapshot.js";
 import { filterSupersededLessons } from "./lesson-state.js";
+import { getEnvVar } from "../config.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 
-const REFLECT_CLUSTER_FP_VERSION = 1;
+const REFLECT_CLUSTER_FP_VERSION = 2;
 
 interface ConceptCluster {
   concepts: string[];
@@ -26,6 +31,122 @@ interface ConceptCluster {
   factIds: string[];
   lessonIds: string[];
   crystalIds: string[];
+}
+
+interface PreparedCluster {
+  conceptNames: string[];
+  facts: SemanticMemory[];
+  lessons: Lesson[];
+  crystals: Crystal[];
+  identityFp: string;
+}
+
+function normalizeEvidenceText(value: string): string {
+  return value.normalize("NFKC").replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function evidenceFingerprint(
+  project: string | undefined,
+  conceptNames: string[],
+  facts: SemanticMemory[],
+  lessons: Lesson[],
+  crystals: Crystal[],
+): string {
+  const lessonVersion = (lesson: Lesson): string | number =>
+    (lesson as Lesson & { version?: string | number }).version ??
+    lesson.updatedAt;
+  return fingerprintId(
+    "cluster",
+    JSON.stringify({
+      version: REFLECT_CLUSTER_FP_VERSION,
+      project: project ?? "",
+      concepts: conceptNames
+        .map((concept) => normalizeEvidenceText(concept))
+        .sort(),
+      facts: facts
+        .map(
+          (fact): [string, number, string] => [
+            fact.id,
+            fact.confidence,
+            normalizeEvidenceText(fact.fact),
+          ],
+        )
+        .sort(([left], [right]) => left.localeCompare(right)),
+      lessons: lessons
+        .map(
+          (lesson): [string, string | number, number, string] => [
+            lesson.id,
+            lessonVersion(lesson),
+            lesson.confidence,
+            normalizeEvidenceText(lesson.content),
+          ],
+        )
+        .sort(([left], [right]) => String(left).localeCompare(String(right))),
+      crystals: crystals
+        .map((crystal) => [
+          crystal.id,
+          normalizeEvidenceText(
+            [crystal.narrative, ...(crystal.lessons ?? [])].join("\n"),
+          ),
+        ])
+        .sort(([left], [right]) => left.localeCompare(right)),
+    }),
+  );
+}
+
+function memoryBelongsToProject(
+  memory: Memory,
+  project: string,
+  projectSessionIds: Set<string>,
+): boolean {
+  if (memory.project !== undefined) return memory.project === project;
+  return memory.sessionIds.some((sessionId) => projectSessionIds.has(sessionId));
+}
+
+function semanticBelongsToProject(
+  semantic: SemanticMemory,
+  projectSessionIds: Set<string>,
+  projectMemoryIds: Set<string>,
+): boolean {
+  return (
+    semantic.sourceSessionIds.some((id) => projectSessionIds.has(id)) ||
+    semantic.sourceMemoryIds.some((id) => projectMemoryIds.has(id))
+  );
+}
+
+function crystalBelongsToProject(
+  crystal: Crystal,
+  project: string,
+  projectSessionIds: Set<string>,
+): boolean {
+  if (crystal.project !== undefined) return crystal.project === project;
+  return !!crystal.sessionId && projectSessionIds.has(crystal.sessionId);
+}
+
+async function readProjectEvidence(
+  kv: StateKV,
+  project: string,
+): Promise<{ sessionIds: Set<string>; memoryIds: Set<string> }> {
+  const [sessions, summaries, memories] = await Promise.all([
+    kv.list<Session>(KV.sessions),
+    kv.list<SessionSummary>(KV.summaries),
+    kv.list<Memory>(KV.memories),
+  ]);
+  const sessionIds = new Set([
+    ...sessions.filter((session) => session.project === project).map((session) => session.id),
+    ...summaries.filter((summary) => summary.project === project).map((summary) => summary.sessionId),
+  ]);
+  for (const memory of memories) {
+    if (memory.project === project) {
+      for (const sessionId of memory.sessionIds) sessionIds.add(sessionId);
+    }
+  }
+  const memoryIds = new Set(
+    memories
+      .filter((memory) => memoryBelongsToProject(memory, project, sessionIds))
+      .map((memory) => memory.id),
+  );
+  return { sessionIds, memoryIds };
 }
 
 function reinforceInsight(insight: Insight): void {
@@ -144,12 +265,31 @@ function reinforceInsightWithProvenance(
   cluster: ConceptCluster,
   conceptNames: string[],
 ): void {
-  reinforceInsight(insight);
   insight.sourceMemoryIds = boundedUnion(insight.sourceMemoryIds, cluster.factIds, 100);
   insight.sourceLessonIds = boundedUnion(insight.sourceLessonIds, cluster.lessonIds, 100);
   insight.sourceCrystalIds = boundedUnion(insight.sourceCrystalIds, cluster.crystalIds, 100);
   insight.sourceConceptCluster = boundedUnion(insight.sourceConceptCluster, conceptNames, 50);
   insight.tags = boundedUnion(insight.tags, conceptNames, 50);
+}
+
+function stampClusterFingerprint(insight: Insight, clusterFp: string): void {
+  insight.reflectClusterFp = clusterFp;
+  insight.reflectClusterFps = boundedUnion(
+    insight.reflectClusterFps ?? [],
+    [clusterFp],
+    100,
+  );
+  insight.reflectClusterFpVersion = REFLECT_CLUSTER_FP_VERSION;
+}
+
+function hasClusterFingerprint(insight: Insight, clusterFp: string): boolean {
+  if (insight.reflectClusterFpVersion !== REFLECT_CLUSTER_FP_VERSION) {
+    return false;
+  }
+  return (
+    insight.reflectClusterFp === clusterFp ||
+    insight.reflectClusterFps?.includes(clusterFp) === true
+  );
 }
 
 function buildGraphClusters(
@@ -228,9 +368,9 @@ const REFLECT_TIMEOUT_MS_DEFAULT = 600_000;
 
 export function readMaxSingleCallMs(): number {
   for (const key of ["OPENAI_TIMEOUT_MS", "AGENTMEMORY_LLM_TIMEOUT_MS"]) {
-    const raw = process.env[key];
+    const raw = getEnvVar(key);
     if (raw) {
-      const n = parseInt(raw, 10);
+      const n = Number(raw);
       if (Number.isFinite(n) && n > 0) return n;
     }
   }
@@ -243,9 +383,9 @@ export function readReflectTimeoutMs(): number {
     60_000,
     III_INVOCATION_CAP_MS - maxSingleCall - REFLECT_BUDGET_MARGIN_MS,
   );
-  const raw = process.env.AGENTMEMORY_REFLECT_TIMEOUT_MS;
+  const raw = getEnvVar("AGENTMEMORY_REFLECT_TIMEOUT_MS");
   if (!raw) return ceiling;
-  const n = parseInt(raw, 10);
+  const n = Number(raw);
   const configured = Number.isFinite(n) && n > 0 ? n : REFLECT_TIMEOUT_MS_DEFAULT;
   if (configured > ceiling) {
     logger.warn(
@@ -314,6 +454,49 @@ function buildJaccardClusters(
   return clusters;
 }
 
+function prepareCluster(
+  conceptNames: string[],
+  semanticMemories: SemanticMemory[],
+  lessons: Lesson[],
+  crystals: Crystal[],
+  project: string | undefined,
+): PreparedCluster {
+  const conceptSet = new Set(conceptNames.map((concept) => concept.toLowerCase()));
+  const facts = semanticMemories.filter((semantic) =>
+    semantic.fact
+      .toLowerCase()
+      .split(/\s+/)
+      .some((term) => conceptSet.has(term)),
+  );
+  const matchingLessons = lessons.filter(
+    (lesson) =>
+      lesson.tags.some((tag) => conceptSet.has(tag.toLowerCase())) ||
+      conceptNames.some((concept) =>
+        lesson.content.toLowerCase().includes(concept.toLowerCase()),
+      ),
+  );
+  const matchingCrystals = crystals.filter((crystal) =>
+    crystal.lessons.some((lesson) =>
+      conceptNames.some((concept) =>
+        lesson.toLowerCase().includes(concept.toLowerCase()),
+      ),
+    ),
+  );
+  return {
+    conceptNames,
+    facts,
+    lessons: matchingLessons,
+    crystals: matchingCrystals,
+    identityFp: evidenceFingerprint(
+      project,
+      conceptNames,
+      facts,
+      matchingLessons,
+      matchingCrystals,
+    ),
+  };
+}
+
 export function registerReflectFunctions(
   sdk: ISdk,
   kv: StateKV,
@@ -321,37 +504,43 @@ export function registerReflectFunctions(
 ): void {
   sdk.registerFunction("mem::reflect", 
     async (data: { maxClusters?: number; project?: string }) => {
-      const maxClusters = Math.min(data?.maxClusters ?? 10, 20);
+      const project = data?.project;
+      const cursorKey = `reflect:cursor:${project || "global"}`;
+      return withKeyedLock(cursorKey, async () => {
+      const maxClusters = Math.max(1, Math.min(data?.maxClusters ?? 10, 20));
       const maxInsightsPerCluster = 5;
       const maxTotal = 50;
       const reflectStart = Date.now();
       const reflectBudgetMs = readReflectTimeoutMs();
-      const cursorKey = `reflect:cursor:${data?.project || "global"}`;
       const cursorState = await kv
         .get<{ processedFps: string[] }>(KV.config, cursorKey)
         .catch(() => null);
       const processedFps = new Set<string>(cursorState?.processedFps ?? []);
-      const clusterIdentityFp = (conceptNames: string[]): string =>
-        fingerprintId(
-          "reflectcursor",
-          `${data?.project ?? ""}\n${conceptNames.map((c) => c.toLowerCase()).slice().sort().join(",")}`,
-        );
 
-      // #814/#825: reflect is a hot path, so read the bounded graph snapshot
-      // instead of kv.list over full graphNodes/graphEdges (stalls the worker
-      // on large corpora). Falls back to Jaccard clustering when absent.
+      // Snapshot reads bound reflection cost for large graphs.
       const graphSnapshot = await readGraphSnapshot(kv);
       const graphNodes = graphSnapshot?.topNodes ?? [];
       const graphEdges = graphSnapshot?.topEdges ?? [];
-      const [semanticMemories, lessons, crystals] = await Promise.all([
-        kv.list<SemanticMemory>(KV.semantic).catch(() => []),
-        kv.list<Lesson>(KV.lessons).catch(() => []),
-        kv.list<Crystal>(KV.crystals).catch(() => []),
+      let [semanticMemories, lessons, crystals] = await Promise.all([
+        kv.list<SemanticMemory>(KV.semantic),
+        kv.list<Lesson>(KV.lessons),
+        kv.list<Crystal>(KV.crystals),
       ]);
 
       let activeLessons = filterSupersededLessons(lessons);
-      if (data?.project) {
-        activeLessons = activeLessons.filter((l) => l.project === data.project);
+      if (project) {
+        const evidence = await readProjectEvidence(kv, project);
+        semanticMemories = semanticMemories.filter((semantic) =>
+          semanticBelongsToProject(
+            semantic,
+            evidence.sessionIds,
+            evidence.memoryIds,
+          ),
+        );
+        activeLessons = activeLessons.filter((lesson) => lesson.project === project);
+        crystals = crystals.filter((crystal) =>
+          crystalBelongsToProject(crystal, project, evidence.sessionIds),
+        );
       }
 
       let conceptClusters = buildGraphClusters(
@@ -368,6 +557,15 @@ export function registerReflectFunctions(
           maxClusters,
         );
       }
+      const preparedClusters = conceptClusters.map((conceptNames) =>
+        prepareCluster(
+          conceptNames,
+          semanticMemories,
+          activeLessons,
+          crystals,
+          project,
+        ),
+      );
 
       let newInsights = 0;
       let reinforced = 0;
@@ -382,74 +580,31 @@ export function registerReflectFunctions(
       ).filter((i) => !i.deleted);
       const reinforcedIds = new Set<string>();
 
-      const backfillDirty: Insight[] = [];
-      for (const ins of activeInsights) {
-        if (data?.project !== undefined && ins.project !== data.project) continue;
-        if (ins.reflectClusterFp === undefined && Array.isArray(ins.sourceLessonIds) && ins.sourceLessonIds.length >= 1) {
-          ins.reflectClusterFp = fingerprintId(
-            "cluster",
-            `${ins.project ?? ""}\n${ins.sourceLessonIds.slice().sort().join(",")}`,
-          );
-          ins.reflectClusterFpVersion = REFLECT_CLUSTER_FP_VERSION;
-          backfillDirty.push(ins);
-        }
-      }
-      if (backfillDirty.length > 0) {
-        await Promise.all(
-          backfillDirty.map((i) => kv.set(KV.insights, i.id, i)),
-        );
-      }
-
-      for (const conceptNames of conceptClusters) {
+      for (const prepared of preparedClusters) {
         if (totalInsights >= maxTotal) break;
-        const identityFp = clusterIdentityFp(conceptNames);
+        const { conceptNames, facts, lessons: clusterLessons, crystals: clusterCrystals, identityFp } = prepared;
         if (processedFps.has(identityFp)) continue;
         if (Date.now() - reflectStart >= reflectBudgetMs) {
           budgetExhausted = true;
           break;
         }
-        processedFps.add(identityFp);
-
-        const conceptSet = new Set(conceptNames.map((c) => c.toLowerCase()));
-
-        const clusterFacts = semanticMemories.filter((s) => {
-          const factTerms = s.fact.toLowerCase().split(/\s+/);
-          return factTerms.some((t) => conceptSet.has(t));
-        });
-
-        const clusterLessons = activeLessons.filter((l) =>
-          l.tags.some((t) => conceptSet.has(t.toLowerCase())) ||
-          conceptNames.some((c) =>
-            l.content.toLowerCase().includes(c.toLowerCase()),
-          ),
-        );
-
-        const clusterCrystals = crystals.filter((c) =>
-          (c.lessons || []).some((l) =>
-            conceptNames.some((cn) =>
-              l.toLowerCase().includes(cn.toLowerCase()),
-            ),
-          ),
-        );
-
         const totalItems =
-          clusterFacts.length + clusterLessons.length + clusterCrystals.length;
+          facts.length + clusterLessons.length + clusterCrystals.length;
         if (totalItems < 3) {
+          processedFps.add(identityFp);
           clustersSkipped++;
           continue;
         }
 
         let clusterFp: string | undefined;
         if (clusterLessons.length >= 1) {
-          clusterFp = fingerprintId(
-            "cluster",
-            `${data?.project ?? ""}\n${clusterLessons.map((l) => l.id).sort().join(",")}`,
-          );
+          clusterFp = identityFp;
           if (
             activeInsights.some(
-              (i) => !i.deleted && i.reflectClusterFp === clusterFp,
+              (insight) => hasClusterFingerprint(insight, identityFp),
             )
           ) {
+            processedFps.add(identityFp);
             clustersFrozen++;
             continue;
           }
@@ -458,7 +613,7 @@ export function registerReflectFunctions(
 
         const cluster: ConceptCluster = {
           concepts: conceptNames,
-          facts: clusterFacts.map((f) => ({
+          facts: facts.map((f) => ({
             fact: f.fact,
             confidence: f.confidence,
           })),
@@ -467,7 +622,7 @@ export function registerReflectFunctions(
             confidence: l.confidence,
           })),
           crystalNarratives: clusterCrystals.map((c) => c.narrative),
-          factIds: clusterFacts.map((f) => f.id),
+          factIds: facts.map((f) => f.id),
           lessonIds: clusterLessons.map((l) => l.id),
           crystalIds: clusterCrystals.map((c) => c.id),
         };
@@ -518,16 +673,16 @@ export function registerReflectFunctions(
             }
 
             if (target) {
+              reinforceInsightWithProvenance(target, cluster, conceptNames);
               if (!reinforcedIds.has(target.id)) {
-                reinforceInsightWithProvenance(target, cluster, conceptNames);
-                if (clusterFp !== undefined) {
-                  target.reflectClusterFp = clusterFp;
-                  target.reflectClusterFpVersion = REFLECT_CLUSTER_FP_VERSION;
-                }
-                await kv.set(KV.insights, target.id, target);
+                reinforceInsight(target);
                 reinforcedIds.add(target.id);
                 reinforced++;
               }
+              if (clusterFp !== undefined) {
+                stampClusterFingerprint(target, clusterFp);
+              }
+              await kv.set(KV.insights, target.id, target);
             } else {
               const now = new Date().toISOString();
               const insight: Insight = {
@@ -547,8 +702,7 @@ export function registerReflectFunctions(
                 decayRate: 0.05,
               };
               if (clusterFp !== undefined) {
-                insight.reflectClusterFp = clusterFp;
-                insight.reflectClusterFpVersion = REFLECT_CLUSTER_FP_VERSION;
+                stampClusterFingerprint(insight, clusterFp);
               }
               await kv.set(KV.insights, insight.id, insight);
               activeInsights.push(insight);
@@ -558,20 +712,32 @@ export function registerReflectFunctions(
             clusterCount++;
             totalInsights++;
           }
+          if (clusterCount === 0) {
+            clustersFailed++;
+            continue;
+          }
+          processedFps.add(identityFp);
         } catch {
           clustersFailed++;
           continue;
         }
       }
-      const fullPassComplete = conceptClusters.every((cn) =>
-        processedFps.has(clusterIdentityFp(cn)),
+      const fullPassComplete = preparedClusters.every((cluster) =>
+        processedFps.has(cluster.identityFp),
       );
-      await kv
-        .set(KV.config, cursorKey, {
+      let cursorPersisted = true;
+      try {
+        await kv.set(KV.config, cursorKey, {
           processedFps: fullPassComplete ? [] : [...processedFps],
           updatedAt: new Date().toISOString(),
-        })
-        .catch(() => {});
+        });
+      } catch (err) {
+        cursorPersisted = false;
+        logger.warn("Reflect cursor update failed", {
+          error: err instanceof Error ? err.message : String(err),
+          cursorKey,
+        });
+      }
       const reflectFailed =
         clustersAttempted > 0 && clustersFailed === clustersAttempted;
 
@@ -579,7 +745,7 @@ export function registerReflectFunctions(
         await recordAudit(kv, "reflect", "mem::reflect", [], {
           newInsights,
           reinforced,
-          clustersProcessed: conceptClusters.length - clustersSkipped - clustersFrozen,
+          clustersProcessed: clustersAttempted,
           clustersFrozen,
           clustersSkipped,
           usedFallback,
@@ -589,16 +755,17 @@ export function registerReflectFunctions(
       } catch {}
 
       return {
-        success: !reflectFailed,
+        success: !reflectFailed && cursorPersisted,
         newInsights,
         reinforced,
-        clustersProcessed: conceptClusters.length - clustersSkipped - clustersFrozen,
+        clustersProcessed: clustersAttempted,
         clustersFrozen,
         clustersSkipped,
         usedFallback,
         budgetExhausted,
-        fullPassComplete,
+        fullPassComplete: fullPassComplete && cursorPersisted,
       };
+      });
     },
   );
 

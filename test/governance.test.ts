@@ -4,13 +4,20 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
+const decrementImageRef = vi.hoisted(() => vi.fn(async () => {}));
+
+vi.mock("../src/functions/image-refs.js", () => ({
+  decrementImageRef,
+}));
+
 import { registerGovernanceFunction } from "../src/functions/governance.js";
 import {
   getSearchIndex,
   setIndexPersistence,
 } from "../src/functions/search.js";
+import { KV } from "../src/state/schema.js";
 import { memoryToObservation } from "../src/state/memory-utils.js";
-import type { Memory, AuditEntry } from "../src/types.js";
+import type { Memory, AuditEntry, Session } from "../src/types.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -22,6 +29,21 @@ function mockKV() {
       if (!store.has(scope)) store.set(scope, new Map());
       store.get(scope)!.set(key, data);
       return data;
+    },
+    update: async <T>(
+      scope: string,
+      key: string,
+      ops: Array<{ type: string; path: string; value?: unknown }>,
+    ): Promise<T> => {
+      const existing =
+        (store.get(scope)?.get(key) as Record<string, unknown>) ?? {};
+      const next = { ...existing };
+      for (const op of ops) {
+        if (op.type === "set") next[op.path] = op.value;
+      }
+      if (!store.has(scope)) store.set(scope, new Map());
+      store.get(scope)!.set(key, next);
+      return next as T;
     },
     delete: async (scope: string, key: string): Promise<void> => {
       store.get(scope)?.delete(key);
@@ -68,11 +90,24 @@ function makeMemory(id: string, type: Memory["type"] = "pattern"): Memory {
   };
 }
 
+function makeSession(observationCount: number): Session {
+  return {
+    id: "ses_1",
+    project: "agentmemory",
+    cwd: "/repo",
+    startedAt: "2026-02-01T00:00:00Z",
+    status: "active",
+    observationCount,
+  };
+}
+
 describe("Governance Functions", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
 
   beforeEach(async () => {
+    decrementImageRef.mockReset();
+    decrementImageRef.mockResolvedValue(undefined);
     sdk = mockSdk();
     kv = mockKV();
     registerGovernanceFunction(sdk as never, kv as never);
@@ -109,18 +144,47 @@ describe("Governance Functions", () => {
     expect(remaining.length).toBe(3);
   });
 
+  it("governance-delete preserves a memory when image cleanup fails", async () => {
+    const imageRef = "/managed/memory.png";
+    await kv.set(KV.memories, "mem_1", {
+      ...makeMemory("mem_1"),
+      imageRef,
+    });
+    await kv.set(KV.accessLog, "mem_1", { memoryId: "mem_1" });
+    decrementImageRef.mockRejectedValueOnce(new Error("image cleanup failed"));
+
+    await expect(
+      sdk.trigger("mem::governance-delete", { memoryIds: ["mem_1"] }),
+    ).rejects.toThrow("image cleanup failed");
+
+    expect(await kv.get(KV.memories, "mem_1")).not.toBeNull();
+    expect(await kv.get(KV.accessLog, "mem_1")).not.toBeNull();
+
+    const result = (await sdk.trigger("mem::governance-delete", {
+      memoryIds: ["mem_1"],
+    })) as { success: boolean; deleted: number };
+
+    expect(result.success).toBe(true);
+    expect(result.deleted).toBe(1);
+    expect(decrementImageRef).toHaveBeenCalledTimes(2);
+    expect(await kv.get(KV.memories, "mem_1")).toBeNull();
+    expect(await kv.get(KV.accessLog, "mem_1")).toBeNull();
+  });
+
   it("governance-delete removes an observation and its retained raw payload", async () => {
-    await kv.set("mem:obs:ses_1", "obs_1", {
+    await kv.set(KV.sessions, "ses_1", makeSession(1));
+    await kv.set(KV.observations("ses_1"), "obs_1", {
       id: "obs_1",
       sessionId: "ses_1",
       title: "Edit auth",
     });
-    await kv.set("mem:raw-payloads", "obs_1", {
+    await kv.set(KV.rawPayloads, "obs_1", {
       id: "obs_1",
       sessionId: "ses_1",
       hookType: "post_tool_use",
       raw: {},
     });
+    await kv.set(KV.accessLog, "obs_1", { memoryId: "obs_1" });
 
     const result = (await sdk.trigger("mem::governance-delete", {
       memoryIds: ["obs_1"],
@@ -129,8 +193,85 @@ describe("Governance Functions", () => {
 
     expect(result.success).toBe(true);
     expect(result.deleted).toBe(1);
-    expect(await kv.get("mem:obs:ses_1", "obs_1")).toBeNull();
-    expect(await kv.get("mem:raw-payloads", "obs_1")).toBeNull();
+    expect(await kv.get(KV.observations("ses_1"), "obs_1")).toBeNull();
+    expect(await kv.get(KV.rawPayloads, "obs_1")).toBeNull();
+    expect(await kv.get(KV.accessLog, "obs_1")).toBeNull();
+    expect((await kv.get<Session>(KV.sessions, "ses_1"))?.observationCount).toBe(
+      0,
+    );
+  });
+
+  it("governance-delete finds compressed observations without raw payloads", async () => {
+    await kv.set(KV.sessions, "ses_1", makeSession(2));
+    await kv.set(KV.observations("ses_1"), "obs_1", {
+      id: "obs_1",
+      sessionId: "ses_1",
+      title: "Edit auth",
+    });
+    await kv.set(KV.observations("ses_1"), "obs_2", {
+      id: "obs_2",
+      sessionId: "ses_1",
+      title: "Run tests",
+    });
+    await kv.set(KV.accessLog, "obs_1", { memoryId: "obs_1" });
+
+    const result = (await sdk.trigger("mem::governance-delete", {
+      memoryIds: ["obs_1"],
+    })) as { success: boolean; deleted: number };
+
+    expect(result.success).toBe(true);
+    expect(result.deleted).toBe(1);
+    expect(await kv.get(KV.observations("ses_1"), "obs_1")).toBeNull();
+    expect(await kv.get(KV.observations("ses_1"), "obs_2")).not.toBeNull();
+    expect(await kv.get(KV.accessLog, "obs_1")).toBeNull();
+    expect((await kv.get<Session>(KV.sessions, "ses_1"))?.observationCount).toBe(
+      1,
+    );
+  });
+
+  it("governance-delete preserves an observation when image cleanup fails", async () => {
+    const imageRef = "/managed/image.png";
+    await kv.set(KV.sessions, "ses_1", makeSession(1));
+    await kv.set(KV.observations("ses_1"), "obs_1", {
+      id: "obs_1",
+      sessionId: "ses_1",
+      title: "Capture image",
+      imageRef,
+    });
+    await kv.set(KV.rawPayloads, "obs_1", {
+      id: "obs_1",
+      sessionId: "ses_1",
+      hookType: "post_tool_use",
+      raw: {},
+      imageData: imageRef,
+    });
+    await kv.set(KV.accessLog, "obs_1", { memoryId: "obs_1" });
+    decrementImageRef.mockRejectedValueOnce(new Error("image cleanup failed"));
+
+    await expect(
+      sdk.trigger("mem::governance-delete", { memoryIds: ["obs_1"] }),
+    ).rejects.toThrow("image cleanup failed");
+
+    expect(await kv.get(KV.observations("ses_1"), "obs_1")).not.toBeNull();
+    expect(await kv.get(KV.rawPayloads, "obs_1")).not.toBeNull();
+    expect(await kv.get(KV.accessLog, "obs_1")).not.toBeNull();
+    expect((await kv.get<Session>(KV.sessions, "ses_1"))?.observationCount).toBe(
+      1,
+    );
+
+    const result = (await sdk.trigger("mem::governance-delete", {
+      memoryIds: ["obs_1"],
+    })) as { success: boolean; deleted: number };
+
+    expect(result.success).toBe(true);
+    expect(result.deleted).toBe(1);
+    expect(decrementImageRef).toHaveBeenCalledTimes(2);
+    expect(await kv.get(KV.observations("ses_1"), "obs_1")).toBeNull();
+    expect(await kv.get(KV.rawPayloads, "obs_1")).toBeNull();
+    expect(await kv.get(KV.accessLog, "obs_1")).toBeNull();
+    expect((await kv.get<Session>(KV.sessions, "ses_1"))?.observationCount).toBe(
+      0,
+    );
   });
 
   it("governance-bulk deletes by type filter", async () => {

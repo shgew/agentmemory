@@ -5,13 +5,111 @@ import type {
   AuditEntry,
   CompressedObservation,
   RawObservation,
+  Session,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { recordAudit, safeAudit, queryAudit } from "./audit.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { getSearchIndex, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { logger } from "../logger.js";
+
+async function locateObservationSession(
+  kv: StateKV,
+  id: string,
+  raw: RawObservation | null,
+): Promise<string | null> {
+  if (raw) return raw.sessionId;
+
+  const sessions = await kv.list<Session>(KV.sessions);
+  for (let offset = 0; offset < sessions.length; offset += 25) {
+    const batch = sessions.slice(offset, offset + 25);
+    const observations = await Promise.all(
+      batch.map((session) =>
+        kv.get<CompressedObservation>(KV.observations(session.id), id),
+      ),
+    );
+    const index = observations.findIndex((observation) => observation !== null);
+    if (index >= 0) return batch[index].id;
+  }
+
+  return null;
+}
+
+async function decrementImageRefs(
+  sdk: ISdk,
+  kv: StateKV,
+  ...refs: Array<string | undefined>
+): Promise<void> {
+  const imageRefs = Array.from(
+    new Set(
+      refs.filter(
+        (ref): ref is string => typeof ref === "string" && ref.length > 0,
+      ),
+    ),
+  );
+  if (imageRefs.length === 0) return;
+
+  const { decrementImageRef } = await import("./image-refs.js");
+  for (const imageRef of imageRefs) {
+    await decrementImageRef(kv, sdk, imageRef);
+  }
+}
+
+async function decrementObservationCount(
+  kv: StateKV,
+  sessionId: string,
+): Promise<void> {
+  const session = await kv.get<Session>(KV.sessions, sessionId);
+  if (!session) return;
+
+  const currentCount =
+    typeof session.observationCount === "number" &&
+    Number.isFinite(session.observationCount)
+      ? Math.max(0, Math.floor(session.observationCount))
+      : 0;
+  const observationCount = Math.max(0, currentCount - 1);
+  if (session.observationCount === observationCount) return;
+
+  await kv.update<Session>(KV.sessions, sessionId, [
+    { type: "set", path: "observationCount", value: observationCount },
+  ]);
+}
+
+async function deleteObservation(
+  sdk: ISdk,
+  kv: StateKV,
+  id: string,
+  raw: RawObservation | null,
+): Promise<boolean> {
+  const sessionId = await locateObservationSession(kv, id, raw);
+  if (!sessionId) return false;
+
+  return withKeyedLock(`obs:${sessionId}`, async () => {
+    const [currentObservation, currentRaw] = await Promise.all([
+      kv.get<CompressedObservation>(KV.observations(sessionId), id),
+      kv.get<RawObservation>(KV.rawPayloads, id),
+    ]);
+    if (!currentObservation && !currentRaw) return false;
+
+    await decrementImageRefs(
+      sdk,
+      kv,
+      currentObservation?.imageData,
+      currentObservation?.imageRef,
+      currentRaw?.imageData,
+    );
+
+    if (currentObservation) {
+      await kv.delete(KV.observations(sessionId), id);
+    }
+    if (currentRaw) await kv.delete(KV.rawPayloads, id);
+    await deleteAccessLog(kv, id);
+    await decrementObservationCount(kv, sessionId);
+    return true;
+  });
+}
 
 export function registerGovernanceFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction("mem::governance-delete", 
@@ -28,6 +126,7 @@ export function registerGovernanceFunction(sdk: ISdk, kv: StateKV): void {
       for (const id of data.memoryIds) {
         const mem = await kv.get<Memory>(KV.memories, id);
         if (mem) {
+          await decrementImageRefs(sdk, kv, mem.imageData, mem.imageRef);
           await kv.delete(KV.memories, id);
           await deleteAccessLog(kv, id);
           getSearchIndex().remove(id);
@@ -37,22 +136,7 @@ export function registerGovernanceFunction(sdk: ISdk, kv: StateKV): void {
         }
 
         const raw = await kv.get<RawObservation>(KV.rawPayloads, id);
-        if (raw) {
-          const { decrementImageRef } = await import("./image-refs.js");
-          const observation = await kv.get<CompressedObservation>(
-            KV.observations(raw.sessionId),
-            id,
-          );
-          await kv.delete(KV.observations(raw.sessionId), id);
-          await kv.delete(KV.rawPayloads, id);
-          const imageRefs = new Set(
-            [observation?.imageData, observation?.imageRef, raw.imageData].filter(
-              (ref): ref is string => typeof ref === "string" && ref.length > 0,
-            ),
-          );
-          for (const imageRef of imageRefs) {
-            await decrementImageRef(kv, sdk, imageRef);
-          }
+        if (await deleteObservation(sdk, kv, id, raw)) {
           getSearchIndex().remove(id);
           vectorIndexRemove(id);
           deleted++;

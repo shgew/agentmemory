@@ -22,15 +22,17 @@ describe("OpenCode connect adapter: --with-plugin flag", () => {
 
   it("resolves the plugin source from @agentmemory/agentmemory", () => {
     expect(adapter).toMatch(/agentmemory-capture\.ts/);
-    expect(adapter).toMatch(/@agentmemory\/agentmemory|plugin\/opencode/);
+    expect(adapter).toMatch(/findPluginRoot\(\)/);
+    expect(adapter).toMatch(/join\(pluginRoot,\s*["']opencode["']/);
   });
 
   it("targets ~/.config/opencode/plugins/ for the plugin file", () => {
     expect(adapter).toMatch(/["']plugins["']/);
   });
 
-  it("merges the plugin path into the opencode.json 'plugin' array", () => {
-    expect(adapter).toMatch(/["']plugin["']\s*\]?[\s\S]{0,200}?agentmemory-capture/);
+  it("relies on OpenCode plugin-directory discovery", () => {
+    expect(adapter).not.toMatch(/mergePluginArray/);
+    expect(adapter).not.toMatch(/config\[["']plugin["']\]\s*=/);
   });
 
   it("copies the agentmemory skills tree from plugin/skills/ to ~/.config/opencode/skills/", () => {
@@ -40,24 +42,21 @@ describe("OpenCode connect adapter: --with-plugin flag", () => {
   });
 
   it("does NOT ship the deleted /recall, /remember, /health markdown commands", () => {
-    // Old ship-path constructs are gone
     expect(adapter).not.toMatch(/SLASH_COMMANDS/);
     expect(adapter).not.toMatch(/function\s+commandsDir/);
-    // No code path that creates or copies INTO a commands/ dir
     expect(adapter).not.toMatch(/mkdirSync\([^)]*?["']commands["']/);
     expect(adapter).not.toMatch(/copyFileSync\([^)]*?,\s*join\([^)]*?["']commands["']/);
   });
 
   it("removes deprecated agentmemory legacy command files on upgrade", () => {
-    // Cleanup constant + function are present
     expect(adapter).toMatch(/LEGACY_COMMAND_FILES/);
     expect(adapter).toMatch(/cleanupLegacyCommands/);
-    // Cleanup names the 3 deprecated files
     expect(adapter).toMatch(/recall\.md/);
     expect(adapter).toMatch(/remember\.md/);
     expect(adapter).toMatch(/health\.md/);
-    // Cleanup backs up before removing
     expect(adapter).toMatch(/backupFile[^;]*opencode-legacy-command/);
+    expect(adapter).toMatch(/LEGACY_COMMAND_HASHES/);
+    expect(adapter).toMatch(/createHash\(["']sha256["']\)/);
     expect(adapter).toMatch(/rmSync/);
   });
 

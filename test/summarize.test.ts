@@ -8,6 +8,7 @@ vi.mock("../src/state/schema.js", () => ({
   KV: {
     sessions: "sessions",
     summaries: "summaries",
+    rawPayloads: "rawPayloads",
     observations: (sessionId: string) => `obs:${sessionId}`,
     audit: "audit",
   },
@@ -32,6 +33,7 @@ vi.mock("../src/functions/audit.js", () => ({
 import { registerSummarizeFunction, getSummarizeTimeoutMs } from "../src/functions/summarize.js";
 import type {
   CompressedObservation,
+  RawObservation,
   Session,
   MemoryProvider,
 } from "../src/types.js";
@@ -65,7 +67,10 @@ function mockSdk() {
       functions.set(id, handler);
     },
     registerTrigger: () => {},
-    trigger: async () => ({}),
+    trigger: async (input: { function_id: string; payload?: unknown }) => {
+      const handler = functions.get(input.function_id);
+      return handler ? handler(input.payload) : {};
+    },
   };
 }
 
@@ -514,6 +519,70 @@ describe("mem::summarize windowing", () => {
   });
 });
 
+describe("mem::summarize pending compression drain", () => {
+  it("retries pending raw observations and remains idempotent after success", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const sessionId = "ses_pending";
+    const timestamp = "2026-01-01T10:00:00.000Z";
+    const session: Session = {
+      id: sessionId,
+      project: "test-project",
+      cwd: "/tmp",
+      startedAt: timestamp,
+      updatedAt: timestamp,
+      status: "completed",
+      observationCount: 1,
+    };
+    const raw: RawObservation = {
+      id: "obs_pending",
+      sessionId,
+      timestamp,
+      hookType: "prompt_submit",
+      raw: { prompt: "remember this" },
+      userPrompt: "remember this",
+    };
+    await kv.set("sessions", sessionId, session);
+    await kv.set("rawPayloads", raw.id, raw);
+
+    let shouldFail = true;
+    let compressCalls = 0;
+    sdk.registerFunction("mem::compress", async (data: unknown) => {
+      compressCalls += 1;
+      if (shouldFail) return { success: false, error: "temporary_failure" };
+      const payload = data as {
+        observationId: string;
+        sessionId: string;
+      };
+      await kv.set(
+        `obs:${payload.sessionId}`,
+        payload.observationId,
+        { ...makeObs(1, payload.sessionId), id: payload.observationId, timestamp },
+      );
+      return { success: true };
+    });
+
+    const provider = makeProvider([summaryXml({ title: "recovered" })]);
+    registerSummarizeFunction(sdk as any, kv as any, provider);
+    const handler = sdk.functions.get("mem::summarize")!;
+
+    const failed: any = await handler({ sessionId, until: timestamp });
+    expect(failed).toMatchObject({
+      success: false,
+      error: "pending_compression_failed",
+      pendingObservationIds: [raw.id],
+    });
+
+    shouldFail = false;
+    const recovered: any = await handler({ sessionId, until: timestamp });
+    expect(recovered).toMatchObject({ success: true });
+    expect(compressCalls).toBe(2);
+
+    await handler({ sessionId, until: timestamp });
+    expect(compressCalls).toBe(2);
+  });
+});
+
 describe("getSummarizeTimeoutMs", () => {
   const ORIGINAL_ENV = { ...process.env };
 
@@ -538,6 +607,19 @@ describe("getSummarizeTimeoutMs", () => {
     process.env.AGENTMEMORY_SUMMARIZE_TIMEOUT_MS = "abc";
     expect(getSummarizeTimeoutMs()).toBe(180000);
   });
+
+  it("falls back to default on numeric prefix garbage", () => {
+    process.env.AGENTMEMORY_SUMMARIZE_TIMEOUT_MS = "1ms";
+    expect(getSummarizeTimeoutMs()).toBe(180000);
+  });
+
+  it.each(["1.5", "1e3", "2147483648"])(
+    "falls back to default on unsafe timer value %s",
+    (value) => {
+      process.env.AGENTMEMORY_SUMMARIZE_TIMEOUT_MS = value;
+      expect(getSummarizeTimeoutMs()).toBe(180000);
+    },
+  );
 
   it("falls back to default on zero", () => {
     process.env.AGENTMEMORY_SUMMARIZE_TIMEOUT_MS = "0";

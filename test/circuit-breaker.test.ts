@@ -54,6 +54,17 @@ describe("CircuitBreaker", () => {
     expect(cb.getState().state).toBe("half-open");
   });
 
+  it("allows only one half-open probe", () => {
+    const cb = new CircuitBreaker();
+    cb.recordFailure();
+    cb.recordFailure();
+    cb.recordFailure();
+    vi.advanceTimersByTime(30_000);
+
+    expect(cb.isAllowed).toBe(true);
+    expect(cb.isAllowed).toBe(false);
+  });
+
   it("closes on success in half-open state", () => {
     const cb = new CircuitBreaker();
     cb.recordFailure();

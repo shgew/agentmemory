@@ -6,6 +6,42 @@ export interface CronSpec {
   dow: number[];
 }
 
+export const MAX_TIMEOUT_MS = 2_147_483_647;
+
+export function parseIntervalMs(
+  raw: string | undefined,
+  fallback: number,
+): number {
+  const value = raw?.trim();
+  if (!value || !/^\d+$/.test(value)) return fallback;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 && parsed <= MAX_TIMEOUT_MS
+    ? parsed
+    : fallback;
+}
+
+export function scheduleLongTimeout(
+  callback: () => void,
+  delayMs: number,
+): void {
+  if (!Number.isSafeInteger(delayMs) || delayMs < 0) {
+    throw new RangeError("delayMs must be a non-negative safe integer");
+  }
+  const deadline = Date.now() + delayMs;
+  const schedule = () => {
+    const remaining = Math.max(0, deadline - Date.now());
+    const timer = setTimeout(
+      () => {
+        if (Date.now() < deadline) schedule();
+        else callback();
+      },
+      Math.min(remaining, MAX_TIMEOUT_MS),
+    );
+    timer.unref();
+  };
+  schedule();
+}
+
 function parseField(
   field: string,
   min: number,
@@ -41,9 +77,7 @@ function parseField(
         throw new Error(`Invalid value in cron ${label}: ${part}`);
       }
       if (lo < min || hi > max || lo > hi) {
-        throw new Error(
-          `Out-of-range cron ${label} (${min}-${max}): ${part}`,
-        );
+        throw new Error(`Out-of-range cron ${label} (${min}-${max}): ${part}`);
       }
     }
     for (let v = lo; v <= hi; v += step) out.add(v);
@@ -67,7 +101,10 @@ export function parseCron(expr: string): CronSpec {
   };
 }
 
-export function nextCronFireMs(spec: CronSpec, from: Date = new Date()): number {
+export function nextCronFireMs(
+  spec: CronSpec,
+  from: Date = new Date(),
+): number {
   const candidate = new Date(from.getTime());
   candidate.setSeconds(0, 0);
   candidate.setMinutes(candidate.getMinutes() + 1);

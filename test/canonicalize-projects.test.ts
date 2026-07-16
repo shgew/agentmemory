@@ -13,6 +13,7 @@ import type {
   Insight,
   Lesson,
   Memory,
+  MemorySlot,
   ProjectProfile,
   Session,
   SessionSummary,
@@ -265,6 +266,21 @@ function profile(project: string): ProjectProfile {
     recentActivity: [],
     sessionCount: 0,
     totalObservations: 0,
+  };
+}
+
+function slot(project: string, label: string, content: string): MemorySlot {
+  return {
+    project,
+    label,
+    content,
+    sizeLimit: 4_000,
+    description: label,
+    pinned: false,
+    readOnly: false,
+    scope: "project",
+    createdAt: "2026-06-20T00:00:00.000Z",
+    updatedAt: "2026-06-20T00:00:00.000Z",
   };
 }
 
@@ -587,6 +603,115 @@ describe("canonicalize-projects migration", () => {
     expect(result.perScope[KV.profiles]?.alreadyCanonical).toBe(1);
     expect(await kv.get<ProjectProfile>(KV.profiles, "old-name-c")).toBeNull();
     expect((await kv.get<ProjectProfile>(KV.profiles, "proj-c"))?.project).toBe("proj-c");
+  });
+
+  it("normalizes mapping whitespace and resolves aliases to their terminal slug", async () => {
+    const { sdk, kv } = registerSubject();
+    await kv.set(KV.sessions, "s1", session("s1", "old-name"));
+
+    const result = await runCanonicalize(sdk, {
+      step: "canonicalize-projects",
+      mapping: { " old-name ": " intermediate ", intermediate: "canonical" },
+    });
+
+    expect(result.totalUpdated).toBe(1);
+    expect((await kv.get<Session>(KV.sessions, "s1"))?.project).toBe("canonical");
+
+    const second = await runCanonicalize(sdk, {
+      step: "canonicalize-projects",
+      mapping: { " old-name ": " intermediate ", intermediate: "canonical" },
+    });
+    expect(second.totalUpdated).toBe(0);
+  });
+
+  it.each([
+    [{ " old ": "a", old: "b" }, "collide"],
+    [{ a: "b", b: "a" }, "cycle"],
+  ])("rejects ambiguous normalized mapping %j", async (mapping, errorPart) => {
+    const { sdk } = registerSubject();
+    const result = (await sdk.trigger("mem::migrate", {
+      step: "canonicalize-projects",
+      mapping,
+    })) as CanonicalizeFailure;
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain(errorPart);
+  });
+
+  it("moves project slots and reflect state to the canonical project", async () => {
+    const { sdk, kv } = registerSubject();
+    await kv.set(
+      KV.slots,
+      "old-name:guidance",
+      slot("old-name", "guidance", "keep this"),
+    );
+    await kv.set(KV.config, "reflect:cursor:old-name", {
+      processedFps: ["old-fp"],
+    });
+    await kv.set(KV.config, "reflect:cursor:canonical", {
+      processedFps: ["canonical-fp"],
+    });
+    await kv.set(KV.config, "reflect:last-success:old-name", {
+      at: "2026-06-20T12:00:00.000Z",
+    });
+    await kv.set(KV.config, "reflect:last-success:canonical", {
+      at: "2026-06-20T10:00:00.000Z",
+    });
+
+    const result = await runCanonicalize(sdk, {
+      step: "canonicalize-projects",
+      mapping: { "old-name": "canonical" },
+    });
+
+    expect(result.perScope[KV.slots]?.wouldUpdate).toBe(1);
+    expect(result.perScope[KV.config]?.wouldUpdate).toBe(2);
+    expect(await kv.get(KV.slots, "old-name:guidance")).toBeNull();
+    expect(await kv.get<MemorySlot>(KV.slots, "canonical:guidance")).toMatchObject({
+      project: "canonical",
+      content: "keep this",
+    });
+    expect(await kv.get(KV.config, "reflect:cursor:old-name")).toBeNull();
+    expect(
+      (await kv.get<{ processedFps: string[] }>(
+        KV.config,
+        "reflect:cursor:canonical",
+      ))?.processedFps,
+    ).toEqual(["canonical-fp", "old-fp"]);
+    expect(await kv.get(KV.config, "reflect:last-success:old-name")).toBeNull();
+    expect(await kv.get(KV.config, "reflect:last-success:canonical")).toEqual({
+      at: "2026-06-20T12:00:00.000Z",
+    });
+  });
+
+  it("keeps both slots when canonical and legacy contents conflict", async () => {
+    const { sdk, kv } = registerSubject();
+    await kv.set(
+      KV.slots,
+      "old-name:guidance",
+      slot("old-name", "guidance", "legacy"),
+    );
+    await kv.set(
+      KV.slots,
+      "canonical:guidance",
+      slot("canonical", "guidance", "canonical"),
+    );
+
+    const result = await runCanonicalize(sdk, {
+      step: "canonicalize-projects",
+      mapping: { "old-name": "canonical" },
+    });
+
+    expect(result.perScope[KV.slots]).toMatchObject({
+      wouldUpdate: 0,
+      noMatch: 1,
+      notes: "1 slot conflicts left at their original keys",
+    });
+    expect(await kv.get<MemorySlot>(KV.slots, "old-name:guidance")).toMatchObject({
+      content: "legacy",
+    });
+    expect(await kv.get<MemorySlot>(KV.slots, "canonical:guidance")).toMatchObject({
+      content: "canonical",
+    });
   });
 
 });

@@ -19,7 +19,7 @@ Generated from `src/cli/connect/index.ts`. Do not edit the block below by hand; 
 | Hermes Agent | `hermes` | Using MCP. Hooks are also available, see https://github.com/rohitg00/agentmemory/tree/main/integrations/hermes. |
 | Kiro | `kiro` | Using MCP via ~/.kiro/settings/mcp.json (user-level). Workspace overrides live in .kiro/settings/mcp.json. |
 | OpenClaw | `openclaw` | Using MCP. Hooks are also available, see https://github.com/rohitg00/agentmemory/tree/main/integrations/openclaw. |
-| OpenCode | `opencode` | Using MCP via ~/.config/opencode/opencode.json (top-level `mcp` key). For full auto-capture, also install the bundled plugin in plugin/opencode/. |
+| OpenCode | `opencode` | Using MCP via ~/.config/opencode/opencode.jsonc or opencode.json (top-level `mcp` key). Pass --with-plugin to also install the auto-capture plugin and 16 skills (9 invocable: recall, remember, health, recap, handoff, forget, commit-context, commit-history, session-history; 7 reference). OpenCode auto-discovers the copied plugin and surfaces invocable skills in the slash command palette. |
 | OpenHuman | `openhuman` | Using native hooks (REST API at :3111). MCP not required. |
 | pi | `pi` | Using native hooks (REST API at :3111). MCP not required. |
 | Qwen Code | `qwen` | Using MCP via ~/.qwen/settings.json. Qwen Code's hook system can also be wired separately, see docs. |

@@ -145,6 +145,51 @@ describe("event::session::stopped consolidation pool", () => {
     expect(calls.map((c) => c.function_id)).toContain("mem::graph-extract");
   });
 
+  it("rejects when graph-extract returns success false", async () => {
+    const { registerEventTriggers } = await import("../src/triggers/events.js");
+    const { sdk } = mockSdk();
+
+    registerEventTriggers(sdk as never, mockKV() as never);
+    sdk.registerFunction("mem::summarize", async () => ({ success: true }));
+    sdk.registerFunction("mem::graph-extract", async () => ({
+      success: false,
+      error: "all_chunks_failed",
+    }));
+
+    await expect(
+      sdk.trigger({
+        function_id: "event::session::checkpoint",
+        payload: {
+          sessionId: "ses_graph_failure",
+          waitForCompletion: true,
+        },
+      }),
+    ).rejects.toThrow(/all_chunks_failed/);
+  });
+
+  it("reports permanent summarize skips as successful no-ops", async () => {
+    const { registerEventTriggers } = await import("../src/triggers/events.js");
+    const { sdk } = mockSdk();
+
+    registerEventTriggers(sdk as never, mockKV() as never);
+    sdk.registerFunction("mem::summarize", async () => ({
+      success: false,
+      error: "no_provider",
+    }));
+    sdk.registerFunction("mem::graph-extract", async () => ({ success: true }));
+
+    await expect(
+      sdk.trigger({
+        function_id: "event::session::checkpoint",
+        payload: { sessionId: "ses_no_provider", waitForCompletion: true },
+      }),
+    ).resolves.toEqual({
+      success: true,
+      noOp: true,
+      reason: "no_provider",
+    });
+  });
+
   it("runs up to CONSOLIDATION_CONCURRENCY sessions in parallel", async () => {
     process.env.CONSOLIDATION_CONCURRENCY = "2";
     const { registerEventTriggers } = await import("../src/triggers/events.js");

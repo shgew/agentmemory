@@ -10,6 +10,8 @@ import {
   setVectorIndex,
   setEmbeddingProvider,
   getVectorIndex,
+  vectorIndexAddGuarded,
+  vectorIndexRemove,
 } from "../src/functions/search.js";
 import type { EmbeddingProvider } from "../src/types.js";
 
@@ -119,5 +121,48 @@ describe("reindexVectors", () => {
 
     expect(result.success).toBe(false);
     expect(result.swapped).toBe(false);
+  });
+
+  it("replays additions and removals that happen during rebuild", async () => {
+    const kv = mockKV();
+    await seedCorpus(kv);
+    const live = new VectorIndex();
+    setVectorIndex(live);
+    let releaseBatch: (() => void) | undefined;
+    let batchStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      batchStarted = resolve;
+    });
+    let blockNextBatch = true;
+    const blockedProvider: EmbeddingProvider = {
+      ...fourDimProvider,
+      embedBatch: async (texts) => {
+        if (blockNextBatch) {
+          blockNextBatch = false;
+          batchStarted?.();
+          await new Promise<void>((resolve) => {
+            releaseBatch = resolve;
+          });
+        }
+        return texts.map(() => new Float32Array([0.1, 0.2, 0.3, 0.4]));
+      },
+    };
+    setEmbeddingProvider(blockedProvider);
+
+    const reindex = reindexVectors(kv as never);
+    await started;
+    await vectorIndexAddGuarded("late", "ses_2", "late write", {
+      kind: "observation",
+      logId: "late",
+    });
+    vectorIndexRemove("obs_1");
+    releaseBatch?.();
+
+    const result = await reindex;
+    expect(result.success).toBe(true);
+    expect(result.vectorSize).toBe(2);
+    const serialized = getVectorIndex()!.serialize();
+    expect(serialized).toContain('"late"');
+    expect(serialized).not.toContain('"obs_1"');
   });
 });

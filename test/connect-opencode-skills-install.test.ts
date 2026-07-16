@@ -1,17 +1,46 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ConnectAdapter } from "../src/cli/connect/types.js";
 
-describe("agentmemory connect — opencode adapter --with-plugin (skills tree install)", () => {
+const LEGACY_RECALL_COMMAND = [
+  "Search past session observations and lessons for relevant context. Wrap the `memory_smart_search` and `memory_lesson_recall` MCP tools.",
+  "",
+  "## Usage",
+  "",
+  "```",
+  "/recall [query]",
+  "```",
+  "",
+  "## Instructions",
+  "",
+  "1. Call `memory_smart_search` with the query and `limit: 10` (hybrid BM25 + vector + graph search).",
+  "2. Call `memory_lesson_recall` with the same query and `limit: 5` (lesson search).",
+  "3. Combine results and present to the user:",
+  "   - Group by session",
+  "   - Show type, title, and narrative for each observation",
+  "   - Highlight high-importance (>= 7) observations",
+  "   - Show lessons separately with confidence scores",
+  "4. If no results, suggest 2-3 alternative search terms.",
+  "5. **Never hallucinate results.** Only present what the MCP tools actually return.",
+  "",
+].join("\n");
+
+describe("agentmemory connect: opencode adapter --with-plugin skills tree install", () => {
   let customDir: string;
   let originalOpencodeConfigDir: string | undefined;
+  let originalHome: string | undefined;
+  let originalUserprofile: string | undefined;
 
   beforeEach(() => {
     customDir = mkdtempSync(join(tmpdir(), "am-opencode-skills-"));
     originalOpencodeConfigDir = process.env["OPENCODE_CONFIG_DIR"];
+    originalHome = process.env["HOME"];
+    originalUserprofile = process.env["USERPROFILE"];
     process.env["OPENCODE_CONFIG_DIR"] = customDir;
+    process.env["HOME"] = customDir;
+    process.env["USERPROFILE"] = customDir;
   });
 
   afterEach(() => {
@@ -20,6 +49,14 @@ describe("agentmemory connect — opencode adapter --with-plugin (skills tree in
     } else {
       delete process.env["OPENCODE_CONFIG_DIR"];
     }
+    if (originalHome !== undefined) process.env["HOME"] = originalHome;
+    else delete process.env["HOME"];
+    if (originalUserprofile !== undefined) {
+      process.env["USERPROFILE"] = originalUserprofile;
+    } else {
+      delete process.env["USERPROFILE"];
+    }
+    vi.useRealTimers();
     rmSync(customDir, { recursive: true, force: true });
   });
 
@@ -99,7 +136,7 @@ describe("agentmemory connect — opencode adapter --with-plugin (skills tree in
     expect(existsSync(join(customDir, "commands", "health.md"))).toBe(false);
   });
 
-  it("still copies the auto-capture plugin TS and wires opencode.json (regression guard)", async () => {
+  it("copies the auto-capture plugin and relies on plugin-directory discovery", async () => {
     const adapter = await loadAdapter();
     const result = await adapter.install({
       dryRun: false,
@@ -112,7 +149,22 @@ describe("agentmemory connect — opencode adapter --with-plugin (skills tree in
 
     const config = JSON.parse(readFileSync(join(customDir, "opencode.json"), "utf-8"));
     expect(config.mcp.agentmemory.command).toContain("@agentmemory/mcp");
-    expect(config.plugin).toContain("./plugins/agentmemory-capture.ts");
+    expect(config.plugin).toBeUndefined();
+  });
+
+  it("creates collision-proof backups when the clock does not advance", async () => {
+    const source = join(customDir, "source.json");
+    writeFileSync(source, "original");
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-16T12:00:00.000Z"));
+
+    const { backupFile } = await import("../src/cli/connect/util.js");
+    const first = backupFile(source, "opencode");
+    const second = backupFile(source, "opencode");
+
+    expect(second).not.toBe(first);
+    expect(readFileSync(first, "utf-8")).toBe("original");
+    expect(readFileSync(second, "utf-8")).toBe("original");
   });
 
   it("dry-run announces skills copy but does NOT touch the filesystem", async () => {
@@ -130,14 +182,20 @@ describe("agentmemory connect — opencode adapter --with-plugin (skills tree in
   });
 });
 
-describe("agentmemory connect — opencode adapter --with-plugin (legacy command cleanup)", () => {
+describe("agentmemory connect: opencode adapter --with-plugin legacy command cleanup", () => {
   let customDir: string;
   let originalOpencodeConfigDir: string | undefined;
+  let originalHome: string | undefined;
+  let originalUserprofile: string | undefined;
 
   beforeEach(() => {
     customDir = mkdtempSync(join(tmpdir(), "am-opencode-legacy-"));
     originalOpencodeConfigDir = process.env["OPENCODE_CONFIG_DIR"];
+    originalHome = process.env["HOME"];
+    originalUserprofile = process.env["USERPROFILE"];
     process.env["OPENCODE_CONFIG_DIR"] = customDir;
+    process.env["HOME"] = customDir;
+    process.env["USERPROFILE"] = customDir;
   });
 
   afterEach(() => {
@@ -145,6 +203,13 @@ describe("agentmemory connect — opencode adapter --with-plugin (legacy command
       process.env["OPENCODE_CONFIG_DIR"] = originalOpencodeConfigDir;
     } else {
       delete process.env["OPENCODE_CONFIG_DIR"];
+    }
+    if (originalHome !== undefined) process.env["HOME"] = originalHome;
+    else delete process.env["HOME"];
+    if (originalUserprofile !== undefined) {
+      process.env["USERPROFILE"] = originalUserprofile;
+    } else {
+      delete process.env["USERPROFILE"];
     }
     rmSync(customDir, { recursive: true, force: true });
   });
@@ -154,38 +219,46 @@ describe("agentmemory connect — opencode adapter --with-plugin (legacy command
     return (mod as { adapter: ConnectAdapter }).adapter;
   }
 
-  it("removes deprecated agentmemory command files (recall.md, remember.md, health.md) on upgrade", async () => {
+  it("removes generated legacy command files on upgrade", async () => {
     mkdirSync(join(customDir, "commands"), { recursive: true });
-    writeFileSync(join(customDir, "commands", "recall.md"), "old agentmemory recall command");
-    writeFileSync(join(customDir, "commands", "remember.md"), "old agentmemory remember command");
-    writeFileSync(join(customDir, "commands", "health.md"), "old agentmemory health command");
+    writeFileSync(join(customDir, "commands", "recall.md"), LEGACY_RECALL_COMMAND);
 
     const adapter = await loadAdapter();
     await adapter.install({ dryRun: false, force: false, withPlugin: true });
 
     expect(existsSync(join(customDir, "commands", "recall.md"))).toBe(false);
-    expect(existsSync(join(customDir, "commands", "remember.md"))).toBe(false);
-    expect(existsSync(join(customDir, "commands", "health.md"))).toBe(false);
   });
 
-  it("preserves user-owned command files alongside the legacy cleanup", async () => {
+  it("preserves user-owned commands that reuse a generated filename", async () => {
     mkdirSync(join(customDir, "commands"), { recursive: true });
-    writeFileSync(join(customDir, "commands", "recall.md"), "old agentmemory recall");
-    writeFileSync(join(customDir, "commands", "my-custom.md"), "user's own command - leave alone");
+    writeFileSync(join(customDir, "commands", "recall.md"), "custom recall command");
 
     const adapter = await loadAdapter();
     await adapter.install({ dryRun: false, force: false, withPlugin: true });
 
-    expect(existsSync(join(customDir, "commands", "recall.md"))).toBe(false);
-    expect(existsSync(join(customDir, "commands", "my-custom.md"))).toBe(true);
+    expect(readFileSync(join(customDir, "commands", "recall.md"), "utf-8")).toBe(
+      "custom recall command",
+    );
     expect(existsSync(join(customDir, "commands"))).toBe(true);
   });
 
-  it("removes the commands/ directory if it only contained agentmemory legacy files", async () => {
+  it("preserves user-owned command files alongside generated cleanup", async () => {
     mkdirSync(join(customDir, "commands"), { recursive: true });
-    writeFileSync(join(customDir, "commands", "recall.md"), "old");
-    writeFileSync(join(customDir, "commands", "remember.md"), "old");
-    writeFileSync(join(customDir, "commands", "health.md"), "old");
+    writeFileSync(join(customDir, "commands", "recall.md"), LEGACY_RECALL_COMMAND);
+    writeFileSync(join(customDir, "commands", "my-custom.md"), "user command");
+
+    const adapter = await loadAdapter();
+    await adapter.install({ dryRun: false, force: false, withPlugin: true });
+
+    expect(existsSync(join(customDir, "commands", "recall.md"))).toBe(false);
+    expect(readFileSync(join(customDir, "commands", "my-custom.md"), "utf-8")).toBe(
+      "user command",
+    );
+  });
+
+  it("removes the commands directory when it only contained generated files", async () => {
+    mkdirSync(join(customDir, "commands"), { recursive: true });
+    writeFileSync(join(customDir, "commands", "recall.md"), LEGACY_RECALL_COMMAND);
 
     const adapter = await loadAdapter();
     await adapter.install({ dryRun: false, force: false, withPlugin: true });
@@ -195,7 +268,7 @@ describe("agentmemory connect — opencode adapter --with-plugin (legacy command
 
   it("dry-run announces legacy cleanup but does NOT touch the filesystem", async () => {
     mkdirSync(join(customDir, "commands"), { recursive: true });
-    writeFileSync(join(customDir, "commands", "recall.md"), "legacy");
+    writeFileSync(join(customDir, "commands", "recall.md"), LEGACY_RECALL_COMMAND);
 
     const adapter = await loadAdapter();
     await adapter.install({ dryRun: true, force: false, withPlugin: true });

@@ -209,18 +209,17 @@ describe("inferMemoryProjects", () => {
     expect(tie?.project).toBeUndefined();
   });
 
-  it("ignores missing sessions when voting but still infers if remainder has majority", async () => {
+  it("keeps memories unscoped when linked sessions are missing", async () => {
     const kv = makeMockKV();
     await kv.set(KV.sessions, "sess_real", makeSession("sess_real", "api"));
-    // ghost_sess does not exist in KV — should be silently skipped in voting
     await kv.set(KV.memories, "mem_a", makeMemory("mem_a", ["sess_real", "ghost_sess"]));
 
     const result = await inferMemoryProjects(kv);
 
-    // Only one vote collected (api), which is a strict majority of 1 project out of 1
-    expect(result.updated).toBe(1);
+    expect(result.updated).toBe(0);
+    expect(result.ambiguous).toBe(1);
     const stored = await kv.get<Memory>(KV.memories, "mem_a");
-    expect(stored?.project).toBe("api");
+    expect(stored?.project).toBeUndefined();
   });
 
   it("is idempotent when run twice in succession", async () => {

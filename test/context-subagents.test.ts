@@ -150,4 +150,67 @@ describe("mem::context subagent rollup", () => {
     expect(result.context).toBe("");
     expect(result.blocks).toBe(0);
   });
+
+  it("excludes sessions and children owned by another agent", async () => {
+    const parent = session({ id: "parent-session", agentId: "agent-a" });
+    const ownPrior = session({
+      id: "own-prior",
+      agentId: "agent-a",
+      status: "completed",
+    });
+    const foreignPrior = session({
+      id: "foreign-prior",
+      agentId: "agent-b",
+      status: "completed",
+    });
+    const ownChild = session({
+      id: "own-child",
+      agentId: "agent-a",
+      parentSessionId: parent.id,
+      summary: "own child marker",
+    });
+    const foreignChild = session({
+      id: "foreign-child",
+      agentId: "agent-b",
+      parentSessionId: parent.id,
+      summary: "foreign child marker",
+    });
+    await kv.set(KV.sessions, parent.id, parent);
+    await kv.set(KV.sessions, ownPrior.id, ownPrior);
+    await kv.set(KV.sessions, foreignPrior.id, foreignPrior);
+    await kv.set(KV.sessions, ownChild.id, ownChild);
+    await kv.set(KV.sessions, foreignChild.id, foreignChild);
+    await kv.set(KV.summaries, ownPrior.id, {
+      sessionId: ownPrior.id,
+      project: parent.project,
+      createdAt: "2026-07-15T09:00:00.000Z",
+      title: "own prior marker",
+      narrative: "own narrative",
+      keyDecisions: [],
+      filesModified: [],
+      concepts: [],
+      observationCount: 1,
+    } satisfies SessionSummary);
+    await kv.set(KV.summaries, foreignPrior.id, {
+      sessionId: foreignPrior.id,
+      project: parent.project,
+      createdAt: "2026-07-15T09:00:00.000Z",
+      title: "foreign prior marker",
+      narrative: "foreign narrative",
+      keyDecisions: [],
+      filesModified: [],
+      concepts: [],
+      observationCount: 1,
+    } satisfies SessionSummary);
+
+    const result = await handler({
+      sessionId: parent.id,
+      project: "caller-controlled-project",
+    });
+
+    expect(result.context).toContain("own prior marker");
+    expect(result.context).toContain("own child marker");
+    expect(result.context).not.toContain("foreign prior marker");
+    expect(result.context).not.toContain("foreign child marker");
+  });
 });

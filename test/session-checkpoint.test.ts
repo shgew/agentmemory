@@ -5,8 +5,14 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerSessionCheckpoint } from "../src/functions/session-checkpoint.js";
+import { registerObserveFunction } from "../src/functions/observe.js";
 import { KV } from "../src/state/schema.js";
-import type { Session, AuditEntry } from "../src/types.js";
+import type {
+  Session,
+  AuditEntry,
+  CompressedObservation,
+  RawObservation,
+} from "../src/types.js";
 import { logger } from "../src/logger.js";
 
 function mockKV() {
@@ -131,7 +137,7 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
       sessionId: "ses_first",
       since: undefined,
       until: startedAt,
-      waitForCompletion: false,
+      waitForCompletion: true,
     });
 
     const stored = await kv.get<Session>(SESSIONS_SCOPE, "ses_first");
@@ -220,8 +226,244 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
       sessionId: "ses_new",
       since: older,
       until: newer,
-      waitForCompletion: false,
+      waitForCompletion: true,
     });
+  });
+
+  it("leaves the watermark unchanged when consolidation returns a failure", async () => {
+    const startedAt = pastThreshold();
+    const session = makeSession({ id: "ses_failed", startedAt });
+    await kv.set(SESSIONS_SCOPE, "ses_failed", session);
+    sdk.registerFunction("event::session::checkpoint", async () => ({
+      success: false,
+      error: "graph_failed",
+    }));
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session::checkpoint",
+      payload: { sessionId: "ses_failed" },
+    })) as { success: boolean; error?: string };
+
+    expect(result).toEqual({
+      success: false,
+      error: "consolidation_failed",
+    });
+    expect(
+      (await kv.get<Session>(SESSIONS_SCOPE, "ses_failed"))
+        ?.lastCheckpointAt,
+    ).toBeUndefined();
+    expect(await kv.list<AuditEntry>(AUDIT_SCOPE)).toHaveLength(0);
+  });
+
+  it("leaves the watermark unchanged when consolidation throws", async () => {
+    const startedAt = pastThreshold();
+    const session = makeSession({ id: "ses_thrown", startedAt });
+    await kv.set(SESSIONS_SCOPE, session.id, session);
+    sdk.registerFunction("event::session::checkpoint", async () => {
+      throw new Error("provider failed");
+    });
+
+    const result = await sdk.trigger({
+      function_id: "mem::session::checkpoint",
+      payload: { sessionId: session.id },
+    });
+
+    expect(result).toEqual({
+      success: false,
+      error: "consolidation_failed",
+    });
+    expect(
+      (await kv.get<Session>(SESSIONS_SCOPE, session.id))?.lastCheckpointAt,
+    ).toBeUndefined();
+    expect(await kv.list<AuditEntry>(AUDIT_SCOPE)).toHaveLength(0);
+  });
+
+  it("retries pending compression before advancing the watermark", async () => {
+    const startedAt = pastThreshold();
+    const sessionId = "ses_pending";
+    const session = makeSession({
+      id: sessionId,
+      startedAt,
+      lastCheckpointAt: startedAt,
+    });
+    const observationTimestamp = new Date(
+      new Date(startedAt).getTime() + 1_000,
+    ).toISOString();
+    const raw: RawObservation = {
+      id: "obs_pending",
+      sessionId,
+      timestamp: observationTimestamp,
+      hookType: "prompt_submit",
+      raw: { prompt: "retain this" },
+      userPrompt: "retain this",
+    };
+    await kv.set(SESSIONS_SCOPE, sessionId, session);
+    await kv.set(KV.rawPayloads, raw.id, raw);
+
+    let shouldFail = true;
+    let compressCalls = 0;
+    sdk.registerFunction("mem::compress", async () => {
+      compressCalls += 1;
+      if (shouldFail) return { success: false, error: "temporary_failure" };
+      const compressed: CompressedObservation = {
+        id: raw.id,
+        sessionId,
+        timestamp: observationTimestamp,
+        sourceType: raw.hookType,
+        type: "conversation",
+        title: "Recovered observation",
+        facts: [],
+        narrative: "retain this",
+        concepts: [],
+        files: [],
+        importance: 5,
+      };
+      await kv.set(KV.observations(sessionId), raw.id, compressed);
+      return { success: true };
+    });
+
+    const failed = await sdk.trigger({
+      function_id: "mem::session::checkpoint",
+      payload: { sessionId },
+    });
+    expect(failed).toEqual({
+      success: false,
+      error: "consolidation_failed",
+    });
+    expect(
+      (await kv.get<Session>(SESSIONS_SCOPE, sessionId))?.lastCheckpointAt,
+    ).toBe(startedAt);
+    expect(
+      sdk.triggerCalls.filter(
+        (call) => call.function_id === "event::session::checkpoint",
+      ),
+    ).toHaveLength(0);
+    expect(await kv.list<AuditEntry>(AUDIT_SCOPE)).toHaveLength(0);
+
+    shouldFail = false;
+    const recovered = await sdk.trigger({
+      function_id: "mem::session::checkpoint",
+      payload: { sessionId },
+    });
+    expect(recovered).toMatchObject({
+      success: true,
+      lastCheckpointAt: startedAt,
+    });
+    expect(
+      sdk.triggerCalls.filter(
+        (call) => call.function_id === "event::session::checkpoint",
+      ),
+    ).toContainEqual({
+      function_id: "event::session::checkpoint",
+      payload: {
+        sessionId,
+        since: undefined,
+        until: undefined,
+        waitForCompletion: true,
+      },
+    });
+    expect(compressCalls).toBe(2);
+
+    await sdk.trigger({
+      function_id: "mem::session::checkpoint",
+      payload: { sessionId },
+    });
+    expect(compressCalls).toBe(2);
+  });
+
+  it("allows observations while pending compression is blocked", async () => {
+    vi.stubEnv("AGENTMEMORY_IDLE_CHECKPOINT_MS", "0");
+    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "false");
+    registerObserveFunction(sdk as never, kv as never);
+
+    const checkpointAt = pastThreshold();
+    const sessionId = "ses_blocked_compression";
+    const raw: RawObservation = {
+      id: "obs_blocked_compression",
+      sessionId,
+      timestamp: checkpointAt,
+      hookType: "prompt_submit",
+      raw: { prompt: "pending before checkpoint" },
+      userPrompt: "pending before checkpoint",
+    };
+    await kv.set(
+      SESSIONS_SCOPE,
+      sessionId,
+      makeSession({ id: sessionId, updatedAt: checkpointAt }),
+    );
+    await kv.set(KV.rawPayloads, raw.id, raw);
+
+    let markCompressionStarted: () => void = () => {};
+    const compressionStarted = new Promise<void>((resolve) => {
+      markCompressionStarted = resolve;
+    });
+    let finishCompression: () => void = () => {};
+    const compressionFinished = new Promise<void>((resolve) => {
+      finishCompression = resolve;
+    });
+    sdk.registerFunction("mem::compress", async () => {
+      markCompressionStarted();
+      await compressionFinished;
+      const compressed: CompressedObservation = {
+        id: raw.id,
+        sessionId,
+        timestamp: raw.timestamp,
+        sourceType: raw.hookType,
+        type: "conversation",
+        title: "Recovered pending observation",
+        facts: [],
+        narrative: "pending before checkpoint",
+        concepts: [],
+        files: [],
+        importance: 5,
+      };
+      await kv.set(KV.observations(sessionId), raw.id, compressed);
+      return { success: true };
+    });
+
+    const checkpoint = sdk.trigger({
+      function_id: "mem::session::checkpoint",
+      payload: { sessionId },
+    });
+    await compressionStarted;
+
+    const observation = sdk.trigger({
+      function_id: "mem::observe",
+      payload: {
+        sessionId,
+        project: "test-project",
+        cwd: "/workspace",
+        hookType: "prompt_submit",
+        timestamp: new Date().toISOString(),
+        data: { prompt: "captured while compression waits" },
+      },
+    });
+    let observationTimeout: ReturnType<typeof setTimeout> | undefined;
+    const observationCompletedBeforeCompression = await Promise.race([
+      observation.then(
+        () => {
+          if (observationTimeout) clearTimeout(observationTimeout);
+          return true;
+        },
+        () => false,
+      ),
+      new Promise<boolean>((resolve) => {
+        observationTimeout = setTimeout(() => resolve(false), 250);
+      }),
+    ]);
+    const anchorBeforeCompressionFinished = (
+      await kv.get<Session>(SESSIONS_SCOPE, sessionId)
+    )?.updatedAt;
+
+    finishCompression();
+    await checkpoint;
+    await observation;
+
+    expect(observationCompletedBeforeCompression).toBe(true);
+    expect(anchorBeforeCompressionFinished).not.toBe(checkpointAt);
+    expect(
+      (await kv.get<Session>(SESSIONS_SCOPE, sessionId))?.lastCheckpointAt,
+    ).toBe(anchorBeforeCompressionFinished);
   });
 
   it("defers when there is new activity but idle is below the threshold (no per-turn fire)", async () => {
@@ -311,6 +553,89 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
     expect([first, second].some((result) => (result as { queued?: boolean }).queued)).toBe(true);
     expect([first, second].some((result) => (result as { noOp?: boolean }).noOp)).toBe(true);
     expect(sdk.triggerCalls.filter((c) => c.function_id === "event::session::checkpoint")).toHaveLength(1);
+  });
+
+  it("allows observations during consolidation without advancing past them", async () => {
+    vi.stubEnv("AGENTMEMORY_IDLE_CHECKPOINT_MS", "0");
+    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "false");
+    registerObserveFunction(sdk as never, kv as never);
+
+    const checkpointAt = pastThreshold();
+    const sessionId = "ses_live_consolidation";
+    await kv.set(
+      SESSIONS_SCOPE,
+      sessionId,
+      makeSession({ id: sessionId, updatedAt: checkpointAt }),
+    );
+
+    let markConsolidationStarted: () => void = () => {};
+    const consolidationStarted = new Promise<void>((resolve) => {
+      markConsolidationStarted = resolve;
+    });
+    let finishConsolidation: () => void = () => {};
+    const consolidationFinished = new Promise<void>((resolve) => {
+      finishConsolidation = resolve;
+    });
+    sdk.registerFunction("event::session::checkpoint", async () => {
+      markConsolidationStarted();
+      await consolidationFinished;
+      return { success: true };
+    });
+
+    const checkpoint = sdk.trigger({
+      function_id: "mem::session::checkpoint",
+      payload: { sessionId },
+    });
+    await consolidationStarted;
+
+    const observation = sdk.trigger({
+      function_id: "mem::observe",
+      payload: {
+        sessionId,
+        project: "test-project",
+        cwd: "/workspace",
+        hookType: "prompt_submit",
+        timestamp: new Date().toISOString(),
+        data: { prompt: "captured during consolidation" },
+      },
+    });
+    let observationTimeout: ReturnType<typeof setTimeout> | undefined;
+    const observationCompletedBeforeConsolidation = await Promise.race([
+      observation.then(() => {
+        if (observationTimeout) clearTimeout(observationTimeout);
+        return true;
+      }),
+      new Promise<boolean>((resolve) => {
+        observationTimeout = setTimeout(() => resolve(false), 250);
+      }),
+    ]);
+
+    finishConsolidation();
+    await checkpoint;
+    await observation;
+
+    expect(observationCompletedBeforeConsolidation).toBe(true);
+    const afterFirstCheckpoint = await kv.get<Session>(
+      SESSIONS_SCOPE,
+      sessionId,
+    );
+    expect(afterFirstCheckpoint?.lastCheckpointAt).toBe(checkpointAt);
+    expect(afterFirstCheckpoint?.updatedAt).not.toBe(checkpointAt);
+
+    await sdk.trigger({
+      function_id: "mem::session::checkpoint",
+      payload: { sessionId },
+    });
+    const checkpointCalls = sdk.triggerCalls.filter(
+      (call) => call.function_id === "event::session::checkpoint",
+    );
+    expect(checkpointCalls).toHaveLength(2);
+    expect(checkpointCalls[1]?.payload).toMatchObject({
+      sessionId,
+      since: checkpointAt,
+      until: afterFirstCheckpoint?.updatedAt,
+      waitForCompletion: true,
+    });
   });
 });
 

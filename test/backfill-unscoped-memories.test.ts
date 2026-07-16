@@ -55,7 +55,7 @@ function session(id: string, project: string): Session {
   } as Session;
 }
 
-describe("Backfill unscoped memories (Task 16 Item 1)", () => {
+describe("backfill unscoped memories", () => {
   let kv: ReturnType<typeof mockKV>;
 
   beforeEach(() => {
@@ -72,9 +72,6 @@ describe("Backfill unscoped memories (Task 16 Item 1)", () => {
     const stored = (await kv.get(KV.memories, "mem_1")) as Memory;
     expect(stored.project).toBe("proj-a");
 
-    // The gap the audit flagged: a backfill mutated a memory's scope
-    // but left NO audit trail. After the fix an audit row must name
-    // the backfilled memory and the project it was assigned.
     const audits = (await kv.list(KV.audit)) as AuditEntry[];
     const backfillAudit = audits.find((a) => a.targetIds.includes("mem_1"));
     expect(backfillAudit).toBeDefined();
@@ -82,9 +79,7 @@ describe("Backfill unscoped memories (Task 16 Item 1)", () => {
   });
 
   it("backfillUnscopedMemories reports unresolvable memories explicitly instead of silently leaving them unscoped", async () => {
-    // No linked sessions -> cannot be confidently assigned.
     await kv.set(KV.memories, "mem_orphan", memory("mem_orphan", []));
-    // Conflicting sessions with no majority -> ambiguous.
     await kv.set(KV.sessions, "ses_a", session("ses_a", "proj-a"));
     await kv.set(KV.sessions, "ses_b", session("ses_b", "proj-b"));
     await kv.set(
@@ -102,5 +97,22 @@ describe("Backfill unscoped memories (Task 16 Item 1)", () => {
     // Still unscoped, and explicitly reported (not silently dropped).
     const orphan = (await kv.get(KV.memories, "mem_orphan")) as Memory;
     expect(orphan.project).toBeUndefined();
+  });
+
+  it("requires a majority of every linked session id, including missing sessions", async () => {
+    await kv.set(KV.sessions, "ses_a", session("ses_a", "proj-a"));
+    await kv.set(
+      KV.memories,
+      "mem_partial",
+      memory("mem_partial", ["ses_a", "ses_missing"]),
+    );
+
+    const result = await inferMemoryProjects(kv as never, false);
+
+    expect(result.updated).toBe(0);
+    expect(result.unresolvedIds).toContain("mem_partial");
+    expect(
+      (await kv.get<Memory>(KV.memories, "mem_partial"))?.project,
+    ).toBeUndefined();
   });
 });

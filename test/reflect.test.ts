@@ -9,7 +9,15 @@ import {
   readReflectTimeoutMs,
   registerReflectFunctions,
 } from "../src/functions/reflect.js";
-import type { Insight, GraphNode, GraphEdge, SemanticMemory, Lesson } from "../src/types.js";
+import type {
+  Crystal,
+  GraphEdge,
+  GraphNode,
+  Insight,
+  Lesson,
+  SemanticMemory,
+  Session,
+} from "../src/types.js";
 import { fingerprintId } from "../src/state/schema.js";
 
 function mockKV() {
@@ -18,11 +26,7 @@ function mockKV() {
     get: async <T>(scope: string, key: string): Promise<T | null> => {
       const explicit = store.get(scope)?.get(key);
       if (explicit !== undefined) return explicit as T;
-      // Mirror production: reflect reads the graph via readGraphSnapshot
-      // (a kv.get on mem:graph:snapshot), which graph-extract maintains as a
-      // top-degree view of the graph scopes. Tests seed mem:graph:nodes /
-      // mem:graph:edges, so synthesize that snapshot on read instead of
-      // forcing every test to seed it explicitly.
+      // Tests seed graph scopes, so synthesize the production snapshot view.
       if (scope === "mem:graph:snapshot" && key === "current") {
         const nodes = Array.from(
           store.get("mem:graph:nodes")?.values() ?? [],
@@ -106,18 +110,50 @@ function makeEdge(src: string, tgt: string): GraphEdge {
   };
 }
 
-function makeSemantic(fact: string, id?: string): SemanticMemory {
+function makeSemantic(
+  fact: string,
+  id?: string,
+  sourceSessionIds: string[] = [],
+): SemanticMemory {
   return {
     id: id || `sem_${fact.slice(0, 8)}`,
     fact,
     confidence: 0.8,
-    sourceSessionIds: [],
+    sourceSessionIds,
     sourceMemoryIds: [],
     accessCount: 1,
     lastAccessedAt: "2026-04-01T00:00:00Z",
     strength: 0.8,
     createdAt: "2026-04-01T00:00:00Z",
     updatedAt: "2026-04-01T00:00:00Z",
+  };
+}
+
+function makeSession(id: string, project: string): Session {
+  return {
+    id,
+    project,
+    cwd: `/workspace/${project}`,
+    startedAt: "2026-04-01T00:00:00Z",
+    status: "completed",
+    observationCount: 1,
+  };
+}
+
+function makeCrystal(
+  id: string,
+  narrative: string,
+  project?: string,
+): Crystal {
+  return {
+    id,
+    narrative,
+    keyOutcomes: [],
+    filesAffected: [],
+    lessons: ["Apply security validation at boundaries"],
+    sourceActionIds: [],
+    project,
+    createdAt: "2026-04-01T00:00:00Z",
   };
 }
 
@@ -143,13 +179,6 @@ function makeLesson(
 }
 
 type ReflectCursorState = { processedFps: string[]; updatedAt: string };
-
-function reflectCursorFp(concepts: string[], project?: string): string {
-  return fingerprintId(
-    "reflectcursor",
-    `${project ?? ""}\n${concepts.map((c) => c.toLowerCase()).slice().sort().join(",")}`,
-  );
-}
 
 const XML_RESPONSE = `<insights>
 <insight confidence="0.85" title="Defense in Depth">
@@ -187,6 +216,21 @@ describe("Reflect", () => {
       expect(result.success).toBe(true);
       expect(result.newInsights).toBe(0);
       expect(result.clustersProcessed).toBe(0);
+    });
+
+    it("fails closed when reflection evidence cannot be read", async () => {
+      const list = kv.list.bind(kv);
+      vi.spyOn(kv, "list").mockImplementation(async (scope: string) => {
+        if (scope === "mem:semantic") throw new Error("state unavailable");
+        return list(scope);
+      });
+
+      await expect(sdk.trigger("mem::reflect", {})).rejects.toThrow(
+        "state unavailable",
+      );
+      expect(
+        await kv.get("mem:config", "reflect:cursor:global"),
+      ).toBeNull();
     });
 
     it("synthesizes insights from graph concept clusters", async () => {
@@ -393,13 +437,89 @@ describe("Reflect", () => {
       expect(insights[0].reinforcements).toBe(1);
     });
 
+    it("merges provenance from every matching cluster while reinforcing once", async () => {
+      const content = "One shared principle applies across both independent concept groups.";
+      const id = fingerprintId("ins", content.toLowerCase());
+      const ts = "2026-04-01T00:00:00Z";
+      await kv.set("mem:insights", id, {
+        id,
+        title: "Shared principle",
+        content,
+        confidence: 0.8,
+        reinforcements: 0,
+        sourceConceptCluster: [],
+        sourceMemoryIds: [],
+        sourceLessonIds: [],
+        sourceCrystalIds: [],
+        tags: [],
+        createdAt: ts,
+        updatedAt: ts,
+        decayRate: 0.05,
+      });
+      for (const concept of ["alpha", "beta", "alphaextra", "gamma", "delta", "gammaextra"]) {
+        await kv.set("mem:graph:nodes", `node_${concept}`, makeConceptNode(concept));
+      }
+      await kv.set("mem:graph:edges", "edge_ab", makeEdge("alpha", "beta"));
+      await kv.set("mem:graph:edges", "edge_ae", makeEdge("alpha", "alphaextra"));
+      await kv.set("mem:graph:edges", "edge_gd", makeEdge("gamma", "delta"));
+      await kv.set("mem:graph:edges", "edge_ge", makeEdge("gamma", "gammaextra"));
+      for (const [idSuffix, fact] of [
+        ["alpha_1", "alpha fact one"],
+        ["alpha_2", "beta fact two"],
+        ["alpha_3", "alpha beta fact three"],
+        ["gamma_1", "gamma fact one"],
+        ["gamma_2", "delta fact two"],
+        ["gamma_3", "gamma delta fact three"],
+      ]) {
+        await kv.set("mem:semantic", `sem_${idSuffix}`, makeSemantic(fact, `sem_${idSuffix}`));
+      }
+      provider.summarize.mockResolvedValue(
+        `<insights><insight confidence="0.8" title="Shared principle">${content}</insight></insights>`,
+      );
+
+      const result = (await sdk.trigger("mem::reflect", {})) as {
+        reinforced: number;
+      };
+
+      const insight = await kv.get<Insight>("mem:insights", id);
+      expect(provider.summarize).toHaveBeenCalledTimes(2);
+      expect(result.reinforced).toBe(1);
+      expect(insight!.reinforcements).toBe(1);
+      expect(insight!.sourceMemoryIds).toEqual(
+        expect.arrayContaining([
+          "sem_alpha_1",
+          "sem_alpha_2",
+          "sem_alpha_3",
+          "sem_gamma_1",
+          "sem_gamma_2",
+          "sem_gamma_3",
+        ]),
+      );
+    });
+
     it("keeps byte-identical insights in different projects separate", async () => {
       await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
       await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
       await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
-      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs"));
-      await kv.set("mem:semantic", "sem_2", makeSemantic("Testing improves security coverage"));
-      await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
+      await kv.set("mem:sessions", "ses_a", makeSession("ses_a", "proj-a"));
+      await kv.set("mem:sessions", "ses_b", makeSession("ses_b", "proj-b"));
+      for (const project of ["a", "b"]) {
+        await kv.set(
+          "mem:semantic",
+          `sem_${project}_1`,
+          makeSemantic("Always validate security inputs", `sem_${project}_1`, [`ses_${project}`]),
+        );
+        await kv.set(
+          "mem:semantic",
+          `sem_${project}_2`,
+          makeSemantic("Testing improves security coverage", `sem_${project}_2`, [`ses_${project}`]),
+        );
+        await kv.set(
+          "mem:semantic",
+          `sem_${project}_3`,
+          makeSemantic("Validation prevents injection", `sem_${project}_3`, [`ses_${project}`]),
+        );
+      }
 
       await sdk.trigger("mem::reflect", { project: "proj-a" });
       await sdk.trigger("mem::reflect", { project: "proj-b" });
@@ -408,6 +528,107 @@ describe("Reflect", () => {
       expect(insights.length).toBe(4);
       expect(insights.filter((i) => i.project === "proj-a").length).toBe(2);
       expect(insights.filter((i) => i.project === "proj-b").length).toBe(2);
+    });
+
+    it("scopes all supporting evidence to the requested project", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:sessions", "ses_a", makeSession("ses_a", "proj-a"));
+      await kv.set("mem:sessions", "ses_b", makeSession("ses_b", "proj-b"));
+      for (const [project, sessionId, marker] of [
+        ["proj-a", "ses_a", "alpha-project"],
+        ["proj-b", "ses_b", "beta-project"],
+      ]) {
+        for (let index = 1; index <= 3; index++) {
+          const id = `sem_${marker}_${index}`;
+          await kv.set(
+            "mem:semantic",
+            id,
+            makeSemantic(`${marker} security fact ${index}`, id, [sessionId]),
+          );
+        }
+        await kv.set(
+          "mem:lessons",
+          `lsn_${marker}`,
+          makeLesson(`${marker} security lesson`, ["security"], {
+            id: `lsn_${marker}`,
+            project,
+          }),
+        );
+        await kv.set(
+          "mem:crystals",
+          `crystal_${marker}`,
+          makeCrystal(`crystal_${marker}`, `${marker} crystal narrative`, project),
+        );
+      }
+
+      await sdk.trigger("mem::reflect", { project: "proj-a" });
+
+      const scopedPrompt = String(provider.summarize.mock.calls[0]?.[1] ?? "");
+      expect(scopedPrompt).toContain("alpha-project");
+      expect(scopedPrompt).not.toContain("beta-project");
+      const scopedInsights = (await kv.list<Insight>("mem:insights")).filter(
+        (insight) => insight.project === "proj-a",
+      );
+      expect(scopedInsights).not.toHaveLength(0);
+      expect(scopedInsights.every((insight) =>
+        insight.sourceMemoryIds.every((id) => id.includes("alpha-project")),
+      )).toBe(true);
+      expect(scopedInsights.every((insight) =>
+        insight.sourceLessonIds.every((id) => id.includes("alpha-project")),
+      )).toBe(true);
+      expect(scopedInsights.every((insight) =>
+        insight.sourceCrystalIds.every((id) => id.includes("alpha-project")),
+      )).toBe(true);
+
+      await sdk.trigger("mem::reflect", {});
+
+      const globalPrompt = String(provider.summarize.mock.calls[1]?.[1] ?? "");
+      expect(globalPrompt).toContain("alpha-project");
+      expect(globalPrompt).toContain("beta-project");
+    });
+
+    it("serializes concurrent reflection runs within one project", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:sessions", "ses_a", makeSession("ses_a", "proj-a"));
+      for (let index = 1; index <= 3; index++) {
+        const id = `sem_${index}`;
+        await kv.set(
+          "mem:semantic",
+          id,
+          makeSemantic(`security validation fact ${index}`, id, ["ses_a"]),
+        );
+      }
+      let activeCalls = 0;
+      let maxActiveCalls = 0;
+      const releases: Array<() => void> = [];
+      provider.summarize.mockImplementation(
+        () => new Promise<string>((resolve) => {
+          activeCalls++;
+          maxActiveCalls = Math.max(maxActiveCalls, activeCalls);
+          releases.push(() => {
+            activeCalls--;
+            resolve(XML_RESPONSE);
+          });
+        }),
+      );
+
+      const first = sdk.trigger("mem::reflect", { project: "proj-a" });
+      await vi.waitFor(() => expect(releases).toHaveLength(1));
+      const second = sdk.trigger("mem::reflect", { project: "proj-a" });
+      await Promise.resolve();
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+      releases[0]();
+      await first;
+      await vi.waitFor(() => expect(releases).toHaveLength(2));
+      releases[1]();
+      await second;
+
+      expect(provider.summarize).toHaveBeenCalledTimes(2);
+      expect(maxActiveCalls).toBe(1);
     });
 
     it("reinforces an existing insight at most once per reflect run", async () => {
@@ -547,8 +768,79 @@ describe("Reflect", () => {
       expect(insights.length).toBe(2);
       for (const ins of insights) {
         expect(ins.reflectClusterFp).toBeTruthy();
-        expect(ins.reflectClusterFpVersion).toBe(1);
+        expect(ins.reflectClusterFpVersion).toBe(2);
+        expect(ins.reflectClusterFps).toContain(ins.reflectClusterFp);
       }
+    });
+
+    it("reprocesses when prompt evidence changes", async () => {
+      await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
+      await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
+      await kv.set("mem:graph:edges", "edge_1", makeEdge("security", "validation"));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("Always validate security inputs", "sem_1"));
+      await kv.set("mem:semantic", "sem_2", makeSemantic("Security validation prevents injection", "sem_2"));
+      await kv.set("mem:lessons", "lsn_1", makeLesson("Use security validation", ["security"], { id: "lsn_1" }));
+      await kv.set("mem:crystals", "crystal_1", makeCrystal("crystal_1", "Initial security outcome"));
+
+      await sdk.trigger("mem::reflect", {});
+      const initial = (await kv.list<Insight>("mem:insights"))[0];
+      const initialFp = initial.reflectClusterFp;
+
+      provider.summarize.mockClear();
+      await sdk.trigger("mem::reflect", {});
+      expect(provider.summarize).not.toHaveBeenCalled();
+
+      const fact = await kv.get<SemanticMemory>("mem:semantic", "sem_1");
+      fact!.fact = "Always validate security request inputs";
+      await kv.set("mem:semantic", fact!.id, fact!);
+      await sdk.trigger("mem::reflect", {});
+      expect(provider.summarize).toHaveBeenCalledOnce();
+      const factFp = (await kv.list<Insight>("mem:insights"))[0].reflectClusterFp;
+      expect(factFp).not.toBe(initialFp);
+
+      provider.summarize.mockClear();
+      fact!.confidence = 0.9;
+      await kv.set("mem:semantic", fact!.id, fact!);
+      await sdk.trigger("mem::reflect", {});
+      expect(provider.summarize).toHaveBeenCalledOnce();
+      const factConfidenceFp = (await kv.list<Insight>("mem:insights"))[0]
+        .reflectClusterFp;
+      expect(factConfidenceFp).not.toBe(factFp);
+
+      provider.summarize.mockClear();
+      const crystal = await kv.get<Crystal>("mem:crystals", "crystal_1");
+      crystal!.narrative = "Revised security outcome";
+      await kv.set("mem:crystals", crystal!.id, crystal!);
+      await sdk.trigger("mem::reflect", {});
+      expect(provider.summarize).toHaveBeenCalledOnce();
+      const crystalFp = (await kv.list<Insight>("mem:insights"))[0].reflectClusterFp;
+      expect(crystalFp).not.toBe(factConfidenceFp);
+
+      provider.summarize.mockClear();
+      const lesson = await kv.get<Lesson>("mem:lessons", "lsn_1");
+      lesson!.updatedAt = "2026-04-02T00:00:00Z";
+      await kv.set("mem:lessons", lesson!.id, lesson!);
+      await sdk.trigger("mem::reflect", {});
+      expect(provider.summarize).toHaveBeenCalledOnce();
+      const lessonVersionFp = (await kv.list<Insight>("mem:insights"))[0].reflectClusterFp;
+      expect(lessonVersionFp).not.toBe(crystalFp);
+
+      provider.summarize.mockClear();
+      lesson!.confidence = 0.9;
+      await kv.set("mem:lessons", lesson!.id, lesson!);
+      await sdk.trigger("mem::reflect", {});
+      expect(provider.summarize).toHaveBeenCalledOnce();
+      const lessonConfidenceFp = (await kv.list<Insight>("mem:insights"))[0]
+        .reflectClusterFp;
+      expect(lessonConfidenceFp).not.toBe(lessonVersionFp);
+
+      provider.summarize.mockClear();
+      lesson!.content = "Use layered security validation";
+      await kv.set("mem:lessons", lesson!.id, lesson!);
+      await sdk.trigger("mem::reflect", {});
+      expect(provider.summarize).toHaveBeenCalledOnce();
+      const lessonContentFp = (await kv.list<Insight>("mem:insights"))[0].reflectClusterFp;
+      expect(lessonContentFp).not.toBe(lessonConfidenceFp);
     });
 
     it("leaves reflectClusterFp undefined on insights from a lesson-less cluster", async () => {
@@ -620,16 +912,18 @@ describe("Reflect", () => {
       expect(run2.clustersFrozen).toBe(0);
     });
 
-    it("backfills reflectClusterFp on a pre-existing insight and freezes the matching cluster in the same run", async () => {
+    it("reprocesses a legacy fingerprint before stamping the evidence-aware version", async () => {
       const ts = new Date().toISOString();
       const lessonId = `lsn_${"Use execFile for security".slice(0, 8)}`;
       await kv.set("mem:insights", "ins_pre", {
         id: "ins_pre",
-        title: "Pre-existing note from before the fingerprint feature",
-        content: "Prior synthesized guidance about defense layering for systems",
+        title: "Defense in Depth",
+        content: "Security requires layered protection: input validation, safe APIs, and deny-lists together.",
         confidence: 0.8, reinforcements: 0, sourceConceptCluster: ["security"],
-        sourceMemoryIds: [], sourceLessonIds: [lessonId], sourceCrystalIds: [],
+        sourceMemoryIds: ["sem_1", "sem_2", "sem_3"], sourceLessonIds: [lessonId], sourceCrystalIds: [],
         tags: ["security"], createdAt: ts, updatedAt: ts, decayRate: 0.05,
+        reflectClusterFp: "cluster_legacy",
+        reflectClusterFpVersion: 1,
       });
       await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
       await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
@@ -639,18 +933,22 @@ describe("Reflect", () => {
       await kv.set("mem:semantic", "sem_3", makeSemantic("Validation prevents injection"));
       await kv.set("mem:lessons", "lsn_1", makeLesson("Use execFile for security", ["security"]));
 
+      provider.summarize.mockResolvedValue(
+        `<insights><insight confidence="0.85" title="Defense in Depth">Security requires layered protection: input validation, safe APIs, and deny-lists together.</insight></insights>`,
+      );
       provider.summarize.mockClear();
       const result = (await sdk.trigger("mem::reflect", {})) as {
         clustersFrozen: number;
         newInsights: number;
       };
 
-      expect(provider.summarize).not.toHaveBeenCalled();
-      expect(result.clustersFrozen).toBe(1);
+      expect(provider.summarize).toHaveBeenCalledOnce();
+      expect(result.clustersFrozen).toBe(0);
       expect(result.newInsights).toBe(0);
       const after = await kv.get<Insight>("mem:insights", "ins_pre");
       expect(after!.reflectClusterFp).toBeTruthy();
-      expect(after!.reflectClusterFpVersion).toBe(1);
+      expect(after!.reflectClusterFp).not.toBe("cluster_legacy");
+      expect(after!.reflectClusterFpVersion).toBe(2);
     });
 
     it("reports failure when every non-frozen cluster's provider call fails even though another cluster froze", async () => {
@@ -992,6 +1290,73 @@ describe("Reflect budget (AGENTMEMORY_REFLECT_TIMEOUT_MS)", () => {
     expect(provider.summarize).toHaveBeenCalled();
   });
 
+  it("keeps failed clusters pending after a partial provider failure", async () => {
+    await seedTwoProcessableClusters();
+    provider.summarize.mockReset();
+    provider.summarize
+      .mockResolvedValueOnce(XML_RESPONSE)
+      .mockRejectedValueOnce(new Error("provider down"));
+
+    const first = (await sdk.trigger("mem::reflect", {})) as {
+      success: boolean;
+      fullPassComplete: boolean;
+    };
+    const cursor = await kv.get<ReflectCursorState>(
+      "mem:config",
+      "reflect:cursor:global",
+    );
+    const failedPrompt = String(provider.summarize.mock.calls[1]?.[1] ?? "");
+
+    expect(first.success).toBe(true);
+    expect(first.fullPassComplete).toBe(false);
+    expect(cursor?.processedFps).toHaveLength(1);
+
+    provider.summarize.mockResolvedValue(XML_RESPONSE);
+    const second = (await sdk.trigger("mem::reflect", {})) as {
+      fullPassComplete: boolean;
+    };
+    const retryPrompt = String(provider.summarize.mock.calls[2]?.[1] ?? "");
+
+    expect(second.fullPassComplete).toBe(true);
+    expect(retryPrompt).toBe(failedPrompt);
+  });
+
+  it("keeps malformed provider output pending and retries the same cluster", async () => {
+    await seedOneCluster();
+    provider.summarize.mockReset();
+    provider.summarize
+      .mockResolvedValueOnce(
+        `<insights><insight confidence="0.8">missing title</insight></insights>`,
+      )
+      .mockResolvedValueOnce(XML_RESPONSE);
+
+    const first = (await sdk.trigger("mem::reflect", {})) as {
+      success: boolean;
+      fullPassComplete: boolean;
+    };
+    const cursor = await kv.get<ReflectCursorState>(
+      "mem:config",
+      "reflect:cursor:global",
+    );
+    const failedPrompt = String(provider.summarize.mock.calls[0]?.[1] ?? "");
+
+    expect(first.success).toBe(false);
+    expect(first.fullPassComplete).toBe(false);
+    expect(cursor?.processedFps).toEqual([]);
+    expect(await kv.list("mem:insights")).toEqual([]);
+
+    const second = (await sdk.trigger("mem::reflect", {})) as {
+      success: boolean;
+      fullPassComplete: boolean;
+    };
+    const retryPrompt = String(provider.summarize.mock.calls[1]?.[1] ?? "");
+
+    expect(second.success).toBe(true);
+    expect(second.fullPassComplete).toBe(true);
+    expect(retryPrompt).toBe(failedPrompt);
+    expect(provider.summarize).toHaveBeenCalledTimes(2);
+  });
+
   it("exhausted budget returns partial success and skips remaining LLM calls", async () => {
     await seedOneCluster();
     const t0 = Date.now();
@@ -1034,7 +1399,8 @@ describe("Reflect budget (AGENTMEMORY_REFLECT_TIMEOUT_MS)", () => {
 
       expect(run1.fullPassComplete).toBe(false);
       expect(run1.budgetExhausted).toBe(true);
-      expect(cursorAfterRun1?.processedFps).toEqual([reflectCursorFp(["alpha", "beta", "alphaextra"])]);
+      expect(cursorAfterRun1?.processedFps).toHaveLength(1);
+      expect(cursorAfterRun1?.processedFps[0]).toMatch(/^cluster_/);
       expect(provider.summarize).toHaveBeenCalledTimes(1);
 
       now = 2_000;
@@ -1075,7 +1441,8 @@ describe("Reflect budget (AGENTMEMORY_REFLECT_TIMEOUT_MS)", () => {
       const cursorAfterRun1 = await kv.get<ReflectCursorState>("mem:config", "reflect:cursor:global");
 
       expect(run1.fullPassComplete).toBe(false);
-      expect(cursorAfterRun1?.processedFps).toContain(reflectCursorFp(["factsonly", "evidence", "archive"]));
+      expect(cursorAfterRun1?.processedFps).toHaveLength(1);
+      expect(cursorAfterRun1?.processedFps[0]).toMatch(/^cluster_/);
 
       now = 2_000;
       const run2 = (await sdk.trigger("mem::reflect", {})) as { fullPassComplete: boolean };

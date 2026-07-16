@@ -3,11 +3,8 @@ import { KV } from "./schema.js";
 import type { StateKV } from "./kv.js";
 import { logger } from "../logger.js";
 
-// #814/#825: the precomputed snapshot is the only bounded read of the
-// graph. kv.list over the full graphNodes/graphEdges scopes serializes a
-// multi-MB state frame that blocks the iii worker heartbeat on large
-// corpora ("Invocation stopped"), so every hot path reads this single key
-// instead. Maintained inline by mem::graph-extract under SNAPSHOT_KEY.
+// Full graph scope reads can block the iii worker heartbeat, so hot paths use
+// this bounded snapshot.
 export const SNAPSHOT_KEY = "current";
 
 export async function readGraphSnapshot(

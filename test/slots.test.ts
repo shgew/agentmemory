@@ -240,7 +240,7 @@ describe("slots — reflect", () => {
     expect(res.applied).toBe(0);
   });
 
-  it("keeps pending_items agent-curated (slot-reflect no longer auto-dumps TODOs) while still counting patterns", async () => {
+  it("keeps pending_items agent-curated while still counting patterns", async () => {
     const sessionId = "sess_reflect";
     await seedSession(kv, sessionId);
     const obsKey = KV.observations(sessionId);
@@ -288,7 +288,7 @@ describe("slots — reflect", () => {
 });
 
 
-describe("slots — reflect windowing", () => {
+describe("slots reflect windowing", () => {
   let kv: ReturnType<typeof mockKV>;
   let handlers: Record<string, (d: Record<string, unknown>) => Promise<Record<string, unknown>>>;
 
@@ -334,7 +334,7 @@ describe("slots — reflect windowing", () => {
   });
 });
 
-describe("slots — seedDefaults reconciles pinned on existing default-label slots", () => {
+describe("slots seedDefaults reconciles pinned on existing default-label slots", () => {
   function wireWith(kv: ReturnType<typeof mockKV>) {
     const handlers: Record<string, (d: Record<string, unknown>) => Promise<Record<string, unknown>>> = {};
     const sdk = {

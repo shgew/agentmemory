@@ -111,7 +111,6 @@ describe("api::session::commit ingest", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    // Baseline: no agent scope (legacy behavior). Individual tests override.
     vi.stubEnv("AGENT_ID", "");
     vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "");
     sdk = mockSdk();
@@ -179,15 +178,12 @@ describe("api::session::commit ingest", () => {
   });
 
   it("preserves existing metadata on re-post (existing-wins), still merges sessionIds", async () => {
-    // NOTE: contract flipped from the old "new value wins" merge to
-    // "existing wins" so a later re-post cannot overwrite verified metadata.
     await commit(postBody({ sha: SHA40, sessionId: "s1", message: "first" }));
     await commit(
       postBody({ sha: SHA40, sessionId: "s2", message: "second", branch: "main" }),
     );
     const link = await kv.get<CommitLink>(KV.commits, SHA40);
     expect(link?.message).toBe("first");
-    // A field absent on the first post can still be filled later.
     expect(link?.branch).toBe("main");
     expect(link?.sessionIds.sort()).toEqual(["s1", "s2"]);
   });
@@ -228,25 +224,45 @@ describe("api::session::commit ingest", () => {
     ).toEqual([SHA40]);
   });
 
-  it("wildcard agentId opts out of the isolation check", async () => {
+  it("hides other agents' session IDs from an isolated commit response", async () => {
+    vi.stubEnv("AGENT_ID", "agent-a");
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    kv.seed(KV.sessions, "s1", session({ id: "s1", agentId: "agent-a" }));
+    kv.seed(KV.sessions, "s2", session({ id: "s2", agentId: "agent-b" }));
+    kv.seed(KV.commits, SHA40, {
+      sha: SHA40,
+      shortSha: SHA40.slice(0, 7),
+      sessionIds: ["s2"],
+      linkedAt: "2026-01-01T00:00:00.000Z",
+    } satisfies CommitLink);
+
+    const res = (await commit(
+      postBody({ sha: SHA40, sessionId: "s1" }),
+    )) as { status_code: number; body: { commit: CommitLink } };
+
+    expect(res.status_code).toBe(200);
+    expect(res.body.commit.sessionIds).toEqual(["s1"]);
+  });
+
+  it("does not let wildcard agentId override isolation", async () => {
     vi.stubEnv("AGENT_ID", "agent-b");
     vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
     kv.seed(KV.sessions, "s1", session({ id: "s1", agentId: "agent-a" }));
     const res = (await commit(
       postBody({ sha: SHA40, sessionId: "s1", agentId: "*" }),
     )) as { status_code: number };
-    expect(res.status_code).toBe(200);
-    expect(await kv.get<CommitLink>(KV.commits, SHA40)).not.toBeNull();
+    expect(res.status_code).toBe(403);
+    expect(await kv.get<CommitLink>(KV.commits, SHA40)).toBeNull();
   });
 
-  it("stores the commit but skips the session update when the session does not exist (isolated)", async () => {
+  it("rejects an unknown session under isolation", async () => {
     vi.stubEnv("AGENT_ID", "agent-b");
     vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
     const res = (await commit(
       postBody({ sha: SHA40, sessionId: "missing" }),
     )) as { status_code: number };
-    expect(res.status_code).toBe(200);
-    expect(await kv.get<CommitLink>(KV.commits, SHA40)).not.toBeNull();
+    expect(res.status_code).toBe(403);
+    expect(await kv.get<CommitLink>(KV.commits, SHA40)).toBeNull();
     expect(await kv.get<Session>(KV.sessions, "missing")).toBeNull();
   });
 
@@ -302,11 +318,27 @@ describe("api::session::by-commit lookup", () => {
     ]);
   });
 
-  it("filters sessions to the query-param agentId", async () => {
+  it("normalizes uppercase SHAs and rejects malformed SHAs", async () => {
+    const found = (await byCommit(
+      getReq({ sha: SHA40.toUpperCase() }),
+    )) as { status_code: number };
+    expect(found.status_code).toBe(200);
+
+    const invalid = (await byCommit(getReq({ sha: "abc123" }))) as {
+      status_code: number;
+    };
+    expect(invalid.status_code).toBe(400);
+  });
+
+  it("filters commit session IDs with the query-param agentId", async () => {
     const res = (await byCommit(
       getReq({ sha: SHA40, agentId: "agent-a" }),
-    )) as { status_code: number; body: { sessions: Session[] } };
+    )) as {
+      status_code: number;
+      body: { commit: CommitLink; sessions: Session[] };
+    };
     expect(res.body.sessions.map((s) => s.id)).toEqual(["a-sess"]);
+    expect(res.body.commit.sessionIds).toEqual(["a-sess"]);
   });
 
   it("404s under isolation when none of the linked sessions are visible", async () => {
@@ -328,14 +360,14 @@ describe("api::session::by-commit lookup", () => {
     expect(res.body.sessions.map((s) => s.id)).toEqual(["b-sess"]);
   });
 
-  it("wildcard agentId bypasses env isolation", async () => {
-    vi.stubEnv("AGENT_ID", "agent-c");
+  it("does not let wildcard agentId bypass env isolation", async () => {
+    vi.stubEnv("AGENT_ID", "agent-a");
     vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
     const res = (await byCommit(
       getReq({ sha: SHA40, agentId: "*" }),
     )) as { status_code: number; body: { sessions: Session[] } };
     expect(res.status_code).toBe(200);
-    expect(res.body.sessions).toHaveLength(2);
+    expect(res.body.sessions.map((session) => session.id)).toEqual(["a-sess"]);
   });
 });
 
@@ -355,7 +387,7 @@ describe("api::commits list", () => {
     kv.seed(KV.commits, SHA40, {
       sha: SHA40,
       shortSha: SHA40.slice(0, 7),
-      sessionIds: ["a-sess"],
+      sessionIds: ["a-sess", "b-sess"],
       linkedAt: "2026-01-02T00:00:00.000Z",
     } satisfies CommitLink);
     kv.seed(KV.commits, SHA64, {
@@ -399,13 +431,14 @@ describe("api::commits list", () => {
     expect(res.body.commits).toHaveLength(0);
   });
 
-  it("wildcard agentId bypasses env isolation", async () => {
+  it("does not let wildcard agentId bypass env isolation", async () => {
     vi.stubEnv("AGENT_ID", "agent-a");
     vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
     const res = (await commits(getReq({ agentId: "*" }))) as {
       body: { commits: CommitLink[] };
     };
-    expect(res.body.commits).toHaveLength(2);
+    expect(res.body.commits).toHaveLength(1);
+    expect(res.body.commits[0]?.sessionIds).toEqual(["a-sess"]);
   });
 });
 
@@ -425,7 +458,7 @@ describe("MCP memory_commit_lookup / memory_commits isolation", () => {
     kv.seed(KV.commits, SHA40, {
       sha: SHA40,
       shortSha: SHA40.slice(0, 7),
-      sessionIds: ["a-sess"],
+      sessionIds: ["a-sess", "b-sess"],
       linkedAt: "2026-01-02T00:00:00.000Z",
     } satisfies CommitLink);
     kv.seed(KV.commits, SHA64, {
@@ -447,11 +480,26 @@ describe("MCP memory_commit_lookup / memory_commits isolation", () => {
       sha: SHA40,
     });
     expect((parsed.commit as CommitLink).sha).toBe(SHA40);
-    expect((parsed.sessions as Session[]).map((s) => s.id)).toEqual(["a-sess"]);
+    expect((parsed.sessions as Session[]).map((s) => s.id)).toEqual([
+      "a-sess",
+      "b-sess",
+    ]);
+  });
+
+  it("commit_lookup normalizes uppercase SHAs and rejects malformed SHAs", async () => {
+    const found = await mcpCall(call, "memory_commit_lookup", {
+      sha: SHA40.toUpperCase(),
+    });
+    expect((found.parsed.commit as CommitLink).sha).toBe(SHA40);
+
+    const invalid = await mcpCall(call, "memory_commit_lookup", {
+      sha: "abc123",
+    });
+    expect(invalid.res.status_code).toBe(400);
   });
 
   it("commit_lookup hides another agent's commit under isolation", async () => {
-    vi.stubEnv("AGENT_ID", "agent-b");
+    vi.stubEnv("AGENT_ID", "agent-c");
     vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
     const { parsed } = await mcpCall(call, "memory_commit_lookup", {
       sha: SHA40,
@@ -460,14 +508,14 @@ describe("MCP memory_commit_lookup / memory_commits isolation", () => {
     expect(parsed.sessions).toEqual([]);
   });
 
-  it("commit_lookup wildcard agentId bypasses isolation", async () => {
+  it("does not let commit_lookup wildcard agentId bypass isolation", async () => {
     vi.stubEnv("AGENT_ID", "agent-b");
     vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
     const { parsed } = await mcpCall(call, "memory_commit_lookup", {
       sha: SHA40,
       agentId: "*",
     });
-    expect((parsed.commit as CommitLink).sha).toBe(SHA40);
+    expect((parsed.commit as CommitLink).sessionIds).toEqual(["b-sess"]);
   });
 
   it("commits lists only the caller's commits under isolation", async () => {
@@ -475,6 +523,7 @@ describe("MCP memory_commit_lookup / memory_commits isolation", () => {
     vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
     const { parsed } = await mcpCall(call, "memory_commits", {});
     expect((parsed.commits as CommitLink[]).map((c) => c.sha)).toEqual([SHA40]);
+    expect((parsed.commits as CommitLink[])[0]?.sessionIds).toEqual(["a-sess"]);
   });
 
   it("commits regression: no scope lists everything", async () => {

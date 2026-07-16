@@ -6,6 +6,7 @@ import { KV, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import type {
   Memory,
+  MemorySlot,
   ProjectProfile,
   Session,
   CompressedObservation,
@@ -143,7 +144,7 @@ export async function inferMemoryProjects(
 
     // Require a strict majority (> 50%) to avoid misattributing a memory
     // that was genuinely built from sessions across multiple projects.
-    if (topCount <= projects.length / 2 && sorted.length > 1) {
+    if (topCount <= sessionIds.length / 2) {
       ambiguous++;
       unresolvedIds.push(memory.id);
       continue;
@@ -223,11 +224,6 @@ export async function backfillUnscopedMemories(
   };
 }
 
-// One-shot migration for Task 16 Item 2: normalize file paths already
-// stored on ProjectProfile.topFiles into the portable canonical form
-// (see canonicalizeFilePath). Two forms of the same file merge and
-// their frequencies sum. Idempotent: a second pass over already-
-// canonical profiles updates nothing (STALE STATE safe).
 export async function canonicalizeProfilePaths(
   kv: StateKV,
   dryRun = false,
@@ -320,15 +316,22 @@ export type MappingValidation =
   | { ok: false; error: string };
 
 export function validateMapping(mapping: unknown): MappingValidation {
-  if (mapping === null || typeof mapping !== "object" || Array.isArray(mapping)) {
+  if (
+    mapping === null ||
+    typeof mapping !== "object" ||
+    Array.isArray(mapping) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(mapping))
+  ) {
     return {
       ok: false,
       error: "mapping must be a plain object of string keys to string values",
     };
   }
   const obj = mapping as Record<string, unknown>;
+  const normalized: Record<string, string> = {};
   for (const [k, v] of Object.entries(obj)) {
-    if (k.trim().length === 0) {
+    const key = k.trim();
+    if (key.length === 0) {
       return { ok: false, error: "mapping keys must be non-empty strings" };
     }
     if (typeof v !== "string" || v.trim().length === 0) {
@@ -337,8 +340,30 @@ export function validateMapping(mapping: unknown): MappingValidation {
         error: `mapping value for "${k}" must be a non-empty string`,
       };
     }
+    if (Object.hasOwn(normalized, key)) {
+      return {
+        ok: false,
+        error: `mapping keys collide after trimming: "${key}"`,
+      };
+    }
+    normalized[key] = v.trim();
   }
-  return { ok: true, value: obj as Record<string, string> };
+
+  const resolved: Record<string, string> = {};
+  for (const key of Object.keys(normalized)) {
+    const seen = new Set<string>();
+    let current = key;
+    while (Object.hasOwn(normalized, current) && normalized[current] !== current) {
+      if (seen.has(current)) {
+        return { ok: false, error: `mapping contains a cycle at "${current}"` };
+      }
+      seen.add(current);
+      current = normalized[current];
+    }
+    resolved[key] = current;
+  }
+
+  return { ok: true, value: resolved };
 }
 
 function canonicalProjectSet(mapping: Record<string, string>): ReadonlySet<string> {
@@ -354,7 +379,7 @@ function updateProject<Row extends ProjectRow>(row: Row, project: string, update
 
 const PATH_SHAPED = /^[/\\]|^[A-Za-z]:[/\\]/;
 
-  function projectRowKey(row: ProjectRow): string {
+function projectRowKey(row: ProjectRow): string {
   const raw = row.id ?? row.sessionId ?? row.project ?? "";
   return PATH_SHAPED.test(raw) ? redactProfileKey(raw) : raw;
 }
@@ -459,6 +484,140 @@ async function migrateProfiles(
   return report;
 }
 
+function stateKeyAuditId(prefix: string, key: string): string {
+  const hash = createHash("sha256").update(key).digest("hex").slice(0, 16);
+  return `${prefix}:${hash}`;
+}
+
+async function migrateProjectSlots(
+  kv: StateKV,
+  mapping: Record<string, string>,
+  canonicalProjects: ReadonlySet<string>,
+  dryRun: boolean,
+  touchedIds: string[],
+): Promise<ScopeReport> {
+  const report = emptyScopeReport();
+  const rows = await kv.list<MemorySlot>(KV.slots);
+  let conflicts = 0;
+
+  for (const row of rows) {
+    const project = row.project;
+    if (!project) {
+      report.unscoped++;
+      continue;
+    }
+
+    const mapped = mapping[stripWorktreeSegment(project)] ?? mapping[project];
+    if (mapped === undefined) {
+      if (canonicalProjects.has(project)) report.alreadyCanonical++;
+      else report.noMatch++;
+      continue;
+    }
+    if (mapped === project) {
+      report.alreadyCanonical++;
+      continue;
+    }
+
+    const sourceKey = `${project}:${row.label}`;
+    const destinationKey = `${mapped}:${row.label}`;
+    const destination = await kv.get<MemorySlot>(KV.slots, destinationKey);
+    if (
+      destination &&
+      destination.content.length > 0 &&
+      row.content.length > 0 &&
+      destination.content !== row.content
+    ) {
+      conflicts++;
+      report.noMatch++;
+      continue;
+    }
+
+    report.wouldUpdate++;
+    if (dryRun) continue;
+
+    const selected = destination && (destination.content || !row.content)
+      ? destination
+      : row;
+    await kv.set(KV.slots, destinationKey, {
+      ...selected,
+      project: mapped,
+      scope: "project",
+    });
+    await kv.delete(KV.slots, sourceKey);
+    touchedIds.push(stateKeyAuditId("slot-key", sourceKey));
+  }
+
+  if (conflicts > 0) {
+    report.notes = `${conflicts} slot conflicts left at their original keys`;
+  }
+  return report;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function mergeCursorState(current: unknown, incoming: unknown): unknown {
+  if (!isRecord(incoming)) return current ?? incoming;
+  if (!isRecord(current)) return incoming;
+  const processedFps = [
+    ...(Array.isArray(current.processedFps) ? current.processedFps : []),
+    ...(Array.isArray(incoming.processedFps) ? incoming.processedFps : []),
+  ].filter((value): value is string => typeof value === "string");
+  return {
+    ...incoming,
+    ...current,
+    processedFps: [...new Set(processedFps)],
+  };
+}
+
+function mergeReflectWatermark(current: unknown, incoming: unknown): unknown {
+  if (!isRecord(incoming)) return current ?? incoming;
+  if (!isRecord(current)) return incoming;
+  const currentTime =
+    typeof current.at === "string" ? Date.parse(current.at) : Number.NaN;
+  const incomingTime =
+    typeof incoming.at === "string" ? Date.parse(incoming.at) : Number.NaN;
+  if (!Number.isFinite(currentTime)) return incoming;
+  if (!Number.isFinite(incomingTime)) return current;
+  return incomingTime > currentTime ? incoming : current;
+}
+
+async function migrateReflectConfig(
+  kv: StateKV,
+  mapping: Record<string, string>,
+  dryRun: boolean,
+  touchedIds: string[],
+): Promise<ScopeReport> {
+  const report = emptyScopeReport();
+  const keyTypes = [
+    { prefix: "reflect:cursor", merge: mergeCursorState },
+    { prefix: "reflect:last-success", merge: mergeReflectWatermark },
+  ] as const;
+
+  for (const [sourceProject, destinationProject] of Object.entries(mapping)) {
+    if (sourceProject === "global" || sourceProject === destinationProject) {
+      continue;
+    }
+    for (const { prefix, merge } of keyTypes) {
+      const sourceKey = `${prefix}:${sourceProject}`;
+      const source = await kv.get<unknown>(KV.config, sourceKey);
+      if (source === null) continue;
+
+      report.wouldUpdate++;
+      if (dryRun) continue;
+
+      const destinationKey = `${prefix}:${destinationProject}`;
+      const destination = await kv.get<unknown>(KV.config, destinationKey);
+      await kv.set(KV.config, destinationKey, merge(destination, source));
+      await kv.delete(KV.config, sourceKey);
+      touchedIds.push(stateKeyAuditId("config-key", sourceKey));
+    }
+  }
+
+  return report;
+}
+
 export async function canonicalizeProjects(
   kv: StateKV,
   payload: CanonicalizeProjectPayload,
@@ -509,6 +668,19 @@ export async function canonicalizeProjects(
     notes: "team scopes skipped: no enumerator",
   };
   perScope[KV.profiles] = await migrateProfiles(kv, effectiveMap, canonicalProjects, dryRun, touchedIds);
+  perScope[KV.slots] = await migrateProjectSlots(
+    kv,
+    effectiveMap,
+    canonicalProjects,
+    dryRun,
+    touchedIds,
+  );
+  perScope[KV.config] = await migrateReflectConfig(
+    kv,
+    effectiveMap,
+    dryRun,
+    touchedIds,
+  );
 
   let totalUpdated = 0;
   let totalDeleted = 0;

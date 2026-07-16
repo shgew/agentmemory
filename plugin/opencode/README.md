@@ -33,13 +33,13 @@ The server starts on `http://localhost:3111`.
 agentmemory connect opencode --with-plugin
 ```
 
-`--with-plugin` writes the MCP block to `~/.config/opencode/opencode.json`, copies the auto-capture plugin to `~/.config/opencode/plugins/agentmemory-capture.ts`, copies 16 skills (9 invocable + 7 reference) to `~/.config/opencode/skills/<name>/`, and adds `"plugin": ["./plugins/agentmemory-capture.ts"]` to `opencode.json`. The merge is idempotent and backs up any existing files first. OpenCode merges skills into its unified slash command palette (`source: "skill"`), so `/recall`, `/remember`, `/health` work directly from the palette.
+`--with-plugin` writes the MCP block to an existing `~/.config/opencode/opencode.jsonc` or `~/.config/opencode/opencode.json`, copies the auto-capture plugin to `~/.config/opencode/plugins/agentmemory-capture.ts`, and copies 16 skills (9 invocable + 7 reference) to `~/.config/opencode/skills/<name>/`. OpenCode auto-discovers plugin files from its `plugins/` directory, so the installer does not add a top-level `plugin` array. Existing explicit arrays remain compatible but unnecessary. The merge is idempotent and backs up existing files first. OpenCode merges skills into its unified slash command palette (`source: "skill"`), so `/recall`, `/remember`, and `/health` work directly from the palette.
 
 Without `--with-plugin`, `agentmemory connect opencode` writes the MCP block only, leaving the plugin install to you.
 
 ### 3. Manual install (alternative)
 
-Add to `~/.config/opencode/opencode.json`:
+Add to `~/.config/opencode/opencode.jsonc` or `~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -49,8 +49,7 @@ Add to `~/.config/opencode/opencode.json`:
       "command": ["npx", "-y", "@agentmemory/mcp"],
       "enabled": true
     }
-  },
-  "plugin": ["./plugins/agentmemory-capture.ts"]
+  }
 }
 ```
 
@@ -62,7 +61,7 @@ cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
 cp -R plugin/skills/* ~/.config/opencode/skills/
 ```
 
-Restart OpenCode or open a new session. The plugin auto-captures session lifecycle, messages, tool execution, file edits, permissions, todos, and config events.
+OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not required. Restart OpenCode or open a new session. The plugin auto-captures session lifecycle, messages, tool execution, file edits, permissions, todos, and config events.
 
 ## What gets captured
 

@@ -87,18 +87,30 @@ function tools(): string {
 function rest(): string {
   const text = readFileSync(join(SRC, "triggers", "api.ts"), "utf8");
   const found: { path: string; method: string }[] = [];
-  const re = /api_path:\s*"([^"]+)"/g;
+  const registrationCount = [...text.matchAll(/api_path:\s*["`]/g)].length;
+  const re = /api_path:\s*"([^"]+)"\s*,\s*http_method:\s*"([A-Z]+)"/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
-    const path = m[1];
-    const win = text.slice(Math.max(0, m.index - 140), m.index + 140);
-    const mm = /http_method:\s*"([A-Z]+)"/.exec(win);
-    found.push({ path, method: mm ? mm[1] : "POST" });
+    found.push({ path: m[1], method: m[2] });
+  }
+  if (found.length !== registrationCount) {
+    throw new Error(
+      `Parsed ${found.length} of ${registrationCount} REST endpoint registrations`,
+    );
   }
   const seen = new Set<string>();
   const rows = found
-    .filter((e) => (seen.has(e.path) ? false : (seen.add(e.path), true)))
-    .sort((a, b) => a.path.localeCompare(b.path));
+    .filter((e) => {
+      const identity = `${e.method} ${e.path}`;
+      if (seen.has(identity)) return false;
+      seen.add(identity);
+      return true;
+    })
+    .sort((a, b) =>
+      a.path === b.path
+        ? a.method.localeCompare(b.method)
+        : a.path.localeCompare(b.path),
+    );
   const lines = [
     `The REST API is the primary surface. All paths are under \`http://localhost:3111\` (override with \`--port\`). When \`AGENTMEMORY_SECRET\` is set, send \`Authorization: Bearer $AGENTMEMORY_SECRET\`; localhost is otherwise open.`,
     "",

@@ -114,7 +114,7 @@ describe("event::session::started", () => {
     expect(await kv.get<Session>(KV.sessions, existing.id)).toEqual(result.session);
   });
 
-  it("keeps existing project identity and logs event-path conflicts", async () => {
+  it("rejects project identity conflicts before context lookup", async () => {
     const existing: Session = {
       id: "event-conflict",
       project: "existing-project",
@@ -129,13 +129,12 @@ describe("event::session::started", () => {
       sessionId: existing.id,
       project: "incoming-project",
       cwd: "/incoming",
-    })) as { session: Session };
+    })) as { success: boolean; error: string; session: Session };
 
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("project");
     expect(result.session.project).toBe(existing.project);
-    expect(sdk.contextPayloads).toContainEqual({
-      sessionId: existing.id,
-      project: existing.project,
-    });
+    expect(sdk.contextPayloads).toEqual([]);
     expect(logger.warn).toHaveBeenCalledWith(
       "Session project conflict on start",
       {

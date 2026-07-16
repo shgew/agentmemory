@@ -58,3 +58,45 @@ describe("MetricsStore.clear", () => {
     expect(await ms.getAll()).toEqual([]);
   });
 });
+
+describe("MetricsStore.record", () => {
+  it("serializes concurrent updates to the same function", async () => {
+    const ms = new MetricsStore(makeKv());
+
+    await Promise.all(
+      Array.from({ length: 20 }, (_, i) =>
+        ms.record("mem::summarize", i, i % 2 === 0),
+      ),
+    );
+
+    const metrics = await ms.get("mem::summarize");
+    expect(metrics?.totalCalls).toBe(20);
+    expect(metrics?.successCount).toBe(10);
+    expect(metrics?.failureCount).toBe(10);
+  });
+
+  it("preserves quality averaging across store instances", async () => {
+    const kv = makeKv();
+    const first = new MetricsStore(kv);
+    await first.record("mem::reflect", 10, true, 40);
+    await first.record("mem::reflect", 10, true, 80);
+
+    const second = new MetricsStore(kv);
+    await second.record("mem::reflect", 10, true, 90);
+
+    const metrics = await second.get("mem::reflect");
+    expect(metrics?.avgQualityScore).toBe(70);
+    expect(metrics?.qualityScoreCount).toBe(3);
+  });
+
+  it("does not report a successful clear when persistence fails", async () => {
+    const kv = makeKv();
+    const ms = new MetricsStore(kv);
+    await ms.record("mem::summarize", 10, true);
+    kv.delete = async () => {
+      throw new Error("delete failed");
+    };
+
+    await expect(ms.clear()).rejects.toThrow("delete failed");
+  });
+});

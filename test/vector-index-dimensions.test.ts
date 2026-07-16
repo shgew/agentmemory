@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -49,6 +49,10 @@ describe("VectorIndex.validateDimensions", () => {
 });
 
 describe("migrateVectorIndex", () => {
+  afterEach(() => {
+    delete process.env.REBUILD_EMBED_BATCH_SIZE;
+  });
+
   const newProvider: EmbeddingProvider = {
     name: "test-4d",
     dimensions: 4,
@@ -150,5 +154,54 @@ describe("migrateVectorIndex", () => {
     expect(result.index).toBeInstanceOf(VectorIndex);
     expect(result.index.size).toBe(result.vectorSize);
     expect(result.index.size).toBe(1);
+  });
+
+  it("chunks and clips migration embedding inputs", async () => {
+    process.env.REBUILD_EMBED_BATCH_SIZE = "2";
+    const kv = mockKV();
+    for (let index = 0; index < 5; index++) {
+      await kv.set("mem:memories", `mem_${index}`, {
+        id: `mem_${index}`,
+        title: "migration memory",
+        content: "x".repeat(20_000),
+        sessionIds: [],
+        isLatest: true,
+      });
+    }
+    const batches: string[][] = [];
+    const provider: EmbeddingProvider = {
+      ...newProvider,
+      embedBatch: async (texts) => {
+        batches.push(texts);
+        return texts.map(() => new Float32Array(4));
+      },
+    };
+
+    const result = await migrateVectorIndex(kv as never, provider);
+
+    expect(result.success).toBe(true);
+    expect(batches.map((batch) => batch.length)).toEqual([2, 2, 1]);
+    expect(batches.flat().every((text) => text.length <= 16_000)).toBe(true);
+  });
+
+  it("rejects a provider response with the wrong batch length", async () => {
+    const kv = mockKV();
+    await kv.set("mem:memories", "mem_1", {
+      id: "mem_1",
+      title: "migration memory",
+      content: "content",
+      sessionIds: [],
+      isLatest: true,
+    });
+    const provider: EmbeddingProvider = {
+      ...newProvider,
+      embedBatch: async () => [],
+    };
+
+    const result = await migrateVectorIndex(kv as never, provider);
+
+    expect(result.success).toBe(false);
+    expect(result.failed).toBe(1);
+    expect(result.vectorSize).toBe(0);
   });
 });

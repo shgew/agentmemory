@@ -9,7 +9,11 @@ import {
   type LessonCorrectionCandidate,
   type LessonCorrectionSkipped,
 } from "./lesson-correction-markers.js";
-import { sameLessonProject, validateCorrections } from "./lesson-state.js";
+import {
+  sameLessonProject,
+  validateCorrections,
+  withLessonWriteLock,
+} from "./lesson-state.js";
 
 export type LessonCorrectionDirection = "corrects" | "correctedBy";
 
@@ -108,6 +112,18 @@ export async function backfillLessonCorrections(
     readonly dryRun?: boolean;
     readonly confirmedPairs?: readonly LessonCorrectionCandidate[];
   } = {},
+): Promise<LessonCorrectionBackfillResult> {
+  return withLessonWriteLock(() =>
+    backfillLessonCorrectionsUnlocked(kv, options),
+  );
+}
+
+async function backfillLessonCorrectionsUnlocked(
+  kv: StateKV,
+  options: {
+    readonly dryRun?: boolean;
+    readonly confirmedPairs?: readonly LessonCorrectionCandidate[];
+  },
 ): Promise<LessonCorrectionBackfillResult> {
   const dryRun = options.dryRun !== false;
   const lessons = await kv.list<Lesson>(KV.lessons);

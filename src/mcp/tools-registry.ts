@@ -1,3 +1,5 @@
+import { getEnvVar } from "../config.js";
+
 export type McpToolDef = {
   name: string;
   description: string;
@@ -31,6 +33,10 @@ export const CORE_TOOLS: McpToolDef[] = [
         token_budget: {
           type: "number",
           description: "Optional token budget to trim returned results",
+        },
+        project: {
+          type: "string",
+          description: "Filter results by project",
         },
       },
       required: ["query"],
@@ -123,6 +129,14 @@ export const CORE_TOOLS: McpToolDef[] = [
           type: "number",
           description: "Max sessions to return (default 20, max 200)",
         },
+        agentId: {
+          type: "string",
+          description: "Filter sessions by agent ID in shared mode",
+        },
+        includeSubagents: {
+          type: "boolean",
+          description: "Include child agent sessions",
+        },
       },
     },
   },
@@ -138,6 +152,7 @@ export const CORE_TOOLS: McpToolDef[] = [
           description: "Comma-separated observation IDs to expand",
         },
         limit: { type: "number", description: "Max results (default 10)" },
+        project: { type: "string", description: "Filter results by project" },
       },
       required: ["query"],
     },
@@ -1000,11 +1015,15 @@ export function parseToolDisableList(raw: string | undefined | null): Set<string
 }
 
 export function getVisibleTools(): McpToolDef[] {
-  const mode = process.env["AGENTMEMORY_TOOLS"] || "all";
+  const mode = getEnvVar("AGENTMEMORY_TOOLS") || "all";
   const base = mode === "core"
     ? getAllTools().filter((t) => ESSENTIAL_TOOLS.has(t.name))
     : getAllTools();
-  const disable = parseToolDisableList(process.env["AGENTMEMORY_TOOLS_DISABLE"]);
+  const disable = parseToolDisableList(getEnvVar("AGENTMEMORY_TOOLS_DISABLE"));
   if (disable.size === 0) return base;
   return base.filter((t) => !disable.has(t.name));
+}
+
+export function isToolVisible(name: string): boolean {
+  return getVisibleTools().some((tool) => tool.name === name);
 }

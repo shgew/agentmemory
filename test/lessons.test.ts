@@ -117,6 +117,16 @@ describe("Lessons", () => {
       expect(result.success).toBe(false);
     });
 
+    it("rejects malformed string arrays", async () => {
+      const result = (await sdk.trigger("mem::lesson-save", {
+        content: "Validate input arrays",
+        tags: ["valid", 42],
+      })) as { success: boolean; error: string };
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/tags must be an array of strings/);
+    });
+
     it("sets crystal source and sourceIds when provided", async () => {
       const result = (await sdk.trigger("mem::lesson-save", {
         content: "Crystal-derived lesson",

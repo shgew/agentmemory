@@ -3,13 +3,17 @@ import { join, resolve, sep } from "node:path";
 import { existsSync } from "node:fs";
 import { mkdir, writeFile, unlink, utimes, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { getEnvVar } from "../config.js";
 
 export const IMAGES_DIR = join(homedir(), ".agentmemory", "images");
 
 const DEFAULT_MAX_BYTES = 500 * 1024 * 1024;
 
 export function getMaxBytes(): number {
-  return Number(process.env.AGENTMEMORY_IMAGE_STORE_MAX_BYTES) || DEFAULT_MAX_BYTES;
+  const configured = Number(getEnvVar("AGENTMEMORY_IMAGE_STORE_MAX_BYTES"));
+  return Number.isSafeInteger(configured) && configured > 0
+    ? configured
+    : DEFAULT_MAX_BYTES;
 }
 
 export function isManagedImagePath(filePath: string): boolean {

@@ -14,8 +14,9 @@ export type SessionUpsertInput = {
 };
 
 export type SessionUpsertResult = {
-  readonly session: Session;
+  readonly session: Session | null;
   readonly projectConflict: boolean;
+  readonly identityConflict?: "project" | "agent" | "parent";
 };
 
 type UpdateOp = { type: "set"; path: string; value: unknown };
@@ -31,6 +32,20 @@ export function upsertSession(
   return withKeyedLock(`session:${input.sessionId}`, async () => {
     const existing = await kv.get<Session>(KV.sessions, input.sessionId);
     if (!existing) {
+      if (input.parentSessionId) {
+        const parent = await kv.get<Session>(KV.sessions, input.parentSessionId);
+        if (
+          parent &&
+          (parent.project !== input.project ||
+            (parent.agentId && input.agentId && parent.agentId !== input.agentId))
+        ) {
+          return {
+            session: null,
+            projectConflict: parent.project !== input.project,
+            identityConflict: "parent",
+          };
+        }
+      }
       const session: Session = {
         id: input.sessionId,
         project: input.project,
@@ -49,9 +64,49 @@ export function upsertSession(
       return { session, projectConflict: false };
     }
 
+    if (existing.project !== input.project) {
+      return {
+        session: existing,
+        projectConflict: true,
+        identityConflict: "project",
+      };
+    }
+    if (existing.agentId && input.agentId && existing.agentId !== input.agentId) {
+      return {
+        session: existing,
+        projectConflict: false,
+        identityConflict: "agent",
+      };
+    }
+    if (
+      existing.parentSessionId &&
+      input.parentSessionId &&
+      existing.parentSessionId !== input.parentSessionId
+    ) {
+      return {
+        session: existing,
+        projectConflict: false,
+        identityConflict: "parent",
+      };
+    }
+    if (!existing.parentSessionId && input.parentSessionId) {
+      const parent = await kv.get<Session>(KV.sessions, input.parentSessionId);
+      if (
+        parent &&
+        (parent.project !== existing.project ||
+          (parent.agentId && existing.agentId && parent.agentId !== existing.agentId))
+      ) {
+        return {
+          session: existing,
+          projectConflict: false,
+          identityConflict: "parent",
+        };
+      }
+    }
+
     // Metadata enrichment only backfills empty durable fields; keep it under
     // the outer session: lock. The observation-count repair is deliberately
-    // NOT done here — see the nested obs: lock below.
+    // NOT done here. See the nested obs: lock below.
     const ops: UpdateOp[] = [];
     if (isEmpty(existing.summary) && input.summary) {
       ops.push({ type: "set", path: "summary", value: input.summary });
@@ -84,7 +139,7 @@ export function upsertSession(
     // concurrent observe could commit N+1 in the window between our list() and
     // our update(), and our stale write would clobber it (or vice versa).
     // Serialize the repair with observe's increment by running it under the
-    // SAME obs: lock — re-read the row, list observations, and only grow the
+    // SAME obs: lock. Re-read the row, list observations, and only grow the
     // count, never shrink it.
     //
     // Lock order: session: -> obs:. NEVER acquire session: while holding obs:.
@@ -107,7 +162,7 @@ export function upsertSession(
 
     return {
       session,
-      projectConflict: existing.project !== input.project,
+      projectConflict: false,
     };
   });
 }

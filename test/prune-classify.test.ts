@@ -1,8 +1,22 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect } from "vitest";
+import {
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   classifyGraph,
+  parseArgs,
   parseBinObject,
+  runPruneClassifier,
   type GraphNode,
   type GraphEdge,
 } from "../scripts/prune-classify.js";
@@ -38,6 +52,64 @@ function edge(
 }
 
 const RESET_AT = "2026-06-18T14:41:30.871Z";
+const tempDirs: string[] = [];
+
+interface CliFixture {
+  nodesPath: string;
+  edgesPath: string;
+  obsDir: string;
+  memoriesPath: string;
+  outDir: string;
+}
+
+function writeRows(path: string, rows: Array<{ id: string }>): void {
+  writeFileSync(
+    path,
+    JSON.stringify(Object.fromEntries(rows.map((row) => [row.id, row]))),
+  );
+}
+
+function cliFixture(
+  nodes: GraphNode[],
+  edges: GraphEdge[],
+  liveIds: string[] = ["o1"],
+): CliFixture {
+  const root = mkdtempSync(join(tmpdir(), "prune-classify-"));
+  tempDirs.push(root);
+  const nodesPath = join(root, "nodes.bin");
+  const edgesPath = join(root, "edges.bin");
+  const obsDir = join(root, "observations");
+  const memoriesPath = join(root, "memories.bin");
+  const outDir = join(root, "out");
+  mkdirSync(obsDir);
+  writeRows(nodesPath, nodes);
+  writeRows(edgesPath, edges);
+  writeRows(
+    join(obsDir, "session.bin"),
+    liveIds.map((id) => ({ id })),
+  );
+  writeRows(memoriesPath, []);
+  return { nodesPath, edgesPath, obsDir, memoriesPath, outDir };
+}
+
+function fixtureArgs(fixture: CliFixture): string[] {
+  return [
+    "--nodes",
+    fixture.nodesPath,
+    "--edges",
+    fixture.edgesPath,
+    "--obs-dir",
+    fixture.obsDir,
+    "--memories",
+    fixture.memoriesPath,
+    "--out",
+    fixture.outDir,
+  ];
+}
+
+afterEach(() => {
+  for (const path of tempDirs.splice(0)) rmSync(path, { recursive: true });
+});
 
 describe("classifyGraph node reachability", () => {
   it("keeps a node whose source observation is still live", () => {
@@ -272,5 +344,152 @@ describe("parseBinObject", () => {
     expect(parseBinObject(buf)).toEqual({
       a: { name: 'has } brace " quote', id: "x" },
     });
+  });
+});
+
+describe("prune-classify CLI safeguards", () => {
+  it.each(["0", "-1", "1.5", "abc", "9007199254740992"])(
+    "rejects invalid --top value %s",
+    (value) => {
+      expect(() => parseArgs(["--top", value])).toThrow(
+        "--top must be a positive integer",
+      );
+    },
+  );
+
+  it("rejects --top without a value", () => {
+    expect(() => parseArgs(["--top"])).toThrow(
+      "--top must be a positive integer",
+    );
+  });
+
+  it("accepts a positive integer --top", () => {
+    expect(parseArgs(["--top", "25"]).top).toBe(25);
+  });
+
+  it("requires both live-source inputs unless explicitly overridden", () => {
+    const fixture = cliFixture(
+      [node("A", { sourceObservationIds: ["missing"] })],
+      [],
+      [],
+    );
+    const args = [
+      "--nodes",
+      fixture.nodesPath,
+      "--edges",
+      fixture.edgesPath,
+      "--out",
+      fixture.outDir,
+    ];
+
+    expect(() => runPruneClassifier(args)).toThrow(
+      "--obs-dir and --memories are required live-source inputs",
+    );
+    expect(existsSync(fixture.outDir)).toBe(false);
+
+    const result = runPruneClassifier([
+      ...args,
+      "--allow-empty-live-set",
+      "--allow-near-total-prune",
+    ]);
+    expect(result.report.doomedNodes).toBe(1);
+  });
+
+  it("rejects live-source inputs that contain no IDs", () => {
+    const fixture = cliFixture(
+      [node("A", { sourceObservationIds: ["missing"] })],
+      [],
+      [],
+    );
+
+    expect(() => runPruneClassifier(fixtureArgs(fixture))).toThrow(
+      "live-source inputs contain no IDs",
+    );
+    expect(existsSync(fixture.outDir)).toBe(false);
+
+    const result = runPruneClassifier([
+      ...fixtureArgs(fixture),
+      "--allow-empty-live-set",
+      "--allow-near-total-prune",
+    ]);
+    expect(result.report.doomedNodes).toBe(1);
+  });
+
+  it("requires a separate override for an empty prune result", () => {
+    const fixture = cliFixture([
+      node("A", { sourceObservationIds: ["missing"] }),
+    ], []);
+
+    expect(() => runPruneClassifier(fixtureArgs(fixture))).toThrow(
+      "prune would produce an empty graph",
+    );
+
+    const result = runPruneClassifier([
+      ...fixtureArgs(fixture),
+      "--allow-near-total-prune",
+    ]);
+    expect(result.report.keptNodes).toBe(0);
+    expect(result.report.doomedNodes).toBe(1);
+  });
+
+  it("rejects a near-total prune unless explicitly overridden", () => {
+    const nodes = Array.from({ length: 10 }, (_, index) =>
+      node(`N${index}`, {
+        sourceObservationIds: [index === 0 ? "o1" : "missing"],
+      }),
+    );
+    const fixture = cliFixture(nodes, []);
+
+    expect(() => runPruneClassifier(fixtureArgs(fixture))).toThrow(
+      "prune would remove 90.0% of nodes",
+    );
+    expect(existsSync(fixture.outDir)).toBe(false);
+
+    const result = runPruneClassifier([
+      ...fixtureArgs(fixture),
+      "--allow-near-total-prune",
+    ]);
+    expect(result.report.keptNodes).toBe(1);
+    expect(result.report.doomedNodes).toBe(9);
+  });
+
+  it("guards near-total edge pruning independently from nodes", () => {
+    const nodes = [
+      node("A", { sourceObservationIds: ["o1"] }),
+      node("B", { sourceObservationIds: ["o1"] }),
+    ];
+    const edges = Array.from({ length: 10 }, (_, index) =>
+      edge(`E${index}`, "A", "B", {
+        sourceObservationIds: [index === 0 ? "o1" : "missing"],
+      }),
+    );
+    const fixture = cliFixture(nodes, edges);
+
+    expect(() => runPruneClassifier(fixtureArgs(fixture))).toThrow(
+      "prune would remove 90.0% of edges",
+    );
+  });
+
+  it("atomically replaces output files for a safe prune", () => {
+    const fixture = cliFixture([
+      node("live", { sourceObservationIds: ["o1"] }),
+      node("dead", { sourceObservationIds: ["missing"] }),
+    ], []);
+    mkdirSync(fixture.outDir);
+    const sentinelPath = join(fixture.outDir, "sentinel.json");
+    const reportPath = join(fixture.outDir, "report.json");
+    writeFileSync(sentinelPath, "sentinel");
+    linkSync(sentinelPath, reportPath);
+
+    const result = runPruneClassifier(fixtureArgs(fixture));
+
+    expect(result.report.doomedNodes).toBe(1);
+    expect(readFileSync(sentinelPath, "utf8")).toBe("sentinel");
+    expect(JSON.parse(readFileSync(reportPath, "utf8"))).toEqual(result.report);
+    expect(existsSync(join(fixture.outDir, "manifest.json"))).toBe(true);
+    expect(existsSync(join(fixture.outDir, "pruned-snapshot.json"))).toBe(true);
+    expect(readdirSync(fixture.outDir).some((name) => name.endsWith(".tmp"))).toBe(
+      false,
+    );
   });
 });

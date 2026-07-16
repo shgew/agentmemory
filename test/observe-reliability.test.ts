@@ -74,7 +74,7 @@ function mockSdk(opts: { rejectStreams?: boolean } = {}) {
   };
 }
 
-describe("mem::observe — observation cap is an intentional drop, not a failure", () => {
+describe("mem::observe observation cap is an intentional drop", () => {
   beforeEach(() => {
     vi.resetModules();
     delete process.env["AGENTMEMORY_AUTO_COMPRESS"];
@@ -90,7 +90,7 @@ describe("mem::observe — observation cap is an intentional drop, not a failure
     registerObserveFunction(sdk as never, kv as never, undefined, 2);
 
     // Session at cap, plus matching observation rows so the OLD list-based
-    // check trips too — isolates the shape change from the mechanism change.
+    // check trips too, isolating the shape change from the mechanism change.
     await kv.set("mem:sessions", "ses_cap", {
       id: "ses_cap",
       project: "/r",
@@ -189,7 +189,7 @@ describe("mem::observe — observation cap is an intentional drop, not a failure
   });
 });
 
-describe("mem::observe — stream publish failures are non-fatal", () => {
+describe("mem::observe stream publish failures are non-fatal", () => {
   beforeEach(() => {
     vi.resetModules();
     delete process.env["AGENTMEMORY_AUTO_COMPRESS"];
@@ -220,5 +220,84 @@ describe("mem::observe — stream publish failures are non-fatal", () => {
     expect(stored).toBeDefined();
     const obs = Array.from(stored!.values())[0] as { type?: string };
     expect(obs.type).toBeTruthy();
+  });
+});
+
+describe("mem::observe event identity dedup", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    delete process.env["AGENTMEMORY_AUTO_COMPRESS"];
+  });
+
+  it("keeps distinct event IDs and drops a repeat of the same event ID", async () => {
+    const [{ registerObserveFunction }, { DedupMap }] = await Promise.all([
+      import("../src/functions/observe.js"),
+      import("../src/functions/dedup.js"),
+    ]);
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const dedupMap = new DedupMap();
+    registerObserveFunction(sdk as never, kv as never, dedupMap);
+    await kv.set("mem:sessions", "ses_events", {
+      id: "ses_events",
+      project: "agentmemory",
+      cwd: "/repo/agentmemory",
+      startedAt: "2026-07-16T10:00:00.000Z",
+      status: "active",
+      observationCount: 0,
+    });
+
+    const payload = (messageID: string) => ({
+      sessionId: "ses_events",
+      project: "agentmemory",
+      cwd: "/repo/agentmemory",
+      hookType: "assistant_message",
+      timestamp: "2026-07-16T10:01:00.000Z",
+      data: { messageID, finish: "stop" },
+    });
+
+    try {
+      const first = await sdk.trigger("mem::observe", payload("msg_1"));
+      const repeat = await sdk.trigger("mem::observe", payload("msg_1"));
+      const second = await sdk.trigger("mem::observe", payload("msg_2"));
+
+      expect(first).toMatchObject({ observationId: expect.any(String) });
+      expect(repeat).toEqual({
+        deduplicated: true,
+        sessionId: "ses_events",
+      });
+      expect(second).toMatchObject({ observationId: expect.any(String) });
+      expect(kv.store.get("mem:raw-payloads")?.size).toBe(2);
+    } finally {
+      dedupMap.stop();
+    }
+  });
+
+  it("does not guess identity from payload content", async () => {
+    const [{ registerObserveFunction }, { DedupMap }] = await Promise.all([
+      import("../src/functions/observe.js"),
+      import("../src/functions/dedup.js"),
+    ]);
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const dedupMap = new DedupMap();
+    registerObserveFunction(sdk as never, kv as never, dedupMap);
+
+    const payload = {
+      sessionId: "ses_no_identity",
+      project: "agentmemory",
+      cwd: "/repo/agentmemory",
+      hookType: "command_before",
+      timestamp: "2026-07-16T10:01:00.000Z",
+      data: { command: "test", arguments: "" },
+    };
+
+    try {
+      await sdk.trigger("mem::observe", payload);
+      await sdk.trigger("mem::observe", payload);
+      expect(kv.store.get("mem:raw-payloads")?.size).toBe(2);
+    } finally {
+      dedupMap.stop();
+    }
   });
 });

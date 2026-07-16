@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -61,6 +61,10 @@ describe("observe implicit session create (#638)", () => {
     vi.resetModules();
   });
 
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("creates the session on first observe when project+cwd present and session record missing", async () => {
     const { registerObserveFunction } = await import("../src/functions/observe.js");
     const sdk = mockSdk();
@@ -108,7 +112,7 @@ describe("observe implicit session create (#638)", () => {
     expect(sessionScope?.get("ses_no_project")).toBeUndefined();
   });
 
-  it("does not overwrite an existing session when one already exists", async () => {
+  it("rejects an observation whose project conflicts with the session", async () => {
     const { registerObserveFunction } = await import("../src/functions/observe.js");
     const sdk = mockSdk();
     const kv = mockKV();
@@ -124,27 +128,57 @@ describe("observe implicit session create (#638)", () => {
       firstPrompt: "original first prompt",
     });
 
-    await sdk.trigger("mem::observe", {
+    const result = (await sdk.trigger("mem::observe", {
       sessionId: "ses_existing",
       project: "/different/project",
       cwd: "/different/cwd",
       hookType: "post_tool_use",
       timestamp: new Date().toISOString(),
       data: { tool_name: "Read" },
-    });
+    })) as { success: boolean; error: string };
 
     const session = kv.store.get("mem:sessions")!.get("ses_existing") as Record<string, unknown>;
-    // Original project + firstPrompt preserved
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/project does not match session/);
     expect(session.project).toBe("/orig/project");
     expect(session.firstPrompt).toBe("original first prompt");
-    // Counter bumped, updatedAt refreshed
-    expect(session.observationCount).toBe(8);
-    expect(session.updatedAt).toBeTruthy();
+    expect(session.observationCount).toBe(7);
+    expect(kv.store.get("mem:raw-payloads")).toBeUndefined();
+  });
+
+  it("rejects an observation owned by another configured agent", async () => {
+    vi.stubEnv("AGENT_ID", "agent-b");
+    const { registerObserveFunction } = await import("../src/functions/observe.js");
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerObserveFunction(sdk as never, kv as never);
+    await kv.set("mem:sessions", "ses_existing", {
+      id: "ses_existing",
+      project: "/project",
+      cwd: "/project",
+      startedAt: "2026-01-01T00:00:00Z",
+      status: "active",
+      observationCount: 0,
+      agentId: "agent-a",
+    });
+
+    const result = (await sdk.trigger("mem::observe", {
+      sessionId: "ses_existing",
+      project: "/project",
+      cwd: "/project",
+      hookType: "post_tool_use",
+      timestamp: new Date().toISOString(),
+      data: { tool_name: "Read" },
+    })) as { success: boolean; error: string };
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/agent does not match session/);
+    expect(kv.store.get("mem:raw-payloads")).toBeUndefined();
   });
 });
 
 
-describe("observe — post-completion warn-once (Option K)", () => {
+describe("observe post-completion warn-once", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();

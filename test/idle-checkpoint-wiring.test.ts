@@ -21,12 +21,37 @@ describe("idle-checkpoint poll wiring (src/index.ts)", () => {
     expect(indexSrc).toMatch(/mode:\s*["']idle-checkpoint["']/);
   });
 
+  it("schedules the next poll only after the current sweep settles", () => {
+    const idleBlock = indexSrc.slice(
+      indexSrc.indexOf("const idleThresholdMs"),
+      indexSrc.indexOf("const shutdown"),
+    );
+    expect(idleBlock).toMatch(/fireIdleCheckpoint\(\)\.finally\(scheduleIdleCheckpoint\)/);
+    expect(idleBlock).not.toMatch(/setInterval/);
+  });
+
   it("passes the idle threshold via getIdleCheckpointMs", () => {
     expect(indexSrc).toMatch(/getIdleCheckpointMs/);
   });
 
   it("only starts the poll when the idle threshold is positive (eager mode runs no poll)", () => {
     expect(indexSrc).toMatch(/idleThresholdMs\s*>\s*0/);
+  });
+});
+
+describe("session sweep scheduler wiring", () => {
+  it("schedules the next cron sweep after the current run settles", () => {
+    const sweepBlock = indexSrc.slice(
+      indexSrc.indexOf('getEnvVar("SESSION_SWEEP_ENABLED")'),
+      indexSrc.indexOf("const idleThresholdMs"),
+    );
+    expect(sweepBlock).toMatch(
+      /fireSessionSweep\(\)\.finally\(\(\)\s*=>\s*\{\s*scheduleNextSessionSweep\(\)/,
+    );
+  });
+
+  it("reads recurring server settings through getEnvVar", () => {
+    expect(indexSrc).not.toMatch(/process\.env\.(?:AUTO_FORGET|CONSOLIDATION|LESSON_DECAY|INSIGHT_DECAY|SESSION_SWEEP|AGENTMEMORY_IDLE_CHECKPOINT)/);
   });
 });
 

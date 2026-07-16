@@ -400,4 +400,70 @@ describe("Smart Search project scoping", () => {
 
     expect(res.results.map((r) => r.obsId).sort()).toEqual(["mem_a", "mem_b"]);
   });
+
+  it("uses the memory project instead of its source session project", async () => {
+    const result = makeResult("mem_b", "ses_A", 0.9);
+    result.observation.sourceType = "memory";
+    const { sdk, kv } = wire([result]);
+    await kv.set("mem:sessions", "ses_A", {
+      id: "ses_A",
+      project: "proj-A",
+      cwd: "/x",
+      startedAt: "",
+      status: "completed",
+      observationCount: 1,
+    });
+    await kv.set("mem:memories", "mem_b", {
+      id: "mem_b",
+      project: "proj-B",
+    });
+
+    const projectA = (await sdk.trigger("mem::smart-search", {
+      query: "anything",
+      project: "proj-A",
+      includeLessons: false,
+    })) as { results: CompactSearchResult[] };
+    const projectB = (await sdk.trigger("mem::smart-search", {
+      query: "anything",
+      project: "proj-B",
+      includeLessons: false,
+    })) as { results: CompactSearchResult[] };
+
+    expect(projectA.results).toEqual([]);
+    expect(projectB.results.map((row) => row.obsId)).toEqual(["mem_b"]);
+  });
+
+  it("applies project filtering to expanded observations", async () => {
+    const { sdk, kv } = wire([]);
+    const obsA = makeObs({ id: "obs_a", sessionId: "ses_A" });
+    const obsB = makeObs({ id: "obs_b", sessionId: "ses_B" });
+    await kv.set("mem:obs:ses_A", "obs_a", obsA);
+    await kv.set("mem:obs:ses_B", "obs_b", obsB);
+    await kv.set("mem:sessions", "ses_A", {
+      id: "ses_A",
+      project: "proj-A",
+      cwd: "/x",
+      startedAt: "",
+      status: "completed",
+      observationCount: 1,
+    });
+    await kv.set("mem:sessions", "ses_B", {
+      id: "ses_B",
+      project: "proj-B",
+      cwd: "/x",
+      startedAt: "",
+      status: "completed",
+      observationCount: 1,
+    });
+
+    const result = (await sdk.trigger("mem::smart-search", {
+      expandIds: [
+        { obsId: "obs_a", sessionId: "ses_A" },
+        { obsId: "obs_b", sessionId: "ses_B" },
+      ],
+      project: "proj-A",
+    })) as { results: Array<{ obsId: string }> };
+
+    expect(result.results.map((row) => row.obsId)).toEqual(["obs_a"]);
+  });
 });

@@ -26,8 +26,9 @@ const DEFAULT_DIMENSIONS = MODEL_DIMENSIONS[DEFAULT_MODEL] ?? 1536;
 
 function resolveDimensions(model: string, override: string | undefined): number {
   if (override !== undefined && override.trim().length > 0) {
-    const parsed = parseInt(override, 10);
-    if (!Number.isFinite(parsed) || parsed <= 0) {
+    const raw = override.trim();
+    const parsed = Number(raw);
+    if (!/^[1-9]\d*$/.test(raw) || !Number.isSafeInteger(parsed)) {
       throw new Error(
         `OPENAI_EMBEDDING_DIMENSIONS must be a positive integer, got: ${override}`,
       );
@@ -51,7 +52,13 @@ function resolveMaxBatch(override: string | undefined): number {
         `OPENAI_EMBEDDING_MAX_BATCH must be a positive integer, got: ${override}`,
       );
     }
-    return Number(raw);
+    const parsed = Number(raw);
+    if (!Number.isSafeInteger(parsed)) {
+      throw new Error(
+        `OPENAI_EMBEDDING_MAX_BATCH must be a positive integer, got: ${override}`,
+      );
+    }
+    return parsed;
   }
   return DEFAULT_MAX_BATCH;
 }
@@ -143,6 +150,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   }
 
   async embedBatch(texts: string[]): Promise<Float32Array[]> {
+    if (texts.length === 0) return [];
     if (texts.length <= this.maxBatch) {
       return this.embedChunk(texts);
     }

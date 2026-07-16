@@ -76,7 +76,10 @@ describe("opencode plugin project resolver", () => {
 
     try {
       const calls = installFetchMock();
-      activePlugin = await AgentmemoryCapturePlugin(FAKE_CTX);
+      activePlugin = await AgentmemoryCapturePlugin({
+        ...FAKE_CTX,
+        directory: scenario.pluginCwd,
+      });
       await activePlugin.event!({
         event: { type: "session.created", properties: { info: { id: "s_project_resolver", title: "T", parentID: null, version: "1" } } } as EventV1,
       });

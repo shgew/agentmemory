@@ -153,6 +153,23 @@ describe("idle-checkpoint consolidation skips summarize, keeps graph-extract", (
     expect(sdk.calls.map((c) => c.function_id)).toContain("mem::summarize");
   });
 
+  it("skips graph-extract when no observations fall inside the window", async () => {
+    await sdk.trigger({
+      function_id: "event::session::checkpoint",
+      payload: {
+        sessionId: "ses_idle",
+        reason: "idle-checkpoint",
+        since: "2026-01-02T09:00:00Z",
+        until: "2026-01-02T11:00:00Z",
+        waitForCompletion: true,
+      },
+    });
+
+    expect(sdk.calls.map((c) => c.function_id)).not.toContain(
+      "mem::graph-extract",
+    );
+  });
+
   it("event::session::stopped still calls summarize", async () => {
     const result: unknown = await sdk.trigger({
       function_id: "event::session::stopped",

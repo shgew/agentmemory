@@ -8,8 +8,9 @@ import type {
   GraphNode,
   GraphEdge,
   GraphQueryResult,
+  CommitLink,
 } from "../types.js";
-import { getVisibleTools } from "./tools-registry.js";
+import { getVisibleTools, isToolVisible } from "./tools-registry.js";
 import { trimGraphQueryForMcp } from "./graph-trim.js";
 import { timingSafeCompare } from "../auth.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
@@ -40,6 +41,29 @@ function parseCsvList(value: unknown): string[] {
       .filter(Boolean);
   }
   return [];
+}
+
+function normalizeCommitSha(value: unknown): string | undefined {
+  const sha = asNonEmptyString(value);
+  return sha && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(sha)
+    ? sha.toLowerCase()
+    : undefined;
+}
+
+function resolveAgentFilter(requestedAgentId: unknown): string | undefined {
+  if (isAgentScopeIsolated()) return getAgentId();
+  const agentId = asNonEmptyString(requestedAgentId);
+  return agentId && agentId !== "*" ? agentId.slice(0, 128) : undefined;
+}
+
+function restrictCommitSessions(
+  commit: CommitLink,
+  allowedSessionIds: Set<string>,
+): CommitLink | null {
+  const sessionIds = (commit.sessionIds ?? []).filter((sessionId) =>
+    allowedSessionIds.has(sessionId),
+  );
+  return sessionIds.length > 0 ? { ...commit, sessionIds } : null;
 }
 
 export function registerMcpEndpoints(
@@ -86,6 +110,13 @@ export function registerMcpEndpoints(
 
       const { name, arguments: args = {} } = req.body;
 
+      if (!isToolVisible(name)) {
+        return {
+          status_code: 400,
+          body: { error: `Unknown or disabled tool: ${name}` },
+        };
+      }
+
       try {
         switch (name) {
           case "memory_recall": {
@@ -115,20 +146,21 @@ export function registerMcpEndpoints(
                 body: { error: "token_budget must be a positive integer" },
               };
             }
-            // #817: forward agentId so mem::search applies the same
-            // isolation filter smart-search uses. Default behavior is
-            // unchanged (no agentId → falls back to env AGENT_ID when
-            // AGENTMEMORY_AGENT_SCOPE=isolated; "*" wildcard bypasses).
-            const recallAgentId =
-              typeof args.agentId === "string" && args.agentId.trim().length > 0
-                ? (args.agentId as string).trim()
-                : undefined;
+            const project = asNonEmptyString(args.project);
+            if (args.project !== undefined && !project) {
+              return {
+                status_code: 400,
+                body: { error: "project must be a non-empty string" },
+              };
+            }
+            const recallAgentId = resolveAgentFilter(args.agentId);
             const result = await sdk.trigger({ function_id: "mem::search", payload: {
               query: args.query,
               limit: typeof args.limit === "number" ? args.limit : 10,
               format,
               token_budget: tokenBudget,
               agentId: recallAgentId,
+              project,
             } });
             const text =
               format === "narrative" &&
@@ -188,6 +220,13 @@ export function registerMcpEndpoints(
               typeof args.project === "string" && args.project.trim().length > 0
                 ? args.project.trim()
                 : undefined;
+            if (args.project !== undefined && !project) {
+              return {
+                status_code: 400,
+                body: { error: "project must be a non-empty string" },
+              };
+            }
+            const agentId = resolveAgentFilter(args.agentId);
 
             const result = await sdk.trigger({ function_id: "mem::remember", payload: {
               content: args.content,
@@ -195,6 +234,7 @@ export function registerMcpEndpoints(
               concepts,
               files,
               ...(project !== undefined && { project }),
+              ...(agentId !== undefined && { agentId }),
             } });
             return {
               status_code: 200,
@@ -261,12 +301,20 @@ export function registerMcpEndpoints(
                 ? Math.min(200, Math.floor(rawLimit))
                 : 20;
             const allSessions = await kv.list<Session>(KV.sessions);
+            const filterAgentId = resolveAgentFilter(args.agentId);
+            const includeSubagents = args.includeSubagents === true;
             const recencyKey = (s: Session): string =>
               [s.updatedAt, s.endedAt, s.lastCheckpointAt, s.startedAt].reduce(
                 (acc: string, t) => (typeof t === "string" && t > acc ? t : acc),
                 "",
               );
             const sessions = allSessions
+              .filter((session) =>
+                filterAgentId ? session.agentId === filterAgentId : true,
+              )
+              .filter((session) =>
+                includeSubagents ? true : !session.parentSessionId,
+              )
               .sort((a, b) => (recencyKey(a) < recencyKey(b) ? 1 : -1))
               .slice(0, limit);
             return {
@@ -288,12 +336,21 @@ export function registerMcpEndpoints(
             }
             const expandIds = parseCsvList(args.expandIds).slice(0, 20);
             const limit = Math.max(1, Math.min(100, asNumber(args.limit, 10) ?? 10));
+            const project = asNonEmptyString(args.project);
+            if (args.project !== undefined && !project) {
+              return {
+                status_code: 400,
+                body: { error: "project must be a non-empty string" },
+              };
+            }
             const result = await sdk.trigger({
               function_id: "mem::smart-search",
               payload: {
                 query: args.query,
                 expandIds,
                 limit,
+                project,
+                agentId: resolveAgentFilter(args.agentId),
               },
             });
             return {
@@ -1285,42 +1342,40 @@ export function registerMcpEndpoints(
           }
 
           case "memory_commit_lookup": {
-            const sha = asNonEmptyString(args.sha);
-            if (!sha) return { status_code: 400, body: { error: "sha required" } };
-            const link = await kv.get(KV.commits, sha);
+            const sha = normalizeCommitSha(args.sha);
+            if (!sha) {
+              return {
+                status_code: 400,
+                body: { error: "sha must be a 40- or 64-character hex string" },
+              };
+            }
+            const link = await kv.get<CommitLink>(KV.commits, sha);
             if (!link) {
               return {
                 status_code: 200,
                 body: { content: [{ type: "text", text: JSON.stringify({ commit: null, sessions: [] }, null, 2) }] },
               };
             }
-            const linkRecord = link as { sessionIds?: string[] };
             const fetched = await Promise.all(
-              (linkRecord.sessionIds ?? []).map((sid) => kv.get<Session>(KV.sessions, sid)),
+              (link.sessionIds ?? []).map((sid) => kv.get<Session>(KV.sessions, sid)),
             );
             const allSessions = fetched.filter((s): s is Session => s !== null);
-            const normalizedAgentId =
-              typeof args.agentId === "string" ? args.agentId.trim() : undefined;
-            const wildcardAgent = normalizedAgentId === "*";
-            const explicitAgentId =
-              normalizedAgentId && !wildcardAgent ? normalizedAgentId : undefined;
-            const filterAgentId = wildcardAgent
-              ? undefined
-              : explicitAgentId ??
-                (isAgentScopeIsolated() ? getAgentId() : undefined);
+            const filterAgentId = resolveAgentFilter(args.agentId);
             const sessions = filterAgentId
               ? allSessions.filter((s) => s.agentId === filterAgentId)
               : allSessions;
-            // Don't leak another agent's commit metadata under isolation.
             if (filterAgentId && sessions.length === 0) {
               return {
                 status_code: 200,
                 body: { content: [{ type: "text", text: JSON.stringify({ commit: null, sessions: [] }, null, 2) }] },
               };
             }
+            const commit = filterAgentId
+              ? { ...link, sessionIds: sessions.map((session) => session.id) }
+              : link;
             return {
               status_code: 200,
-              body: { content: [{ type: "text", text: JSON.stringify({ commit: link, sessions }, null, 2) }] },
+              body: { content: [{ type: "text", text: JSON.stringify({ commit, sessions }, null, 2) }] },
             };
           }
 
@@ -1328,17 +1383,9 @@ export function registerMcpEndpoints(
             const branch = typeof args.branch === "string" ? args.branch : undefined;
             const repo = typeof args.repo === "string" ? args.repo : undefined;
             const limit = Math.max(1, Math.min(500, asNumber(args.limit, 100) ?? 100));
-            const normalizedAgentId =
-              typeof args.agentId === "string" ? args.agentId.trim() : undefined;
-            const wildcardAgent = normalizedAgentId === "*";
-            const explicitAgentId =
-              normalizedAgentId && !wildcardAgent ? normalizedAgentId : undefined;
-            const filterAgentId = wildcardAgent
-              ? undefined
-              : explicitAgentId ??
-                (isAgentScopeIsolated() ? getAgentId() : undefined);
-            const all = await kv.list(KV.commits);
-            let visible = all as Array<{ branch?: string; repo?: string; linkedAt?: string; sessionIds?: string[] }>;
+            const filterAgentId = resolveAgentFilter(args.agentId);
+            const all = await kv.list<CommitLink>(KV.commits);
+            let visible = all;
             if (filterAgentId) {
               const sessions = await kv.list<Session>(KV.sessions);
               const allowedSessionIds = new Set(
@@ -1346,9 +1393,9 @@ export function registerMcpEndpoints(
                   .filter((s) => s.agentId === filterAgentId)
                   .map((s) => s.id),
               );
-              visible = visible.filter((c) =>
-                (c.sessionIds ?? []).some((sid) => allowedSessionIds.has(sid)),
-              );
+              visible = visible
+                .map((commit) => restrictCommitSessions(commit, allowedSessionIds))
+                .filter((commit): commit is CommitLink => commit !== null);
             }
             const filtered = visible
               .filter((c) => !branch || c.branch === branch)

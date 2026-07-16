@@ -5,7 +5,8 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 vi.mock("../src/config.js", () => ({
-getConsolidationDecayDays: () => 30,
+  getConsolidationDecayDays: () => 30,
+  getEnvVar: vi.fn(() => undefined),
   isConsolidationEnabled: vi.fn(() => true),
   isInsightSynthesisEnabled: vi.fn(() => true),
   isProceduralExtractionEnabled: vi.fn(() => true),
@@ -13,7 +14,12 @@ getConsolidationDecayDays: () => 30,
 
 import { registerConsolidationPipelineFunction } from "../src/functions/consolidation-pipeline.js";
 import { registerReflectFunctions } from "../src/functions/reflect.js";
-import { isConsolidationEnabled, isInsightSynthesisEnabled, isProceduralExtractionEnabled } from "../src/config.js";
+import {
+  getEnvVar,
+  isConsolidationEnabled,
+  isInsightSynthesisEnabled,
+  isProceduralExtractionEnabled,
+} from "../src/config.js";
 import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory } from "../src/types.js";
 
 function mockKV() {
@@ -128,6 +134,7 @@ sdk = mockSdk();
     // new kill-switch flags to enabled here and let the skip-tests override.
     vi.mocked(isInsightSynthesisEnabled).mockReturnValue(true);
     vi.mocked(isProceduralExtractionEnabled).mockReturnValue(true);
+    vi.mocked(getEnvVar).mockReturnValue(undefined);
 });
 
   it("pipeline skips semantic when fewer than 5 summaries", async () => {
@@ -205,6 +212,100 @@ sdk = mockSdk();
     expect(stored[0].confidence).toBe(0.9);
   });
 
+  it("serializes concurrent consolidation writes", async () => {
+    const releases: Array<() => void> = [];
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn(
+        () =>
+          new Promise<string>((resolve) => {
+            releases.push(() =>
+              resolve(
+                `<facts><fact confidence="0.9">Shared semantic fact</fact></facts>`,
+              ),
+            );
+          }),
+      ),
+    };
+    registerConsolidationPipelineFunction(
+      sdk as never,
+      kv as never,
+      provider as never,
+    );
+    for (let index = 0; index < 5; index++) {
+      await kv.set("mem:summaries", `ses_${index}`, makeSummary(index));
+    }
+
+    const first = sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    });
+    await vi.waitFor(() => expect(releases).toHaveLength(1));
+    const second = sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    });
+    await Promise.resolve();
+    expect(releases).toHaveLength(1);
+
+    releases[0]();
+    await first;
+    await vi.waitFor(() => expect(releases).toHaveLength(2));
+    releases[1]();
+    await second;
+
+    expect(await kv.list<SemanticMemory>("mem:semantic")).toHaveLength(1);
+  });
+
+  it("consolidates only summaries and semantic facts from the requested project", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<facts><fact confidence="0.9">Shared project fact</fact></facts>`,
+      ),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (const project of ["proj-a", "proj-b"]) {
+      for (let index = 0; index < 5; index++) {
+        const sessionId = `${project}-ses-${index}`;
+        await kv.set("mem:summaries", sessionId, {
+          ...makeSummary(index),
+          sessionId,
+          project,
+          narrative: `${project} narrative ${index}`,
+        });
+      }
+    }
+    const now = "2026-01-01T00:00:00Z";
+    await kv.set("mem:semantic", "sem_b", {
+      id: "sem_b",
+      fact: "Shared project fact",
+      confidence: 0.7,
+      sourceSessionIds: ["proj-b-ses-0"],
+      sourceMemoryIds: [],
+      accessCount: 1,
+      lastAccessedAt: now,
+      strength: 0.7,
+      createdAt: now,
+      updatedAt: now,
+    } satisfies SemanticMemory);
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+      project: "proj-a",
+    })) as { results: { semantic: { newFacts: number; totalSummaries: number } } };
+
+    const prompt = String(provider.summarize.mock.calls[0]?.[1] ?? "");
+    expect(prompt).toContain("proj-a narrative");
+    expect(prompt).not.toContain("proj-b narrative");
+    expect(result.results.semantic).toEqual({ newFacts: 1, totalSummaries: 5 });
+    const semantic = await kv.list<SemanticMemory>("mem:semantic");
+    expect(semantic).toHaveLength(2);
+    expect(semantic.find((item) => item.id === "sem_b")!.accessCount).toBe(1);
+    expect(semantic.find((item) => item.id !== "sem_b")!.sourceSessionIds)
+      .toEqual(expect.arrayContaining(["proj-a-ses-0", "proj-a-ses-4"]));
+  });
+
   it("with enough patterns, creates procedural memories from provider response", async () => {
     const provider = {
       name: "test",
@@ -232,6 +333,107 @@ sdk = mockSdk();
     expect(stored[0].name).toBe("Test Workflow");
     expect(stored[0].steps.length).toBe(2);
     expect(stored[0].triggerCondition).toBe("when writing tests");
+  });
+
+  it("extracts procedures only from pattern memories in the requested project", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<procedures><procedure name="Shared Workflow" trigger="when needed"><step>Run project flow</step></procedure></procedures>`,
+      ),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (const project of ["proj-a", "proj-b"]) {
+      for (let index = 0; index < 2; index++) {
+        const id = `${project}-mem-${index}`;
+        await kv.set("mem:memories", id, {
+          ...makePattern(index),
+          id,
+          project,
+          content: `${project} pattern ${index}`,
+          sessionIds: [`${project}-ses-1`, `${project}-ses-2`],
+        });
+      }
+    }
+    const now = "2026-01-01T00:00:00Z";
+    await kv.set("mem:procedural", "proc_b", {
+      id: "proc_b",
+      name: "Shared Workflow",
+      steps: ["Old B flow"],
+      triggerCondition: "when needed",
+      frequency: 3,
+      sourceSessionIds: ["proj-b-ses-1"],
+      strength: 0.5,
+      createdAt: now,
+      updatedAt: now,
+    } satisfies ProceduralMemory);
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "procedural",
+      project: "proj-a",
+    })) as { results: { procedural: { newProcedures: number; patternsAnalyzed: number } } };
+
+    const prompt = String(provider.summarize.mock.calls[0]?.[1] ?? "");
+    expect(prompt).toContain("proj-a pattern");
+    expect(prompt).not.toContain("proj-b pattern");
+    expect(result.results.procedural).toEqual({
+      newProcedures: 1,
+      patternsAnalyzed: 2,
+    });
+    const procedural = await kv.list<ProceduralMemory>("mem:procedural");
+    expect(procedural).toHaveLength(2);
+    expect(procedural.find((item) => item.id === "proc_b")!.frequency).toBe(3);
+    expect(procedural.find((item) => item.id !== "proc_b")!.sourceSessionIds)
+      .toEqual(["proj-a-ses-1", "proj-a-ses-2"]);
+  });
+
+  it("decays only semantic and procedural records linked to the requested project", async () => {
+    const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (const project of ["proj-a", "proj-b"]) {
+      const sessionId = `${project}-ses`;
+      await kv.set("mem:summaries", sessionId, {
+        ...makeSummary(1),
+        sessionId,
+        project,
+      });
+      const old = "2020-01-01T00:00:00Z";
+      await kv.set("mem:semantic", `sem_${project}`, {
+        id: `sem_${project}`,
+        fact: `${project} fact`,
+        confidence: 0.8,
+        sourceSessionIds: [sessionId],
+        sourceMemoryIds: [],
+        accessCount: 1,
+        lastAccessedAt: old,
+        strength: 1,
+        createdAt: old,
+        updatedAt: old,
+      } satisfies SemanticMemory);
+      await kv.set("mem:procedural", `proc_${project}`, {
+        id: `proc_${project}`,
+        name: `${project} procedure`,
+        steps: ["Run"],
+        triggerCondition: "always",
+        frequency: 1,
+        sourceSessionIds: [sessionId],
+        strength: 1,
+        createdAt: old,
+        updatedAt: old,
+      } satisfies ProceduralMemory);
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "decay",
+      project: "proj-a",
+    })) as { results: { decay: { semantic: number; procedural: number } } };
+
+    expect(result.results.decay).toEqual({ semantic: 1, procedural: 1 });
+    expect((await kv.get<SemanticMemory>("mem:semantic", "sem_proj-a"))!.strength).toBeLessThan(1);
+    expect((await kv.get<SemanticMemory>("mem:semantic", "sem_proj-b"))!.strength).toBe(1);
+    expect((await kv.get<ProceduralMemory>("mem:procedural", "proc_proj-a"))!.strength).toBeLessThan(1);
+    expect((await kv.get<ProceduralMemory>("mem:procedural", "proc_proj-b"))!.strength).toBe(1);
   });
 
   it("consolidation records an audit entry", async () => {
@@ -322,6 +524,38 @@ sdk = mockSdk();
     expect(new Date(wm!.at).getTime()).toBeGreaterThan(Date.now() - 5000);
   });
 
+  it("serializes the reflect watermark check and update for each project", async () => {
+    const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
+    let releaseReflect!: (value: unknown) => void;
+    const reflectFn = vi.fn().mockImplementation(
+      () => new Promise((resolve) => {
+        releaseReflect = resolve;
+      }),
+    );
+    sdk.registerFunction("mem::reflect", reflectFn);
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+
+    const first = sdk.trigger("mem::consolidate-pipeline", {
+      tier: "all",
+      project: "proj-a",
+    });
+    await vi.waitFor(() => expect(reflectFn).toHaveBeenCalledOnce());
+    const second = sdk.trigger("mem::consolidate-pipeline", {
+      tier: "all",
+      project: "proj-a",
+    });
+    await Promise.resolve();
+    expect(reflectFn).toHaveBeenCalledOnce();
+    releaseReflect({ success: true, fullPassComplete: true });
+
+    const [firstResult, secondResult] = await Promise.all([first, second]) as Array<{
+      results: { reflect: { skipped?: boolean } };
+    }>;
+    expect(firstResult.results.reflect.skipped).toBeUndefined();
+    expect(secondResult.results.reflect.skipped).toBe(true);
+    expect(reflectFn).toHaveBeenCalledOnce();
+  });
+
   it("reflect gate does not write the watermark after a partial reflect pass", async () => {
     const provider = { name: "test", compress: vi.fn(), summarize: vi.fn() };
     const reflectFn = vi.fn().mockResolvedValue({ success: true, fullPassComplete: false, newInsights: 0 });
@@ -374,12 +608,17 @@ sdk = mockSdk();
     expect(wm).toBeNull();
   });
 
-  it("reflect gate does not write the watermark when the real reflect fails on every cluster", async () => {
+  it("reflect gate retries empty provider output without advancing cursor or watermark", async () => {
     const now = new Date().toISOString();
     const provider = {
       name: "test",
       compress: vi.fn(),
-      summarize: vi.fn().mockRejectedValue(new Error("provider down")),
+      summarize: vi
+        .fn()
+        .mockResolvedValueOnce("<insights></insights>")
+        .mockResolvedValueOnce(
+          `<insights><insight confidence="0.8" title="Validate Boundaries">Validate inputs at trust boundaries using layered checks.</insight></insights>`,
+        ),
     };
     registerReflectFunctions(sdk as never, kv as never, provider as never);
     registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
@@ -407,10 +646,29 @@ sdk = mockSdk();
       });
     }
 
-    await sdk.trigger("mem::consolidate-pipeline", { tier: "all" });
+    const first = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "all",
+    })) as {
+      results: { reflect: { success: boolean; fullPassComplete: boolean } };
+    };
 
     const wm = await kv.get("mem:config", "reflect:last-success:global");
     expect(wm).toBeNull();
+    expect(first.results.reflect.success).toBe(false);
+    expect(first.results.reflect.fullPassComplete).toBe(false);
+    expect(
+      await kv.get<{ processedFps: string[] }>(
+        "mem:config",
+        "reflect:cursor:global",
+      ),
+    ).toMatchObject({ processedFps: [] });
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "all" });
+
+    expect(provider.summarize).toHaveBeenCalledTimes(2);
+    expect(
+      await kv.get("mem:config", "reflect:last-success:global"),
+    ).not.toBeNull();
   });
 
   // ── Kill-switch flags: INSIGHT_SYNTHESIS_ENABLED / PROCEDURAL_EXTRACTION_ENABLED ──

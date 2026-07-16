@@ -20,12 +20,15 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
 
   beforeEach(() => {
     resetHandleForTests();
+    vi.stubEnv("AGENT_ID", "");
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "");
     process.env["AGENTMEMORY_URL"] = BASE;
     delete process.env["AGENTMEMORY_SECRET"];
   });
 
   afterEach(() => {
     resetHandleForTests();
+    vi.unstubAllEnvs();
     globalThis.fetch = originalFetch;
     delete process.env["AGENTMEMORY_URL"];
   });
@@ -46,18 +49,28 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
       return new Response("not found", { status: 404 });
     });
 
-    const res = await handleToolCall("memory_sessions", { limit: 5 });
+    const res = await handleToolCall("memory_sessions", {
+      limit: 5,
+      agentId: "agent-a",
+      includeSubagents: true,
+    });
     const body = JSON.parse(res.content[0].text);
     expect(body.sessions).toHaveLength(1);
     expect(body.sessions[0].id).toBe("sess-1");
-    expect(calls.find((c) => c.url.includes("/sessions"))).toBeDefined();
+    const sessionCall = calls.find((c) => c.url.includes("/sessions"));
+    expect(sessionCall).toBeDefined();
+    const sessionUrl = new URL(sessionCall?.url ?? BASE);
+    expect(sessionUrl.searchParams.get("agentId")).toBe("agent-a");
+    expect(sessionUrl.searchParams.get("includeSubagents")).toBe("true");
   });
 
   it("proxies memory_smart_search to POST /agentmemory/smart-search", async () => {
+    let forwardedBody: Record<string, unknown> | undefined;
     installFetch((url, init) => {
       if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
       if (url.endsWith("/agentmemory/smart-search")) {
         const body = JSON.parse((init?.body as string) || "{}");
+        forwardedBody = body;
         return new Response(
           JSON.stringify({
             mode: "compact",
@@ -69,10 +82,15 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
       }
       return new Response("", { status: 404 });
     });
-    const res = await handleToolCall("memory_smart_search", { query: "auth bug", limit: 5 });
+    const res = await handleToolCall("memory_smart_search", {
+      query: "auth bug",
+      limit: 5,
+      project: "ios",
+    });
     const body = JSON.parse(res.content[0].text);
     expect(body.query).toBe("auth bug");
     expect(body.results[0].id).toBe("m1");
+    expect(forwardedBody?.["project"]).toBe("ios");
   });
 
   it("proxies memory_recall to POST /agentmemory/search and forwards format/token_budget (#507)", async () => {
@@ -100,6 +118,7 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
       limit: 5,
       format: "full",
       token_budget: 800,
+      project: "ios",
     });
     const body = JSON.parse(res.content[0].text);
     expect(body.mode).toBe("full");
@@ -111,6 +130,7 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
       limit: 5,
       format: "full",
       token_budget: 800,
+      project: "ios",
     });
     expect(calls.find((c) => c.url.endsWith("/agentmemory/smart-search"))).toBeUndefined();
   });
@@ -389,7 +409,7 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     expect(joined).toMatch(/AGENTMEMORY_FORCE_PROXY/);
   });
 
-  it("local fallback tools/list returns all 7 IMPLEMENTED_TOOLS regardless of AGENTMEMORY_TOOLS env (#234)", async () => {
+  it("local fallback tools/list honors AGENTMEMORY_TOOLS", async () => {
     const { handleToolsList } = await import("../src/mcp/standalone.js");
     installFetch(() => {
       throw new Error("ECONNREFUSED");
@@ -411,7 +431,14 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     resetHandleForTests();
     process.env["AGENTMEMORY_TOOLS"] = "core";
     const core = await handleToolsList();
-    expect((core.tools as unknown[]).length).toBe(7);
+    expect(
+      (core.tools as Array<{ name: string }>).map((tool) => tool.name).sort(),
+    ).toEqual([
+      "memory_recall",
+      "memory_save",
+      "memory_sessions",
+      "memory_smart_search",
+    ]);
     delete process.env["AGENTMEMORY_TOOLS"];
   });
 
@@ -441,7 +468,7 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
   });
 });
 
-describe("@agentmemory/mcp standalone — per-tool proxy call timeouts (LLM-heavy tools)", () => {
+describe("@agentmemory/mcp standalone per-tool proxy call timeouts", () => {
   const originalFetch = globalThis.fetch;
   let timeoutSpy: ReturnType<typeof vi.spyOn>;
 
@@ -465,8 +492,9 @@ describe("@agentmemory/mcp standalone — per-tool proxy call timeouts (LLM-heav
     resetHandleForTests();
     process.env["AGENTMEMORY_URL"] = BASE;
     // Skip the livez probe so the ONLY AbortSignal.timeout call is the tool
-    // call itself — keeps the spy assertions unambiguous.
+    // call itself, which keeps the spy assertions unambiguous.
     process.env["AGENTMEMORY_FORCE_PROXY"] = "1";
+    process.env["AGENTMEMORY_TOOLS"] = "all";
     delete process.env["AGENTMEMORY_SECRET"];
     delete process.env["AGENTMEMORY_MCP_CALL_TIMEOUT_MS"];
     delete process.env["AGENTMEMORY_MCP_EXTENDED_TIMEOUT_MS"];
@@ -479,6 +507,7 @@ describe("@agentmemory/mcp standalone — per-tool proxy call timeouts (LLM-heav
     timeoutSpy.mockRestore();
     delete process.env["AGENTMEMORY_URL"];
     delete process.env["AGENTMEMORY_FORCE_PROXY"];
+    delete process.env["AGENTMEMORY_TOOLS"];
     delete process.env["AGENTMEMORY_MCP_CALL_TIMEOUT_MS"];
     delete process.env["AGENTMEMORY_MCP_EXTENDED_TIMEOUT_MS"];
   });
@@ -528,7 +557,7 @@ describe("@agentmemory/mcp standalone — per-tool proxy call timeouts (LLM-heav
 
   it("AGENTMEMORY_MCP_CALL_TIMEOUT_MS does NOT shrink the extended-timeout budget below its own default", async () => {
     // A user lowering the general call timeout must not accidentally starve
-    // the extended-timeout tools — they have their own independent knob.
+    // the extended-timeout tools, which have their own independent knob.
     process.env["AGENTMEMORY_MCP_CALL_TIMEOUT_MS"] = "9000";
     installGenericFetch();
     await handleToolCall("memory_consolidate", { tier: "semantic" });

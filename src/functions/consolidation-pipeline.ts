@@ -3,6 +3,7 @@ import type {
   SemanticMemory,
   ProceduralMemory,
   SessionSummary,
+  Session,
   Memory,
   MemoryProvider,
 } from "../types.js";
@@ -17,11 +18,77 @@ import {
 import { recordAudit } from "./audit.js";
 import {
   getConsolidationDecayDays,
+  getEnvVar,
   isConsolidationEnabled,
   isInsightSynthesisEnabled,
   isProceduralExtractionEnabled,
 } from "../config.js";
 import { logger } from "../logger.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
+
+interface ProjectEvidence {
+  sessionIds: Set<string>;
+  memoryIds: Set<string>;
+  memories: Memory[];
+}
+
+function memoryBelongsToProject(
+  memory: Memory,
+  project: string,
+  projectSessionIds: Set<string>,
+): boolean {
+  if (memory.project !== undefined) return memory.project === project;
+  return memory.sessionIds.some((sessionId) => projectSessionIds.has(sessionId));
+}
+
+async function readProjectEvidence(
+  kv: StateKV,
+  project: string,
+): Promise<ProjectEvidence> {
+  const [sessions, summaries, memories] = await Promise.all([
+    kv.list<Session>(KV.sessions),
+    kv.list<SessionSummary>(KV.summaries),
+    kv.list<Memory>(KV.memories),
+  ]);
+  const sessionIds = new Set([
+    ...sessions.filter((session) => session.project === project).map((session) => session.id),
+    ...summaries.filter((summary) => summary.project === project).map((summary) => summary.sessionId),
+  ]);
+  for (const memory of memories) {
+    if (memory.project === project) {
+      for (const sessionId of memory.sessionIds) sessionIds.add(sessionId);
+    }
+  }
+  const scopedMemories = memories.filter((memory) =>
+    memoryBelongsToProject(memory, project, sessionIds),
+  );
+  return {
+    sessionIds,
+    memoryIds: new Set(scopedMemories.map((memory) => memory.id)),
+    memories: scopedMemories,
+  };
+}
+
+function semanticBelongsToProject(
+  semantic: SemanticMemory,
+  evidence: ProjectEvidence,
+): boolean {
+  return (
+    semantic.sourceSessionIds.some((id) => evidence.sessionIds.has(id)) ||
+    semantic.sourceMemoryIds.some((id) => evidence.memoryIds.has(id))
+  );
+}
+
+function proceduralBelongsToProject(
+  procedural: ProceduralMemory,
+  evidence: ProjectEvidence,
+): boolean {
+  return procedural.sourceSessionIds.some((id) => evidence.sessionIds.has(id));
+}
+
+function unionIds(existing: string[], incoming: string[]): string[] {
+  return [...new Set([...existing, ...incoming])];
+}
 
 function applyDecay(
   items: Array<{
@@ -52,18 +119,31 @@ export function registerConsolidationPipelineFunction(
   kv: StateKV,
   provider: MemoryProvider,
 ): void {
-  sdk.registerFunction("mem::consolidate-pipeline", 
-    async (data?: { tier?: string; force?: boolean; project?: string }) => {
+  sdk.registerFunction(
+    "mem::consolidate-pipeline",
+    async (data?: { tier?: string; force?: boolean; project?: string }) =>
+      withKeyedLock("consolidation:pipeline", async () => {
       if (!data?.force && !isConsolidationEnabled()) {
         return { success: false, skipped: true, reason: "Consolidation disabled: set CONSOLIDATION_ENABLED=true or configure an LLM provider (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / MINIMAX_API_KEY / OPENAI_BASE_URL / AGENTMEMORY_PROVIDER=agent-sdk)" };
       }
       const tier = data?.tier || "all";
       const decayDays = getConsolidationDecayDays();
       const results: Record<string, unknown> = {};
+      const project = data?.project;
+      const projectEvidence =
+        project && tier !== "reflect"
+          ? await readProjectEvidence(kv, project)
+          : undefined;
 
       if (tier === "all" || tier === "semantic") {
-        const summaries = await kv.list<SessionSummary>(KV.summaries);
-        const existingSemantic = await kv.list<SemanticMemory>(KV.semantic);
+        let summaries = await kv.list<SessionSummary>(KV.summaries);
+        let existingSemantic = await kv.list<SemanticMemory>(KV.semantic);
+        if (project && projectEvidence) {
+          summaries = summaries.filter((summary) => summary.project === project);
+          existingSemantic = existingSemantic.filter((semantic) =>
+            semanticBelongsToProject(semantic, projectEvidence),
+          );
+        }
 
         if (summaries.length >= 5) {
           const recentSummaries = summaries
@@ -106,6 +186,10 @@ export function registerConsolidationPipelineFunction(
                 existing.lastAccessedAt = now;
                 existing.updatedAt = now;
                 existing.confidence = Math.max(existing.confidence, confidence);
+                existing.sourceSessionIds = unionIds(
+                  existing.sourceSessionIds,
+                  recentSummaries.map((summary) => summary.sessionId),
+                );
                 await kv.set(KV.semantic, existing.id, existing);
               } else {
                 const sem: SemanticMemory = {
@@ -149,46 +233,50 @@ export function registerConsolidationPipelineFunction(
         };
       } else if (tier === "all" || tier === "reflect") {
         const REFLECT_GATE_MS = 24 * 60 * 60 * 1000;
-        const reflectWatermarkKey = `reflect:last-success:${data?.project || "global"}`;
-        let reflectGated = false;
-        if (tier === "all") {
-          const last = await kv
-            .get<{ at: string }>(KV.config, reflectWatermarkKey)
-            .catch(() => null);
-          if (
-            last?.at &&
-            Date.now() - new Date(last.at).getTime() < REFLECT_GATE_MS
-          ) {
-            reflectGated = true;
-          }
-        }
-        if (reflectGated) {
-          results.reflect = {
-            skipped: true,
-            reason: "reflect ran within the last 24h",
-          };
-        } else {
-          try {
-            const reflectResult = await sdk.trigger({ function_id: "mem::reflect", payload: {
-              maxClusters: 10,
-              project: data?.project,
-            } });
-            results.reflect = reflectResult;
-            const rr = reflectResult as
-              | { success?: boolean; fullPassComplete?: boolean }
-              | null
-              | undefined;
-            if (rr?.success === true && rr?.fullPassComplete === true) {
-              await kv.set(KV.config, reflectWatermarkKey, {
-                at: new Date().toISOString(),
-              });
+        const scope = project || "global";
+        const reflectWatermarkKey = `reflect:last-success:${scope}`;
+        results.reflect = await withKeyedLock(
+          `reflect:watermark:${scope}`,
+          async () => {
+            if (tier === "all") {
+              const last = await kv
+                .get<{ at: string }>(KV.config, reflectWatermarkKey)
+                .catch(() => null);
+              if (
+                last?.at &&
+                Date.now() - new Date(last.at).getTime() < REFLECT_GATE_MS
+              ) {
+                return {
+                  skipped: true,
+                  reason: "reflect ran within the last 24h",
+                };
+              }
             }
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            logger.warn("Reflect tier failed", { error: msg });
-            results.reflect = { error: msg };
-          }
-        }
+            try {
+              const reflectResult = await sdk.trigger({
+                function_id: "mem::reflect",
+                payload: {
+                  maxClusters: 10,
+                  project,
+                },
+              });
+              const rr = reflectResult as
+                | { success?: boolean; fullPassComplete?: boolean }
+                | null
+                | undefined;
+              if (rr?.success === true && rr?.fullPassComplete === true) {
+                await kv.set(KV.config, reflectWatermarkKey, {
+                  at: new Date().toISOString(),
+                });
+              }
+              return reflectResult;
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              logger.warn("Reflect tier failed", { error: msg });
+              return { error: msg };
+            }
+          },
+        );
       }
 
       if (
@@ -202,13 +290,23 @@ export function registerConsolidationPipelineFunction(
           reason: "PROCEDURAL_EXTRACTION_ENABLED=false",
         };
       } else if (tier === "all" || tier === "procedural") {
-        const memories = await kv.list<Memory>(KV.memories);
+        const memories =
+          projectEvidence?.memories ?? (await kv.list<Memory>(KV.memories));
         const patterns = memories
           .filter((m) => m.isLatest && m.type === "pattern")
-          .map((m) => ({
-            content: m.content,
-            frequency: m.sessionIds.length || 1,
-          }))
+          .map((memory) => {
+            const sourceSessionIds =
+              project && projectEvidence && memory.project === undefined
+                ? memory.sessionIds.filter((id) =>
+                    projectEvidence.sessionIds.has(id),
+                  )
+                : memory.sessionIds;
+            return {
+              content: memory.content,
+              frequency: sourceSessionIds.length || 1,
+              sourceSessionIds,
+            };
+          })
           .filter((p) => p.frequency >= 2);
 
         if (patterns.length >= 2) {
@@ -225,8 +323,17 @@ export function registerConsolidationPipelineFunction(
             let match;
             let newProcs = 0;
             const now = new Date().toISOString();
-            const existingProcs = await kv.list<ProceduralMemory>(
+            let existingProcs = await kv.list<ProceduralMemory>(
               KV.procedural,
+            );
+            if (projectEvidence) {
+              existingProcs = existingProcs.filter((procedural) =>
+                proceduralBelongsToProject(procedural, projectEvidence),
+              );
+            }
+            const sourceSessionIds = unionIds(
+              [],
+              patterns.flatMap((pattern) => pattern.sourceSessionIds),
             );
 
             while ((match = procRegex.exec(response)) !== null) {
@@ -248,6 +355,10 @@ export function registerConsolidationPipelineFunction(
                 existing.frequency++;
                 existing.updatedAt = now;
                 existing.strength = Math.min(1, existing.strength + 0.1);
+                existing.sourceSessionIds = unionIds(
+                  existing.sourceSessionIds,
+                  sourceSessionIds,
+                );
                 await kv.set(KV.procedural, existing.id, existing);
               } else {
                 const proc: ProceduralMemory = {
@@ -256,7 +367,7 @@ export function registerConsolidationPipelineFunction(
                   steps,
                   triggerCondition: trigger,
                   frequency: 1,
-                  sourceSessionIds: [],
+                  sourceSessionIds,
                   strength: 0.5,
                   createdAt: now,
                   updatedAt: now,
@@ -283,13 +394,23 @@ export function registerConsolidationPipelineFunction(
       }
 
       if (tier === "all" || tier === "decay") {
-        const semantic = await kv.list<SemanticMemory>(KV.semantic);
+        let semantic = await kv.list<SemanticMemory>(KV.semantic);
+        if (projectEvidence) {
+          semantic = semantic.filter((item) =>
+            semanticBelongsToProject(item, projectEvidence),
+          );
+        }
         applyDecay(semantic, decayDays);
         for (const s of semantic) {
           await kv.set(KV.semantic, s.id, s);
         }
 
-        const procedural = await kv.list<ProceduralMemory>(KV.procedural);
+        let procedural = await kv.list<ProceduralMemory>(KV.procedural);
+        if (projectEvidence) {
+          procedural = procedural.filter((item) =>
+            proceduralBelongsToProject(item, projectEvidence),
+          );
+        }
         applyDecay(procedural, decayDays);
         for (const p of procedural) {
           await kv.set(KV.procedural, p.id, p);
@@ -301,7 +422,7 @@ export function registerConsolidationPipelineFunction(
         };
       }
 
-      if (process.env["OBSIDIAN_AUTO_EXPORT"] === "true") {
+      if (getEnvVar("OBSIDIAN_AUTO_EXPORT") === "true") {
         try {
           await sdk.trigger({ function_id: "mem::obsidian-export", payload: {} });
           results.obsidianExport = { success: true };
@@ -319,6 +440,6 @@ export function registerConsolidationPipelineFunction(
 
       logger.info("Consolidation pipeline complete", { tier, results });
       return { success: true, results };
-    },
+      }),
   );
 }

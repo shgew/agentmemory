@@ -5,6 +5,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerExportImportFunction } from "../src/functions/export-import.js";
+import { getSearchIndex } from "../src/functions/search.js";
 import type {
   Session,
   CompressedObservation,
@@ -12,6 +13,7 @@ import type {
   SessionSummary,
   ExportData,
   RawObservation,
+  GraphNode,
 } from "../src/types.js";
 
 function mockKV() {
@@ -215,6 +217,92 @@ describe("Export/Import Functions", () => {
     expect(oldSession).toBeNull();
   });
 
+  it.each([
+    {
+      name: "has another page",
+      pagination: { offset: 0, limit: 1, total: 2, hasMore: true },
+    },
+    {
+      name: "starts after the first session",
+      pagination: { offset: 1, limit: 1, total: 2, hasMore: false },
+    },
+    {
+      name: "reports more sessions than it contains",
+      pagination: { offset: 0, limit: 2, total: 2, hasMore: false },
+    },
+  ])("rejects a partial replace export that $name", async ({ pagination }) => {
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [{ ...testSession, id: "ses_partial" }],
+      observations: {},
+      memories: [],
+      summaries: [],
+      pagination,
+    };
+    const list = vi.spyOn(kv, "list");
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "replace",
+    })) as { success: boolean; error: string };
+
+    expect(result).toEqual({
+      success: false,
+      error: "replace requires an export containing all sessions",
+    });
+    expect(list).not.toHaveBeenCalled();
+    expect(await kv.get("mem:sessions", "ses_1")).toEqual(testSession);
+  });
+
+  it("accepts a paginated replace export that contains every session", async () => {
+    const newSession = { ...testSession, id: "ses_complete" };
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [newSession],
+      observations: {},
+      memories: [],
+      summaries: [],
+      pagination: { offset: 0, limit: 1, total: 1, hasMore: false },
+    };
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "replace",
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    expect(await kv.get("mem:sessions", "ses_complete")).toEqual(newSession);
+    expect(await kv.get("mem:sessions", "ses_1")).toBeNull();
+  });
+
+  it("rebuilds the search index after import", async () => {
+    getSearchIndex().add(testObs);
+    const importedMemory = {
+      ...testMemory,
+      id: "mem_imported",
+      title: "Imported search entry",
+    };
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [],
+      observations: {},
+      memories: [importedMemory],
+      summaries: [],
+    };
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "replace",
+    })) as { success: boolean; indexEntries: number };
+
+    expect(result).toMatchObject({ success: true, indexEntries: 1 });
+    expect(getSearchIndex().has(testObs.id)).toBe(false);
+    expect(getSearchIndex().has(importedMemory.id)).toBe(true);
+  });
+
   it("export then import round-trip preserves data", async () => {
     const exported = (await sdk.trigger("mem::export", {})) as ExportData;
 
@@ -265,5 +353,203 @@ describe("Export/Import Functions", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toContain("Unsupported export version");
+  });
+
+  it("fails export instead of returning an incomplete backup", async () => {
+    const originalList = kv.list;
+    kv.list = async <T>(scope: string): Promise<T[]> => {
+      if (scope === "mem:raw-payloads") throw new Error("raw read failed");
+      return originalList<T>(scope);
+    };
+
+    await expect(sdk.trigger("mem::export", {})).rejects.toThrow(
+      "raw read failed",
+    );
+  });
+
+  it("preflights replace reads before deleting existing data", async () => {
+    const originalList = kv.list;
+    kv.list = async <T>(scope: string): Promise<T[]> => {
+      if (scope === "mem:raw-payloads") throw new Error("raw read failed");
+      return originalList<T>(scope);
+    };
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [],
+      observations: {},
+      memories: [],
+      summaries: [],
+    };
+
+    await expect(
+      sdk.trigger("mem::import", { exportData, strategy: "replace" }),
+    ).rejects.toThrow("raw read failed");
+    expect(await kv.get("mem:sessions", "ses_1")).toEqual(testSession);
+  });
+
+  it("rejects malformed optional collections before replace deletes data", async () => {
+    const exportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [],
+      observations: {},
+      memories: [],
+      summaries: [],
+      graphNodes: [null],
+    } as unknown as ExportData;
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "replace",
+    })) as { success: boolean; error: string };
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("graphNodes[0]");
+    expect(await kv.get("mem:sessions", "ses_1")).toEqual(testSession);
+  });
+
+  it("rejects observations stored under a different session bucket", async () => {
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [],
+      observations: { wrong_session: [testObs] },
+      memories: [],
+      summaries: [],
+    };
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "replace",
+    })) as { success: boolean; error: string };
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("mismatched sessionId");
+    expect(await kv.get("mem:sessions", "ses_1")).toEqual(testSession);
+  });
+
+  it("rebuilds image reference counts without double-counting one observation", async () => {
+    const imagePath = "/managed/image.png";
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [testSession],
+      observations: {
+        ses_1: [{ ...testObs, imageData: imagePath, imageRef: imagePath }],
+      },
+      rawPayloads: [{ ...testRawPayload, imageData: imagePath }],
+      memories: [{ ...testMemory, imageRef: imagePath }],
+      summaries: [],
+    };
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "replace",
+    })) as { success: boolean; imageRefs: number };
+
+    expect(result.success).toBe(true);
+    expect(result.imageRefs).toBe(1);
+    expect(await kv.get("mem:image-refs", imagePath)).toBe(2);
+  });
+
+  it("removes image reference counts orphaned by merge overwrites", async () => {
+    await kv.set("mem:memories", "mem_1", {
+      ...testMemory,
+      imageRef: "/managed/old.png",
+    });
+    await kv.set("mem:image-refs", "/managed/old.png", 1);
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [],
+      observations: {},
+      memories: [{ ...testMemory, imageRef: "/managed/new.png" }],
+      summaries: [],
+    };
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "merge",
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    expect(await kv.get("mem:image-refs", "/managed/old.png")).toBeNull();
+    expect(await kv.get("mem:image-refs", "/managed/new.png")).toBe(1);
+  });
+
+  it("rebuilds graph snapshot and lookup indexes after import", async () => {
+    const node = {
+      id: "node_1",
+      type: "file",
+      name: "src/auth.ts",
+      properties: {},
+      sourceObservationIds: ["obs_1"],
+      createdAt: "2026-02-01T00:00:00Z",
+      updatedAt: "2026-02-01T00:00:00Z",
+    };
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [],
+      observations: {},
+      memories: [],
+      summaries: [],
+      graphNodes: [node as GraphNode],
+      graphEdges: [],
+    };
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "replace",
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    expect(await kv.get("mem:graph:name-index", "file|src/auth.ts")).toBe(
+      "node_1",
+    );
+    expect(await kv.get("mem:graph:snapshot", "current")).toMatchObject({
+      stats: { totalNodes: 1, totalEdges: 0 },
+    });
+  });
+
+  it("removes stale graph indexes and tombstones during merge", async () => {
+    const existingNode: GraphNode = {
+      id: "node_1",
+      type: "file",
+      name: "src/old.ts",
+      properties: {},
+      sourceObservationIds: ["obs_1"],
+      createdAt: "2026-02-01T00:00:00Z",
+      updatedAt: "2026-02-01T00:00:00Z",
+    };
+    await kv.set("mem:graph:nodes", existingNode.id, existingNode);
+    await kv.set("mem:graph:name-index", "file|src/old.ts", existingNode.id);
+    await kv.set("mem:graph:tombstones", existingNode.id, {
+      id: existingNode.id,
+      kind: "node",
+    });
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [],
+      observations: {},
+      memories: [],
+      summaries: [],
+      graphNodes: [{ ...existingNode, name: "src/new.ts" }],
+      graphEdges: [],
+    };
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "merge",
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    expect(await kv.get("mem:graph:name-index", "file|src/old.ts")).toBeNull();
+    expect(await kv.get("mem:graph:name-index", "file|src/new.ts")).toBe(
+      "node_1",
+    );
+    expect(await kv.get("mem:graph:tombstones", "node_1")).toBeNull();
   });
 });

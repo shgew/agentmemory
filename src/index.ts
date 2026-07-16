@@ -26,7 +26,13 @@ import { KV } from "./state/schema.js";
 import { VectorIndex } from "./state/vector-index.js";
 import { HybridSearch } from "./state/hybrid-search.js";
 import { IndexPersistence } from "./state/index-persistence.js";
-import { parseCron, nextCronFireMs, type CronSpec } from "./state/cron.js";
+import {
+  parseCron,
+  nextCronFireMs,
+  parseIntervalMs,
+  scheduleLongTimeout,
+  type CronSpec,
+} from "./state/cron.js";
 import { registerPrivacyFunction } from "./functions/privacy.js";
 import { registerObserveFunction } from "./functions/observe.js";
 import { registerImageQuotaCleanup } from "./functions/image-quota-cleanup.js";
@@ -595,10 +601,16 @@ async function main() {
     config.restPort,
   );
 
-  const autoForgetIntervalMs = parseInt(process.env.AUTO_FORGET_INTERVAL_MS || "3600000", 10);
-  const consolidationIntervalMs = parseInt(process.env.CONSOLIDATION_INTERVAL_MS || "7200000", 10);
+  const autoForgetIntervalMs = parseIntervalMs(
+    getEnvVar("AUTO_FORGET_INTERVAL_MS"),
+    3_600_000,
+  );
+  const consolidationIntervalMs = parseIntervalMs(
+    getEnvVar("CONSOLIDATION_INTERVAL_MS"),
+    7_200_000,
+  );
 
-  if (process.env.AUTO_FORGET_ENABLED !== "false") {
+  if (getEnvVar("AUTO_FORGET_ENABLED") !== "false") {
     const autoForgetTimer = setInterval(async () => {
       try {
         await sdk.trigger({ function_id: "mem::auto-forget", payload: { dryRun: false } });
@@ -608,7 +620,7 @@ async function main() {
     bootLog(`Auto-forget: enabled (every ${autoForgetIntervalMs / 60000}m)`);
   }
 
-  if (process.env.LESSON_DECAY_ENABLED !== "false") {
+  if (getEnvVar("LESSON_DECAY_ENABLED") !== "false") {
     const lessonDecayTimer = setInterval(async () => {
       try {
         await sdk.trigger({ function_id: "mem::lesson-decay-sweep", payload: {} });
@@ -618,7 +630,7 @@ async function main() {
     bootLog(`Lesson decay sweep: enabled (every 24h)`);
   }
 
-  if (process.env.INSIGHT_DECAY_ENABLED !== "false") {
+  if (getEnvVar("INSIGHT_DECAY_ENABLED") !== "false") {
     const insightDecayTimer = setInterval(async () => {
       try {
         await sdk.trigger({ function_id: "mem::insight-decay-sweep", payload: {} });
@@ -665,17 +677,19 @@ async function main() {
     bootLog(`Auto-consolidation: enabled (every ${consolidationIntervalMs / 60000}m)`);
   }
 
-  if (process.env.SESSION_SWEEP_ENABLED !== "false") {
-    const parsePositiveInt = (raw: string | undefined, def: number): number => {
-      const parsed = parseInt(raw || "", 10);
-      return Number.isFinite(parsed) && parsed > 0 ? parsed : def;
+  if (getEnvVar("SESSION_SWEEP_ENABLED") !== "false") {
+    const parsePositiveInteger = (raw: string | undefined, def: number): number => {
+      const value = raw?.trim();
+      if (!value || !/^\d+$/.test(value)) return def;
+      const parsed = Number(value);
+      return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : def;
     };
-    const sessionSweepMaxAgeMs = parsePositiveInt(
-      process.env.SESSION_SWEEP_MAX_AGE_MS,
+    const sessionSweepMaxAgeMs = parsePositiveInteger(
+      getEnvVar("SESSION_SWEEP_MAX_AGE_MS"),
       21600000,
     );
     const sessionSweepCronExpr =
-      process.env.SESSION_SWEEP_CRON?.trim() || "0 3 * * *";
+      getEnvVar("SESSION_SWEEP_CRON")?.trim() || "0 3 * * *";
 
     let sessionSweepCronSpec: CronSpec;
     try {
@@ -706,11 +720,11 @@ async function main() {
         );
         return null;
       }
-      const timer = setTimeout(() => {
-        void fireSessionSweep();
-        scheduleNextSessionSweep();
+      scheduleLongTimeout(() => {
+        void fireSessionSweep().finally(() => {
+          scheduleNextSessionSweep();
+        });
       }, delayMs);
-      timer.unref();
       return delayMs;
     };
 
@@ -725,26 +739,27 @@ async function main() {
 
   const idleThresholdMs = getIdleCheckpointMs();
   if (
-    process.env.AGENTMEMORY_IDLE_CHECKPOINT_ENABLED !== "false" &&
+    getEnvVar("AGENTMEMORY_IDLE_CHECKPOINT_ENABLED") !== "false" &&
     idleThresholdMs > 0
   ) {
-    const idleCheckpointPollParsed = parseInt(
-      process.env.AGENTMEMORY_IDLE_CHECKPOINT_POLL_MS || "",
-      10,
+    const idleCheckpointPollMs = parseIntervalMs(
+      getEnvVar("AGENTMEMORY_IDLE_CHECKPOINT_POLL_MS"),
+      180_000,
     );
-    const idleCheckpointPollMs =
-      Number.isFinite(idleCheckpointPollParsed) && idleCheckpointPollParsed > 0
-        ? idleCheckpointPollParsed
-        : 180_000;
-    const idleCheckpointTimer = setInterval(async () => {
+    const fireIdleCheckpoint = async (): Promise<void> => {
       try {
         await sdk.trigger({
           function_id: "mem::session-sweep",
           payload: { mode: "idle-checkpoint", maxAgeMs: idleThresholdMs },
         });
       } catch {}
-    }, idleCheckpointPollMs);
-    idleCheckpointTimer.unref();
+    };
+    const scheduleIdleCheckpoint = (): void => {
+      scheduleLongTimeout(() => {
+        void fireIdleCheckpoint().finally(scheduleIdleCheckpoint);
+      }, idleCheckpointPollMs);
+    };
+    scheduleIdleCheckpoint();
     bootLog(
       `Idle-checkpoint poll: enabled (every ${idleCheckpointPollMs / 60000}m, idle threshold ${idleThresholdMs / 60000}m)`,
     );

@@ -46,8 +46,14 @@ type QuestionOptionPayload = { label?: unknown; description?: unknown };
 type QuestionPayload = { question?: unknown; header?: unknown; options?: readonly QuestionOptionPayload[] };
 type QuestionToolPayload = { callID?: string; messageID?: string };
 const API = env.AGENTMEMORY_URL || "http://localhost:3111";
-const FILE_TOOLS = new Set(["Read", "Write", "Edit", "Glob", "Grep"]);
-const FILE_KEYS = ["filePath", "file_path", "path", "file", "pattern"];
+const FILE_TOOLS = new Set(["read", "write", "edit", "glob", "grep"]);
+const FILE_PATH_KEYS: Record<string, readonly string[]> = {
+  read: ["filePath", "file_path", "path", "file"],
+  write: ["filePath", "file_path", "path", "file"],
+  edit: ["filePath", "file_path", "path", "file"],
+  glob: ["path"],
+  grep: ["path"],
+};
 const MAX_STASHED_FILES = 20;
 
 const DEBUG = env.OPENCODE_AGENTMEMORY_DEBUG === "1";
@@ -64,12 +70,8 @@ const LOOPBACK_HOSTS = new Set([
   "[::1]",
 ]);
 
-// Git commit-link helpers. INLINED here (not split into a sibling module) and
-// they MUST stay module-private / non-exported: OpenCode's legacy plugin loader
-// invokes every runtime export of a plugin file as a plugin factory, so a second
-// export crashes the host (CHANGELOG 0.9.27 incident #2). Inlining also keeps this
-// plugin a single standalone file that `agentmemory connect opencode --with-plugin`
-// (and the manual `cp` docs / nix) can copy alone into ~/.config/opencode/plugins/.
+// OpenCode invokes every runtime export as a plugin factory, so these helpers
+// must stay private and inline in the single installed plugin file.
 type GitCommitMetadata = {
   readonly sha: string;
   readonly branch?: string;
@@ -216,99 +218,6 @@ async function postJson<T = unknown>(path: string, body: Record<string, unknown>
   }
 }
 
-async function observe(
-  sessionId: string,
-  hookType: string,
-  data: Record<string, unknown>,
-): Promise<void> {
-  await post("/observe", {
-    hookType,
-    sessionId,
-    project: projectPath,
-    cwd: projectPath,
-    timestamp: new Date().toISOString(),
-    data,
-  });
-}
-
-let activeSessionId: string | null = null;
-let pendingConfig: Record<string, unknown> | null = null;
-let projectPath: string | null = null;
-let sessionCwd = process.cwd();
-const stashedFiles = new Map<string, Set<string>>();
-const seenSubtaskIds = new Map<string, Set<string>>();
-const seenToolCallIds = new Map<string, Set<string>>();
-const contextInjectedSessions = new Set<string>();
-const startContextCache = new Map<string, string>();
-const lastSeenHeads = new Map<string, string>();
-const commitCheckChains = new Map<string, Promise<void>>();
-
-function seedSessionHead(sessionId: string): void {
-  const head = tryGit(sessionCwd, ["rev-parse", "HEAD"]);
-  if (head) lastSeenHeads.set(sessionId, head);
-  else lastSeenHeads.delete(sessionId);
-}
-
-async function linkCommitIfHeadChanged(sessionId: string): Promise<void> {
-  const head = tryGit(sessionCwd, ["rev-parse", "HEAD"]);
-  if (!head) return;
-
-  const previousHead = lastSeenHeads.get(sessionId);
-  if (!previousHead) {
-    lastSeenHeads.set(sessionId, head);
-    return;
-  }
-  if (head === previousHead) return;
-
-  const metadata = collectGitCommitMetadata(sessionCwd, head);
-  // Metadata collection failed (transient git error): leave the cursor so the next
-  // tool completion retries rather than permanently skipping this commit.
-  if (!metadata) return;
-  // Only advance the cursor when the POST landed. A transient network/5xx failure
-  // leaves lastSeenHeads unchanged so the next tool completion retries the link.
-  const posted = await postOk("/session/commit", { ...metadata, sessionId });
-  if (posted) lastSeenHeads.set(sessionId, head);
-}
-
-function enqueueCommitCheck(sessionId: string): Promise<void> {
-  const previous = commitCheckChains.get(sessionId) ?? Promise.resolve();
-  const next = previous.then(() => linkCommitIfHeadChanged(sessionId)).finally(() => {
-    if (commitCheckChains.get(sessionId) === next) commitCheckChains.delete(sessionId);
-  });
-  commitCheckChains.set(sessionId, next);
-  return next;
-}
-
-function stashFor(sid: string): Set<string> {
-  let s = stashedFiles.get(sid);
-  if (!s) { s = new Set<string>(); stashedFiles.set(sid, s); }
-  return s;
-}
-
-function addToStash(sid: string, file: string | null | undefined): void {
-  if (typeof file !== "string" || file.length === 0) return;
-  const stash = stashFor(sid);
-  stash.add(file);
-  if (stash.size > MAX_STASHED_FILES) {
-    const keep = [...stash].slice(-MAX_STASHED_FILES);
-    stash.clear();
-    for (const f of keep) stash.add(f);
-  }
-}
-
-function subtaskSetFor(sid: string): Set<string> {
-  let s = seenSubtaskIds.get(sid);
-  if (!s) { s = new Set<string>(); seenSubtaskIds.set(sid, s); }
-  return s;
-}
-
-function toolCallSetFor(sid: string): Set<string> {
-  let s = seenToolCallIds.get(sid);
-  if (!s) { s = new Set<string>(); seenToolCallIds.set(sid, s); }
-  return s;
-}
-
-
 function safeSlice(v: unknown, max: number): string {
   if (typeof v === "string") return v.slice(0, max);
   if (v == null) return "";
@@ -391,11 +300,11 @@ function sanitizeOutput(v: unknown): unknown {
   const seen = new WeakSet<object>();
   let nodes = 0;
   const walk = (value: unknown, depth: number): unknown => {
-    if (++nodes > MAX_NODES) return value;
+    if (++nodes > MAX_NODES) return "<truncated:max-nodes>";
     if (typeof value === "string") return stripBlob(value);
     if (value == null) return value;
     if (typeof value !== "object") return value;
-    if (depth >= MAX_DEPTH) return value;
+    if (depth >= MAX_DEPTH) return "<truncated:max-depth>";
     if (seen.has(value as object)) return "<circular>";
     seen.add(value as object);
     if (Array.isArray(value)) {
@@ -424,9 +333,9 @@ function assertHttpsOrLoopback(): void {
   }
 }
 
-function extractFilePaths(args: Record<string, unknown>): string[] {
+function extractFilePaths(tool: string, args: Record<string, unknown>): string[] {
   const files: string[] = [];
-  for (const key of FILE_KEYS) {
+  for (const key of FILE_PATH_KEYS[tool] ?? []) {
     const val = args[key];
     if (typeof val === "string" && val.length > 0) {
       files.push(val);
@@ -451,8 +360,106 @@ function extractErrorMessage(err: unknown): string {
 }
 
 export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
-  sessionCwd = pluginInput?.directory || process.cwd();
-  projectPath = resolveProject();
+  const sessionCwd = pluginInput?.directory || process.cwd();
+  const projectPath = resolveProject(sessionCwd);
+  let activeSessionId: string | null = null;
+  let pendingConfig: Record<string, unknown> | null = null;
+  const stashedFiles = new Map<string, Set<string>>();
+  const seenSubtaskIds = new Map<string, Set<string>>();
+  const seenToolCallIds = new Map<string, Set<string>>();
+  const contextInjectedSessions = new Set<string>();
+  const startContextCache = new Map<string, string>();
+  const lastSeenHeads = new Map<string, string>();
+  const commitCheckChains = new Map<string, Promise<void>>();
+
+  async function observe(
+    sessionId: string,
+    hookType: string,
+    data: Record<string, unknown>,
+  ): Promise<void> {
+    await post("/observe", {
+      hookType,
+      sessionId,
+      project: projectPath,
+      cwd: sessionCwd,
+      timestamp: new Date().toISOString(),
+      data,
+    });
+  }
+
+  function seedSessionHead(sessionId: string): void {
+    const head = tryGit(sessionCwd, ["rev-parse", "HEAD"]);
+    if (head) lastSeenHeads.set(sessionId, head);
+    else lastSeenHeads.delete(sessionId);
+  }
+
+  async function linkCommitIfHeadChanged(sessionId: string): Promise<void> {
+    const head = tryGit(sessionCwd, ["rev-parse", "HEAD"]);
+    if (!head) return;
+
+    const previousHead = lastSeenHeads.get(sessionId);
+    if (!previousHead) {
+      lastSeenHeads.set(sessionId, head);
+      return;
+    }
+    if (head === previousHead) return;
+
+    const metadata = collectGitCommitMetadata(sessionCwd, head);
+    // Metadata collection failed (transient git error): leave the cursor so the next
+    // tool completion retries rather than permanently skipping this commit.
+    if (!metadata) return;
+    // Only advance the cursor when the POST landed. A transient network/5xx failure
+    // leaves lastSeenHeads unchanged so the next tool completion retries the link.
+    const posted = await postOk("/session/commit", { ...metadata, sessionId });
+    if (posted) lastSeenHeads.set(sessionId, head);
+  }
+
+  function enqueueCommitCheck(sessionId: string): Promise<void> {
+    const previous = commitCheckChains.get(sessionId) ?? Promise.resolve();
+    const next = previous.then(() => linkCommitIfHeadChanged(sessionId)).finally(() => {
+      if (commitCheckChains.get(sessionId) === next) commitCheckChains.delete(sessionId);
+    });
+    commitCheckChains.set(sessionId, next);
+    return next;
+  }
+
+  function stashFor(sid: string): Set<string> {
+    let stash = stashedFiles.get(sid);
+    if (!stash) {
+      stash = new Set<string>();
+      stashedFiles.set(sid, stash);
+    }
+    return stash;
+  }
+
+  function addToStash(sid: string, file: string | null | undefined): void {
+    if (typeof file !== "string" || file.length === 0) return;
+    const stash = stashFor(sid);
+    stash.add(file);
+    if (stash.size > MAX_STASHED_FILES) {
+      const keep = [...stash].slice(-MAX_STASHED_FILES);
+      stash.clear();
+      for (const keptFile of keep) stash.add(keptFile);
+    }
+  }
+
+  function subtaskSetFor(sid: string): Set<string> {
+    let ids = seenSubtaskIds.get(sid);
+    if (!ids) {
+      ids = new Set<string>();
+      seenSubtaskIds.set(sid, ids);
+    }
+    return ids;
+  }
+
+  function toolCallSetFor(sid: string): Set<string> {
+    let ids = seenToolCallIds.get(sid);
+    if (!ids) {
+      ids = new Set<string>();
+      seenToolCallIds.set(sid, ids);
+    }
+    return ids;
+  }
 
   assertHttpsOrLoopback();
 
@@ -486,7 +493,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
           parentID: info?.parentID ?? null,
           version: info?.version ?? null,
           project: projectPath,
-          cwd: projectPath,
+          cwd: sessionCwd,
         });
         const startCtx = startResult?.context;
         if (typeof startCtx === "string" && startCtx.length > 0) {
@@ -544,7 +551,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
             title: info?.title ?? null,
             parentID: info?.parentID ?? null,
             project: projectPath,
-            cwd: projectPath,
+            cwd: sessionCwd,
             resumed: true,
           });
           const resumeCtx = resumeResult?.context;
@@ -660,7 +667,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         }
       }
 
-      // ── message.part.removed ──
       if (event.type === "message.part.removed") {
         const sid = event.properties.sessionID ?? activeSessionId;
         if (sid) {
@@ -741,6 +747,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         if (part.type === "step-finish") {
           await observe(sid, "step_finish", {
             messageID: part.messageID,
+            partID: part.id,
             reason: part.reason ?? null,
             cost: part.cost ?? 0,
             input_tokens: part.tokens?.input ?? 0,
@@ -753,6 +760,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         if (part.type === "reasoning") {
           await observe(sid, "reasoning", {
             messageID: part.messageID,
+            partID: part.id,
             text: safeSlice(part.text, 4000),
           });
           return;
@@ -767,6 +775,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         if (part.type === "patch") {
           await observe(sid, "patch_applied", {
             messageID: part.messageID,
+            partID: part.id,
             hash: part.hash,
             files: part.files || [],
           });
@@ -776,6 +785,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         if (part.type === "compaction") {
           await observe(sid, "compaction_event", {
             messageID: part.messageID,
+            partID: part.id,
             auto: part.auto ?? false,
           });
           return;
@@ -784,6 +794,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         if (part.type === "agent") {
           await observe(sid, "agent_selected", {
             messageID: part.messageID,
+            partID: part.id,
             name: part.name,
           });
           return;
@@ -792,6 +803,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         if (part.type === "retry") {
           await observe(sid, "retry_attempt", {
             messageID: part.messageID,
+            partID: part.id,
             attempt: part.attempt,
             error: safeSlice(part.error, 2000),
           });
@@ -807,7 +819,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         }
       }
 
-      // ── file.watcher.updated ── (external fs change)
       if (event.type === "file.watcher.updated") {
         const sid = activeSessionId;
         if (sid && typeof event.properties.file === "string" && event.properties.file.length > 0) {
@@ -834,7 +845,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         });
       }
 
-      // ── permission.asked ── (v2 SDK bus event shape)
       if (event.type === "permission.asked") {
         const sid = event.properties.sessionID ?? activeSessionId;
         if (!sid) return;
@@ -850,7 +860,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         });
       }
 
-      // ── permission.v2.asked ──
       if (event.type === "permission.v2.asked") {
         const sid = event.properties.sessionID ?? activeSessionId;
         if (!sid) return;
@@ -863,7 +872,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         });
       }
 
-      // ── permission.v2.replied ──
       if (event.type === "permission.v2.replied") {
         const sid = event.properties.sessionID ?? activeSessionId;
         if (!sid) return;
@@ -903,7 +911,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         });
       }
 
-      // ── vcs.branch.updated ── (git branch switch context)
       if (event.type === "vcs.branch.updated") {
         const sid = activeSessionId;
         if (sid) {
@@ -913,7 +920,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         }
       }
 
-      // ── command.executed ──
       if (event.type === "command.executed") {
         const sid = event.properties.sessionID ?? activeSessionId;
         if (sid) {
@@ -1055,6 +1061,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
       const userText = textParts.map((p) => p.text || "").join("\n");
 
       await observe(sid, "prompt_submit", {
+        message_id: input.messageID ?? output.message?.id ?? null,
         agent: input.agent ?? null,
         model: input.model ?? null,
         variant: input.variant ?? null,
@@ -1084,17 +1091,17 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
 
     // ── tool.execute.before ──
     "tool.execute.before": async (input, output) => {
-      if (!FILE_TOOLS.has(input.tool)) return;
+      const tool = input.tool.toLowerCase();
+      if (!FILE_TOOLS.has(tool)) return;
       const sid = input.sessionID || activeSessionId;
       if (!sid) return;
       const args = output.args as Record<string, unknown> | undefined;
       if (!args) return;
-      for (const fp of extractFilePaths(args)) {
+      for (const fp of extractFilePaths(tool, args)) {
         addToStash(sid, fp);
       }
     },
 
-    // ── tool.execute.after ──
     "tool.execute.after": async (input, output) => {
       const sid = input.sessionID || activeSessionId;
       if (!sid) return;
@@ -1125,19 +1132,21 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
       if (!contextInjectedSessions.has(sid)) {
         if (!Array.isArray(output.system)) return;
         let ctx = startContextCache.get(sid);
+        let contextLoaded = typeof ctx === "string" && ctx.length > 0;
         if (typeof ctx !== "string" || ctx.length === 0) {
           const result: ContextResponse | null = await postJson("/context", {
             sessionId: sid,
             project: projectPath,
           });
           ctx = result?.context;
+          contextLoaded = result !== null;
         } else {
           startContextCache.delete(sid);
         }
         if (typeof ctx === "string" && ctx.length > 0) {
           output.system.push(ctx);
         }
-        contextInjectedSessions.add(sid);
+        if (contextLoaded) contextInjectedSessions.add(sid);
       }
 
       const stash = stashFor(sid);
@@ -1161,7 +1170,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
       }
     },
 
-    // ── experimental.chat.messages.transform ──
     // SDK shape: input is {}, output has messages[]. No sessionID on input;
     // observe against activeSessionId when present.
     "experimental.chat.messages.transform": async (_input, output) => {
@@ -1203,7 +1211,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
       });
     },
 
-    // ── command.execute.before ──
     // SDK shape: input has {command, sessionID, arguments}, output has {parts}.
     "command.execute.before": async (input, _output) => {
       const sid = input.sessionID || activeSessionId;
@@ -1214,7 +1221,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
       });
     },
 
-    // ── dispose ──
     // Fires on plugin reload, NOT on session end. The OpenCode session
     // is still alive; resetting in-process state is the entire contract.
     // Posting /session/end here would mark a live session as completed

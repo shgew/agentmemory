@@ -1,5 +1,15 @@
-import { describe, it, expect } from "vitest";
-import { parseCron, nextCronFireMs } from "../src/state/cron.js";
+import { afterEach, describe, it, expect, vi } from "vitest";
+import {
+  MAX_TIMEOUT_MS,
+  parseIntervalMs,
+  parseCron,
+  nextCronFireMs,
+  scheduleLongTimeout,
+} from "../src/state/cron.js";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("parseCron", () => {
   it("parses '0 3 * * *' (3 AM daily)", () => {
@@ -113,4 +123,41 @@ describe("nextCronFireMs", () => {
     const spec = parseCron("0 0 31 2 *");
     expect(() => nextCronFireMs(spec)).toThrow(/no match within one year/);
   });
+});
+
+describe("scheduleLongTimeout", () => {
+  it("does not fire early when delay exceeds Node's timer ceiling", async () => {
+    vi.useFakeTimers();
+    const callback = vi.fn();
+
+    scheduleLongTimeout(callback, MAX_TIMEOUT_MS + 5_000);
+    await vi.advanceTimersByTimeAsync(MAX_TIMEOUT_MS);
+    expect(callback).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(callback).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(callback).toHaveBeenCalledOnce();
+  });
+
+  it.each([Number.NaN, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects unsafe delay %s",
+    (delayMs) => {
+      expect(() => scheduleLongTimeout(() => {}, delayMs)).toThrow(
+        /non-negative safe integer/,
+      );
+    },
+  );
+});
+
+describe("parseIntervalMs", () => {
+  it("accepts positive bounded integers", () => {
+    expect(parseIntervalMs(" 60000 ", 1000)).toBe(60_000);
+  });
+
+  it.each([undefined, "", "0", "-1", "1ms", "1.5", String(MAX_TIMEOUT_MS + 1)])(
+    "falls back for malformed or unsafe interval %s",
+    (raw) => {
+      expect(parseIntervalMs(raw, 1000)).toBe(1000);
+    },
+  );
 });

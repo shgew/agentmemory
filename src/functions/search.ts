@@ -11,10 +11,20 @@ import { recordAccessBatch } from './access-tracker.js'
 import { recordAudit } from './audit.js'
 import { logger } from "../logger.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
+import {
+  clipEmbedInput,
+  getRebuildEmbedBatchSize,
+} from "../state/embedding-input.js";
+
+export { clipEmbedInput } from "../state/embedding-input.js";
 
 let index: SearchIndex | null = null
 let vectorIndex: VectorIndex | null = null
 let currentEmbeddingProvider: EmbeddingProvider | null = null
+type VectorMutation =
+  | { type: "add"; id: string; sessionId: string; embedding: Float32Array }
+  | { type: "remove"; id: string }
+let activeVectorMutationJournal: VectorMutation[] | null = null
 
 export function getSearchIndex(): SearchIndex {
   if (!index) index = new SearchIndex()
@@ -39,6 +49,22 @@ export function getEmbeddingProvider(): EmbeddingProvider | null {
 
 export function vectorIndexRemove(id: string): void {
   vectorIndex?.remove(id);
+  activeVectorMutationJournal?.push({ type: "remove", id });
+}
+
+function addVector(
+  target: VectorIndex,
+  id: string,
+  sessionId: string,
+  embedding: Float32Array,
+): void {
+  target.add(id, sessionId, embedding)
+  activeVectorMutationJournal?.push({
+    type: "add",
+    id,
+    sessionId,
+    embedding: new Float32Array(embedding),
+  })
 }
 
 // Persistence sync hook. Without this, index removals only live in
@@ -75,17 +101,6 @@ export async function flushIndexSave(): Promise<void> {
   await indexPersistence?.save();
 }
 
-// Hard cap on embedding input length. Most providers cap input around
-// 8k tokens (~32k chars at ~4 chars/token). Truncate defensively so a
-// huge memory.content can't 400 the embed call or blow context budget
-// on a single doc. 16k chars ≈ 4k tokens, safely under every provider.
-const EMBED_MAX_CHARS = 16_000
-
-export function clipEmbedInput(text: string): string {
-  if (text.length <= EMBED_MAX_CHARS) return text
-  return text.slice(0, EMBED_MAX_CHARS)
-}
-
 // Single guarded vector-index write. Returns true on success. Logs and
 // no-ops on:
 //   - dimension mismatch (mis-configured provider would silently corrupt
@@ -114,7 +129,7 @@ export async function vectorIndexAddGuarded(
       })
       return false
     }
-    vi.add(id, sessionId, embedding)
+    addVector(vi, id, sessionId, embedding)
     return true
   } catch (err) {
     logger.warn("vector-index add: embed failed — skipping", {
@@ -190,7 +205,7 @@ export async function vectorIndexAddBatchGuarded(
       continue
     }
     try {
-      vi.add(item.id, item.sessionId, embedding)
+      addVector(vi, item.id, item.sessionId, embedding)
       ok++
     } catch (err) {
       logger.warn("vector-index add batch: index write failed — skipping item", {
@@ -204,23 +219,10 @@ export async function vectorIndexAddBatchGuarded(
   return { ok, fail }
 }
 
-// Embed-batch size for rebuild. Each item is one /v1/embeddings call's
-// `input` array element; the provider sees the whole batch as one HTTP
-// round-trip. 32 fits comfortably under typical per-request token budgets
-// (32 × ~110 tok/item ≈ 3.5k tokens) and gets close to per-call
-// throughput for GPU-backed endpoints (vLLM, Triton, etc.). Override via
-// REBUILD_EMBED_BATCH_SIZE for endpoints that prefer smaller/larger
-// batches. Set to 1 to fall back to the legacy per-item path.
-const DEFAULT_REBUILD_EMBED_BATCH = 32
-
-function getRebuildEmbedBatchSize(): number {
-  const raw = process.env.REBUILD_EMBED_BATCH_SIZE
-  if (!raw) return DEFAULT_REBUILD_EMBED_BATCH
-  const n = parseInt(raw, 10)
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_REBUILD_EMBED_BATCH
-}
-
-export async function rebuildIndex(kv: StateKV): Promise<number> {
+export async function rebuildIndex(
+  kv: StateKV,
+  options: { strict?: boolean } = {},
+): Promise<number> {
   const idx = getSearchIndex()
   idx.clear()
 
@@ -271,6 +273,7 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
       count++
     }
   } catch (err) {
+    if (options.strict) throw err
     logger.warn('rebuildIndex: failed to load memories', {
       error: err instanceof Error ? err.message : String(err),
     })
@@ -290,7 +293,8 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
       chunk.map(async (s) => {
         try {
           return await kv.list<CompressedObservation>(KV.observations(s.id))
-        } catch {
+        } catch (err) {
+          if (options.strict) throw err
           failedSessions.push(s.id)
           return [] as CompressedObservation[]
         }
@@ -371,30 +375,65 @@ export async function reindexVectors(kv: StateKV): Promise<{
       error: 'vector index not initialized',
     }
   }
-  const { index, ...stats } = await migrateVectorIndex(kv, ep)
-  let swapped = false
-  if (stats.success) {
-    vi.restoreFrom(index)
-    swapped = true
-    try {
-      await flushIndexSave()
-    } catch (err) {
+  if (activeVectorMutationJournal) {
+    return {
+      success: false,
+      swapped: false,
+      totalProcessed: 0,
+      failed: 0,
+      vectorSize: vi.size,
+      failedSessions: [],
+      provider: ep.name,
+      dimensions: ep.dimensions,
+      error: 'vector reindex already in progress',
+    }
+  }
+
+  const journal: VectorMutation[] = []
+  activeVectorMutationJournal = journal
+  try {
+    const { index, ...stats } = await migrateVectorIndex(kv, ep)
+    if (!stats.success) {
+      return { ...stats, swapped: false, provider: ep.name, dimensions: ep.dimensions }
+    }
+    if (currentEmbeddingProvider !== ep || vectorIndex !== vi) {
       return {
         ...stats,
         success: false,
-        swapped,
+        swapped: false,
         provider: ep.name,
         dimensions: ep.dimensions,
-        error: `index swapped but persistence failed: ${err instanceof Error ? err.message : String(err)}`,
+        error: 'embedding provider or vector index changed during reindex',
       }
     }
+
+    activeVectorMutationJournal = null
+    vi.restoreFrom(index)
+    for (const mutation of journal) {
+      if (mutation.type === "remove") {
+        vi.remove(mutation.id)
+      } else {
+        vi.add(mutation.id, mutation.sessionId, mutation.embedding)
+      }
+    }
+    await flushIndexSave()
     await recordAudit(kv, 'vector_index_swap', 'mem::reindex-vectors', [ep.name], {
       provider: ep.name,
       dimensions: ep.dimensions,
       totalProcessed: stats.totalProcessed,
     })
+    return {
+      ...stats,
+      swapped: true,
+      vectorSize: vi.size,
+      provider: ep.name,
+      dimensions: ep.dimensions,
+    }
+  } finally {
+    if (activeVectorMutationJournal === journal) {
+      activeVectorMutationJournal = null
+    }
   }
-  return { ...stats, swapped, provider: ep.name, dimensions: ep.dimensions }
 }
 
 export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {

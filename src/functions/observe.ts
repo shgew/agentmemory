@@ -1,14 +1,13 @@
 import { TriggerAction, type ISdk } from "iii-sdk";
-import type { RawObservation, HookPayload } from "../types.js";
+import type { RawObservation, HookPayload, Session } from "../types.js";
 import { KV, STREAM, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { stripPrivateData } from "./privacy.js";
 import { DedupMap } from "./dedup.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import { isAutoCompressEnabled } from "../config.js";
+import { getAgentId, getEnvVar, isAutoCompressEnabled } from "../config.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
 import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
-import { getAgentId } from "../config.js";
 import { isAfter } from "../state/timestamp-compare.js";
 import { logger } from "../logger.js";
 import { saveImageToDisk } from "../utils/image-store.js";
@@ -24,6 +23,54 @@ const NOISE_HOOK_TYPES = new Set([
 ]);
 const STEP_FINISH_SAMPLE_EVERY = 20;
 let stepFinishCaptureCount = 0;
+
+const EVENT_IDENTITY_KEYS = [
+  "event_id",
+  "call_id",
+  "tool_use_id",
+  "subtask_id",
+  "question_id",
+  "request_id",
+  "permission_id",
+  "pty_id",
+  "messageID",
+  "message_id",
+  "partID",
+  "part_id",
+  "tool_call_id",
+] as const;
+
+function eventIdentity(data: unknown): Record<string, string | number> | null {
+  if (typeof data !== "object" || data === null) return null;
+  const record = data as Record<string, unknown>;
+  const identity: Record<string, string | number> = {};
+  for (const key of EVENT_IDENTITY_KEYS) {
+    const value = record[key];
+    if (
+      (typeof value === "string" && value.length > 0) ||
+      typeof value === "number"
+    ) {
+      identity[key] = value;
+    }
+  }
+  return Object.keys(identity).length > 0 ? identity : null;
+}
+
+function sessionIdentityError(
+  session: Pick<Session, "project" | "agentId">,
+  payload: HookPayload,
+): string | null {
+  const project =
+    typeof payload.project === "string" ? payload.project.trim() : "";
+  if (project && project !== session.project) {
+    return "observation project does not match session";
+  }
+  const agentId = getAgentId();
+  if (session.agentId && agentId && session.agentId !== agentId) {
+    return "observation agent does not match session";
+  }
+  return null;
+}
 
 export function extractImage(d: unknown): string | undefined {
   if (!d) return undefined;
@@ -109,8 +156,10 @@ export function registerObserveFunction(
 
       if (NOISE_HOOK_TYPES.has(payload.hookType)) {
         return withKeyedLock(`obs:${payload.sessionId}`, async () => {
-          const session = await kv.get(KV.sessions, payload.sessionId);
+          const session = await kv.get<Session>(KV.sessions, payload.sessionId);
           if (session) {
+            const identityError = sessionIdentityError(session, payload);
+            if (identityError) return { success: false, error: identityError };
             await kv.update(KV.sessions, payload.sessionId, [
               {
                 type: "set",
@@ -132,18 +181,16 @@ export function registerObserveFunction(
 
       let dedupHash: string | undefined;
       if (dedupMap) {
-        const d =
-          typeof payload.data === "object" && payload.data !== null
-            ? (payload.data as Record<string, unknown>)
-            : {};
-        const toolName = (d["tool_name"] as string) || payload.hookType;
-        dedupHash = dedupMap.computeHash(
-          payload.sessionId,
-          toolName,
-          d["tool_input"],
-        );
-        if (dedupMap.isDuplicate(dedupHash)) {
-          return { deduplicated: true, sessionId: payload.sessionId };
+        const identity = eventIdentity(payload.data);
+        if (identity) {
+          dedupHash = dedupMap.computeHash(
+            payload.sessionId,
+            payload.hookType,
+            identity,
+          );
+          if (dedupMap.isDuplicate(dedupHash)) {
+            return { deduplicated: true, sessionId: payload.sessionId };
+          }
         }
       }
 
@@ -198,14 +245,14 @@ export function registerObserveFunction(
         // (even when undefined) and the observation-count cap. Env AGENT_ID
         // only applies when no row exists yet; otherwise an unscoped session
         // would get retroactively scoped by a later AGENT_ID export.
-        const existingSession = await kv.get<{
-          agentId?: string;
-          observationCount?: number;
-          firstPrompt?: string;
-          status?: string;
-          endedAt?: string;
-          lastCheckpointAt?: string;
-        }>(KV.sessions, payload.sessionId);
+        const existingSession = await kv.get<Session>(
+          KV.sessions,
+          payload.sessionId,
+        );
+        if (existingSession) {
+          const identityError = sessionIdentityError(existingSession, payload);
+          if (identityError) return { success: false, error: identityError };
+        }
 
         // Soft lifetime cap via the maintained observationCount (O(1)) instead
         // of listing all stored observations (O(n)). Reaching the cap is an
@@ -241,7 +288,7 @@ export function registerObserveFunction(
             payload: { deltaBytes: bytesWritten },
             action: TriggerAction.Void(),
           });
-          if (process.env["AGENTMEMORY_IMAGE_EMBEDDINGS"] === "true") {
+          if (getEnvVar("AGENTMEMORY_IMAGE_EMBEDDINGS") === "true") {
             sdk.trigger({
               function_id: "mem::vision-embed",
               payload: {

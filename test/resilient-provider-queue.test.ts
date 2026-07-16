@@ -98,4 +98,28 @@ describe("ResilientProvider LLM queue", () => {
     );
     expect(Date.now() - startedAt).toBeLessThan(500);
   });
+
+  it("times out queued callers without invoking the provider", async () => {
+    process.env.AGENTMEMORY_LLM_TIMEOUT_MS = "50";
+    const { ResilientProvider } = await import("../src/providers/resilient.js");
+    let calls = 0;
+    const inner: MemoryProvider = {
+      name: "inner",
+      async compress() {
+        calls++;
+        return new Promise<string>(() => {});
+      },
+      async summarize() {
+        return "ok";
+      },
+    };
+    const provider = new ResilientProvider(inner);
+
+    const first = provider.compress("s", "first");
+    const second = provider.compress("s", "second");
+
+    await expect(second).rejects.toThrow(/total timeout/);
+    await expect(first).rejects.toThrow(/total timeout/);
+    expect(calls).toBe(1);
+  });
 });

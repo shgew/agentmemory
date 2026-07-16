@@ -39,7 +39,17 @@ function wireContext(kv: ReturnType<typeof mockKV>, budget = 4000) {
   } as unknown as import("iii-sdk").ISdk;
   registerContextFunction(sdk, kv as never, budget);
   if (!handler) throw new Error("mem::context not registered");
-  return handler;
+  return async (data: Parameters<ContextHandler>[0]) => {
+    await kv.set(KV.sessions, data.sessionId, {
+      id: data.sessionId,
+      project: data.project,
+      cwd: data.project,
+      startedAt: new Date().toISOString(),
+      status: "active",
+      observationCount: 0,
+    });
+    return handler(data);
+  };
 }
 
 function makeLesson(over: Partial<Lesson> = {}): Lesson {
@@ -73,7 +83,7 @@ async function seedLesson(
   return lesson;
 }
 
-describe("mem::context — lessons auto-injection (#457)", () => {
+describe("mem::context lesson injection", () => {
   let kv: ReturnType<typeof mockKV>;
   let handler: ContextHandler;
 
@@ -247,7 +257,7 @@ describe("mem::context — lessons auto-injection (#457)", () => {
     });
 
     expect(result.context).toContain(
-      "use TaskCreate for >5-file work — when working on multi-file refactors",
+      "use TaskCreate for >5-file work: when working on multi-file refactors",
     );
   });
 });

@@ -78,13 +78,6 @@ export function resetFollowupStatsForTests(): void {
   followupStats.agentInitiatedSearches = 0;
 }
 
-// Task 16 Item 4: retrieval-outcome telemetry mirror.
-// expandCallsWithSession is the denominator (expand calls carrying a
-// session anchor); resultsExpandedFromPriorSearch is the numerator
-// (expands that referenced at least one obsId a recent prior search
-// returned). The OTEL counter smartSearchResultExpanded is the
-// canonical export; this in-process mirror backs the diagnostic
-// readback + tests.
 const expandStats = {
   expandCallsWithSession: 0,
   resultsExpandedFromPriorSearch: 0,
@@ -162,6 +155,10 @@ export function registerSmartSearchFunction(
       const filterAgentId = wildcardAgent
         ? undefined
         : explicitAgentId ?? envAgentId;
+      const projectFilter =
+        typeof data.project === "string" && data.project.trim().length > 0
+          ? data.project.trim()
+          : undefined;
       if (
         isolated &&
         !wildcardAgent &&
@@ -203,31 +200,40 @@ export function registerSmartSearchFunction(
           if (r) expanded.push(r);
         }
 
-        const scoped = filterAgentId
+        const agentScoped = filterAgentId
           ? expanded.filter((e) => e.observation.agentId === filterAgentId)
           : expanded;
+        const scoped = projectFilter
+          ? await filterByProject(
+              kv,
+              agentScoped,
+              projectFilter,
+              (entry) => entry.observation,
+              (entry) => entry.sessionId,
+            )
+          : agentScoped;
 
         void recordAccessBatch(
           kv,
           scoped.map((e) => e.observation.id),
         );
 
-        // Task 16 Item 4: retrieval-outcome telemetry. Best-effort and
-        // fire-and-forget — must never block or throw on the expand
-        // response path. When this expand references obsIds a PRIOR
-        // search in the same session returned, record that the earlier
-        // result set was actually used (expanded / read).
+        // Telemetry stays off the response path and cannot block expansion.
         if (
           data.sessionId &&
           typeof data.sessionId === "string" &&
           data.source !== "viewer"
         ) {
           const sessionIdForExpand = data.sessionId;
-          const expandedObsIds = items.map((i) => i.obsId);
-          const detection = detectExpandOutcome(
-            kv,
-            sessionIdForExpand,
-            expandedObsIds,
+          const expandedObsIds = scoped.map((entry) => entry.obsId);
+          const detection = withKeyedLock(
+            `recent-searches:${sessionIdForExpand}`,
+            () =>
+              detectExpandOutcome(
+                kv,
+                sessionIdForExpand,
+                expandedObsIds,
+              ),
           )
             .catch((err) => {
               logger.warn(
@@ -285,10 +291,6 @@ export function registerSmartSearchFunction(
       // is a defensible middle ground: enough headroom for a small
       // workload, capped at 300 so a 100-limit request never asks for
       // thousands of hits.
-      const projectFilter =
-        typeof data.project === "string" && data.project.trim().length > 0
-          ? data.project.trim()
-          : undefined;
       const overFetchLimit =
         filterAgentId || projectFilter ? Math.min(limit * 3, 300) : limit;
 
@@ -316,33 +318,13 @@ export function registerSmartSearchFunction(
       let projectScoped = agentScoped;
       if (projectFilter) {
         const projectResolutionStartedAt = timings ? performance.now() : 0;
-        const uniqueSessionIds = [
-          ...new Set(agentScoped.map((r) => r.sessionId)),
-        ];
-        const sessionProjects = new Map<string, string | null>();
-        await Promise.all(
-          uniqueSessionIds.map(async (sid) => {
-            const s = await kv
-              .get<Session>(KV.sessions, sid)
-              .catch(() => null);
-            sessionProjects.set(sid, s?.project ?? null);
-          }),
+        projectScoped = await filterByProject(
+          kv,
+          agentScoped,
+          projectFilter,
+          (result) => result.observation,
+          (result) => result.sessionId,
         );
-        const resolved = await Promise.all(
-          agentScoped.map(async (r) => {
-            const sessionProject = sessionProjects.get(r.sessionId) ?? null;
-            if (sessionProject !== null) return { r, project: sessionProject };
-            const mem = await kv
-              .get<Memory>(KV.memories, r.observation.id)
-              .catch(() => null);
-            return { r, project: mem?.project ?? null };
-          }),
-        );
-        projectScoped = resolved
-          .filter(
-            ({ project }) => project === null || project === projectFilter,
-          )
-          .map(({ r }) => r);
         if (timings) {
           timings.projectResolutionMs =
             performance.now() - projectResolutionStartedAt;
@@ -438,6 +420,59 @@ export function registerSmartSearchFunction(
   );
 }
 
+async function filterByProject<T>(
+  kv: StateKV,
+  rows: T[],
+  project: string,
+  observation: (row: T) => CompressedObservation,
+  sessionId: (row: T) => string,
+): Promise<T[]> {
+  const sessionProjects = new Map<string, Promise<string | null>>();
+  const memoryProjects = new Map<string, Promise<string | null>>();
+  const resolve = async (row: T): Promise<string | null> => {
+    const obs = observation(row);
+    if (obs.sourceType === "memory") {
+      let pending = memoryProjects.get(obs.id);
+      if (!pending) {
+        pending = kv
+          .get<Memory>(KV.memories, obs.id)
+          .then((memory) => memory?.project ?? null)
+          .catch(() => null);
+        memoryProjects.set(obs.id, pending);
+      }
+      return pending;
+    }
+
+    const sid = sessionId(row);
+    let pending = sessionProjects.get(sid);
+    if (!pending) {
+      pending = kv
+        .get<Session>(KV.sessions, sid)
+        .then((session) => session?.project ?? null)
+        .catch(() => null);
+      sessionProjects.set(sid, pending);
+    }
+    const sessionProject = await pending;
+    if (sessionProject !== null) return sessionProject;
+
+    let memoryProject = memoryProjects.get(obs.id);
+    if (!memoryProject) {
+      memoryProject = kv
+        .get<Memory>(KV.memories, obs.id)
+        .then((memory) => memory?.project ?? null)
+        .catch(() => null);
+      memoryProjects.set(obs.id, memoryProject);
+    }
+    return memoryProject;
+  };
+  const resolved = await Promise.all(
+    rows.map(async (row) => ({ row, project: await resolve(row) })),
+  );
+  return resolved
+    .filter((entry) => entry.project === null || entry.project === project)
+    .map((entry) => entry.row);
+}
+
 async function recallLessons(
   sdk: ISdk,
   query: string,
@@ -510,11 +545,6 @@ async function detectFollowup(
   });
 }
 
-// Task 16 Item 4: correlate an expand call with the session's most
-// recent search (KV.recentSearches, written by detectFollowup). If any
-// expanded obsId was in that prior result set, record it as a used
-// result. Best-effort; the caller wraps this in .catch so a throw here
-// never breaks the expand response.
 async function detectExpandOutcome(
   kv: StateKV,
   sessionId: string,

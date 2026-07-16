@@ -74,10 +74,6 @@ describe("fetchWithTimeout", () => {
   });
 
   it("aborts a hung response BODY read, not just a hung fetch (headers received, body stalls)", async () => {
-    // Regression: the timeout must cover the response body read, not just
-    // the headers. fetch() resolves when headers arrive; a backend that then
-    // stalls the body stream would otherwise leave response.json()/text()
-    // unbounded because the abort timer was cleared on header receipt.
     vi.restoreAllMocks();
     vi.spyOn(globalThis, "fetch").mockImplementation(((_url: string, init?: RequestInit) => {
       const signal = init?.signal;
@@ -371,14 +367,6 @@ describe("OpenAIProvider thinking-model fallback (#627)", () => {
     expect(out).toBe("real content");
   });
 });
-
-
-
-// ─────────────────────────────────────────────────────────────
-// Body-stall regression: headers arrive, then the body stream
-// stalls. Before the fix the abort timer was cleared on header
-// receipt, so provider response.json()/text() reads hung forever.
-// ─────────────────────────────────────────────────────────────
 function headersThenHangingBody(_url: string, init?: RequestInit): Promise<Response> {
   const signal = init?.signal;
   const stream = new ReadableStream({

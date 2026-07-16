@@ -90,7 +90,7 @@ function makeObs(id: string, sessionId = "ses_1"): CompressedObservation {
   } as CompressedObservation;
 }
 
-describe("Expand-outcome telemetry (Task 16 Item 4)", () => {
+describe("expand-outcome telemetry", () => {
   let sdk: any;
   let kv: ReturnType<typeof mockKV>;
   let searchResults: HybridSearchResult[];
@@ -105,11 +105,6 @@ describe("Expand-outcome telemetry (Task 16 Item 4)", () => {
     registerRecentSearchesSweepFunction(sdk, kv as any);
   });
 
-  // CHARACTERIZATION: today there is no telemetry linking a search
-  // result to whether it was later expanded/read. Even after a search
-  // followed by an expand of that exact result, the diagnostic readback
-  // exposes NO expand-outcome field — the audit's follow-up diagnostic
-  // had zero usable samples for exactly this reason.
   it("records that a prior search's result was expanded/read", async () => {
     await kv.set(KV.observations("ses_1"), "obs_a", makeObs("obs_a"));
 
@@ -139,14 +134,12 @@ describe("Expand-outcome telemetry (Task 16 Item 4)", () => {
       sessionId: "ses_1",
     });
 
-    // Expand an id the prior search never returned.
     await sdk.trigger("mem::smart-search", {
       expandIds: [{ obsId: "obs_z", sessionId: "ses_1" }],
       sessionId: "ses_1",
     });
 
     const stats = getExpandStats();
-    // Counted as an expand call, but NOT as a prior-result expansion.
     expect(stats.expandCallsWithSession).toBe(1);
     expect(stats.resultsExpandedFromPriorSearch).toBe(0);
     expect(stats.rate).toBe(0);
@@ -155,7 +148,6 @@ describe("Expand-outcome telemetry (Task 16 Item 4)", () => {
   it("expand still returns results and never throws when there is no prior search row (best-effort)", async () => {
     await kv.set(KV.observations("ses_1"), "obs_a", makeObs("obs_a"));
 
-    // No prior search for this session at all.
     const res = (await sdk.trigger("mem::smart-search", {
       expandIds: [{ obsId: "obs_a", sessionId: "ses_1" }],
       sessionId: "ses_1",
@@ -163,7 +155,6 @@ describe("Expand-outcome telemetry (Task 16 Item 4)", () => {
 
     expect(res.mode).toBe("expanded");
     expect(res.results.map((r) => r.obsId)).toContain("obs_a");
-    // Denominator advanced, numerator did not (no prior to match).
     const stats = getExpandStats();
     expect(stats.expandCallsWithSession).toBe(1);
     expect(stats.resultsExpandedFromPriorSearch).toBe(0);

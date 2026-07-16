@@ -52,11 +52,7 @@ interface Counters {
   // despite retrieval being correct). Never incremented by core in
   // live use; reserved here so dashboards keep a stable name.
   readerFailureWithEvidence: Counter;
-  // Task 16 Item 4: retrieval-outcome telemetry. Incremented when a
-  // smart-search expand call references obsIds that a PRIOR search in
-  // the same session returned — direct evidence that a returned result
-  // was actually used (expanded/read). Fills the sample gap the audit's
-  // follow-up diagnostic hit (zero usable outcome samples).
+  // Counts expansions that reference results returned to the same session.
   smartSearchResultExpanded: Counter;
 }
 

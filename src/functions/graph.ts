@@ -9,7 +9,7 @@ import type {
   GraphTombstone,
 } from "../types.js";
 import { GRAPH_NODE_TYPES, GRAPH_EDGE_TYPES } from "../types.js";
-import { KV, generateId } from "../state/schema.js";
+import { KV, fingerprintId, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import {
   GRAPH_EXTRACTION_SYSTEM,
@@ -20,6 +20,7 @@ import { logger } from "../logger.js";
 import { isAfter, isAtOrBefore } from "../state/timestamp-compare.js";
 import { readGraphSnapshot, SNAPSHOT_KEY } from "../state/graph-snapshot.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
+import { getEnvVar } from "../config.js";
 
 // #753: keep the response payload below the iii state channel ceiling.
 // 500 nodes + their incident edges hold well under the limit on the
@@ -30,7 +31,7 @@ const DEFAULT_GRAPH_QUERY_LIMIT = 500;
 const MAX_GRAPH_QUERY_LIMIT = 5000;
 
 // #814: the precomputed snapshot covers the top-degree subgraph used by
-// the empty-body / nodeType-only branch — the path the viewer hits on
+// the empty-body / nodeType-only branch, the path the viewer hits on
 // tab load. Sized to match the default query limit so the snapshot can
 // service a default-cap request without falling back to live
 // enumeration. Aggregate stats (nodesByType / edgesByType) are computed
@@ -55,9 +56,9 @@ const LIVE_ENUMERATION_BUDGET_MS = 6000;
 const GRAPH_EXTRACT_TIMEOUT_MS_DEFAULT = 180_000;
 
 export function getGraphExtractTimeoutMs(): number {
-  const raw = process.env.AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS;
+  const raw = getEnvVar("AGENTMEMORY_GRAPH_EXTRACT_TIMEOUT_MS");
   if (!raw) return GRAPH_EXTRACT_TIMEOUT_MS_DEFAULT;
-  const n = parseInt(raw, 10);
+  const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : GRAPH_EXTRACT_TIMEOUT_MS_DEFAULT;
 }
 
@@ -70,16 +71,16 @@ const GRAPH_CHUNK_SIZE_DEFAULT = 150;
 const GRAPH_CHUNK_CONCURRENCY_DEFAULT = 6;
 
 export function getGraphChunkSize(): number {
-  const raw = process.env.GRAPH_CHUNK_SIZE;
+  const raw = getEnvVar("GRAPH_CHUNK_SIZE");
   if (!raw) return GRAPH_CHUNK_SIZE_DEFAULT;
-  const n = parseInt(raw, 10);
+  const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : GRAPH_CHUNK_SIZE_DEFAULT;
 }
 
 export function getGraphChunkConcurrency(): number {
-  const raw = process.env.GRAPH_CHUNK_CONCURRENCY;
+  const raw = getEnvVar("GRAPH_CHUNK_CONCURRENCY");
   if (!raw) return GRAPH_CHUNK_CONCURRENCY_DEFAULT;
-  const n = parseInt(raw, 10);
+  const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? n : GRAPH_CHUNK_CONCURRENCY_DEFAULT;
 }
 
@@ -124,7 +125,13 @@ export function buildSnapshotFromArrays(
   edges: GraphEdge[],
 ): GraphSnapshot {
   const liveNodes = nodes.filter((n) => !n.stale);
-  const liveEdges = edges.filter((e) => !e.stale);
+  const liveNodeIds = new Set(liveNodes.map((node) => node.id));
+  const liveEdges = edges.filter(
+    (edge) =>
+      !edge.stale &&
+      liveNodeIds.has(edge.sourceNodeId) &&
+      liveNodeIds.has(edge.targetNodeId),
+  );
   // Build the global degree map once so we can both rank by it AND
   // snapshot the per-top-node values into topDegrees for synchronous
   // re-sort after incremental edge writes.
@@ -217,7 +224,7 @@ function snapshotSubgraph(snap: GraphSnapshot): {
 // that kv.list returns a payload too big to JSON.parse without
 // starving the iii heartbeat. We don't actually know the corpus size
 // without enumerating, but we can refuse to start a rebuild if the
-// snapshot's recorded `totalNodes` already exceeds this threshold —
+// snapshot's recorded `totalNodes` already exceeds this threshold.
 // the rebuild path is unreliable above it, and an incremental
 // extract-driven snapshot is the right approach for those corpora.
 // Operators above the threshold should use mem::graph-reset and let
@@ -236,9 +243,9 @@ export function edgeIndexKey(
   return `${sourceNodeId}|${targetNodeId}|${type}`;
 }
 
-// Queue a doomed row for physical deletion by mem::graph-vacuum. Keyed by the
-// doomed id so re-recording is idempotent. Callers own any logical bookkeeping
-// (stats/degree/topN) BEFORE recording; the vacuum is a pure physical delete.
+// Queue a doomed row for deletion by mem::graph-vacuum. Keyed by the doomed id
+// so re-recording is idempotent. Prune bookkeeping is deferred until vacuum;
+// other callers update snapshot state before recording.
 export async function recordGraphTombstone(
   kv: StateKV,
   entry: {
@@ -247,10 +254,25 @@ export async function recordGraphTombstone(
     reason: "cascade" | "orphan" | "retention" | "prune";
     indexKey: string;
     observedSourceCount?: number;
+    observedSourceIds?: string[];
+    nodeType?: GraphNode["type"];
+    edgeType?: GraphEdge["type"];
+    sourceNodeId?: string;
+    targetNodeId?: string;
   },
 ): Promise<void> {
+  const { observedSourceIds, ...storedEntry } = entry;
   const tombstone: GraphTombstone = {
-    ...entry,
+    ...storedEntry,
+    ...(observedSourceIds
+      ? {
+          observedSourceCount: observedSourceIds.length,
+          observedSourceFingerprint: fingerprintId(
+            "graph-source",
+            [...new Set(observedSourceIds)].sort().join("\n"),
+          ),
+        }
+      : {}),
     tombstonedAt: new Date().toISOString(),
   };
   await kv.set(KV.graphTombstones, entry.id, tombstone);
@@ -288,7 +310,7 @@ export async function applyDegreeDelta(
   }
 
   if (snap.topNodes.length < SNAPSHOT_TOP_NODES) {
-    // Capacity available — fetch + promote.
+    // Capacity available: fetch and promote.
     const node = await kv.get<GraphNode>(KV.graphNodes, nodeId);
     if (node && !node.stale) {
       snap.topNodes.push(node);
@@ -311,7 +333,7 @@ export async function applyDegreeDelta(
       const evicted = snap.topNodes.pop();
       if (evicted) {
         delete snap.topDegrees[evicted.id];
-        if (process.env.AGENTMEMORY_GRAPH_RETENTION_CAP === "true") {
+        if (getEnvVar("AGENTMEMORY_GRAPH_RETENTION_CAP") === "true") {
           // Opt-in hard cap (default off): the evicted node just fell out of
           // the snapshot and is now invisible to every reader, so queue it for
           // physical deletion rather than leaving it as unbounded archive
@@ -322,6 +344,8 @@ export async function applyDegreeDelta(
             kind: "node",
             reason: "retention",
             indexKey: nameIndexKey(evicted.type, evicted.name),
+            observedSourceIds: evicted.sourceObservationIds,
+            nodeType: evicted.type,
           });
           snap.stats.totalNodes = Math.max(0, snap.stats.totalNodes - 1);
           snap.stats.nodesByType[evicted.type] = Math.max(
@@ -371,6 +395,7 @@ function mergeNode(
     ],
     properties: { ...existing.properties, ...incoming.properties },
     updatedAt: capturedAt,
+    stale: false,
   };
 }
 
@@ -383,6 +408,7 @@ function mergeEdge(
     sourceObservationIds: [
       ...new Set([...existing.sourceObservationIds, ...obsIds]),
     ],
+    stale: false,
   };
 }
 
@@ -415,7 +441,7 @@ function paginate(
   const pageNodeIds = new Set(pageNodes.map((n) => n.id));
   // Edges restricted to the page so the response payload scales with
   // `limit`, not with the global edge count. An edge is included only
-  // when BOTH endpoints land in the page — half-edges to nodes outside
+  // when both endpoints land in the page. Half-edges to nodes outside
   // the page would render as dangling links in the viewer.
   const pageEdges = allEdges.filter(
     (e) => pageNodeIds.has(e.sourceNodeId) && pageNodeIds.has(e.targetNodeId),
@@ -442,12 +468,6 @@ function paginate(
   };
 }
 
-// Parse all key="value" pairs from a tag's attribute string, in any
-// order. The previous parser hard-coded attribute order
-// (type before name on <entity>, type/source/target/weight on
-// <relationship>) and silently dropped nodes/edges when the upstream
-// LLM emitted attributes in a different order — Codex in particular
-// likes to lead with `name=` (#635).
 function parseAttrs(raw: string): Record<string, string> {
   const attrs: Record<string, string> = {};
   const attrRegex = /([A-Za-z_][\w:-]*)="([^"]*)"/g;
@@ -461,13 +481,6 @@ function parseAttrs(raw: string): Record<string, string> {
 const GRAPH_NODE_TYPE_SET = new Set<string>(GRAPH_NODE_TYPES);
 const GRAPH_EDGE_TYPE_SET = new Set<string>(GRAPH_EDGE_TYPES);
 
-// Task 16 Item 3: canonicalize a raw graph node type before it is
-// validated/stored. The audit found malformed types in the graph such
-// as " file" (leading whitespace) and "decison" (typo for "decision").
-// Trimming + lowercasing recovers whitespace/case malformations; the
-// typo map corrects near-miss spellings against the GRAPH_NODE_TYPES
-// vocabulary. Returns undefined for input that cannot be salvaged
-// (non-string / empty) so the caller drops it as before.
 const GRAPH_NODE_TYPE_TYPOS: Readonly<Record<string, string>> = {
   decison: "decision",
   desicion: "decision",
@@ -607,16 +620,15 @@ async function mergeExtractIntoSnapshot(
   nodes: GraphNode[],
   edges: GraphEdge[],
 ): Promise<{ newNodeCount: number; newEdgeCount: number }> {
-  // #814 v2: targeted name-index lookups replace the O(n) scan over the full
-  // graphNodes scope, whose multi-MB list payload starved the iii heartbeat at
-  // ~75K nodes. The caller wraps this whole read-modify-write of the shared
-  // snapshot in withKeyedLock("graph:merge") so concurrent extracts under the
-  // consolidation pool cannot lose snapshot stat or topNode updates.
+  // Full graph scope reads can block the iii worker heartbeat. The caller holds
+  // graph:merge across this snapshot read-modify-write.
   const snap = (await readGraphSnapshot(kv)) ?? emptySnapshot();
   const capturedAt = new Date().toISOString();
   let newNodeCount = 0;
   let newEdgeCount = 0;
+  let snapshotChanged = false;
   const newEdgesForTopCheck: GraphEdge[] = [];
+  const canonicalNodeIds = new Map<string, string>();
 
   for (const node of nodes) {
     const indexKey = nameIndexKey(node.type, node.name);
@@ -625,39 +637,60 @@ async function mergeExtractIntoSnapshot(
     let existing: GraphNode | null = null;
     if (existingId) {
       existing = await kv.get<GraphNode>(KV.graphNodes, existingId);
-      // #825: drop pre-reset rows so extract writes a fresh node + index entry
-      // instead of reconnecting to a legacy orphan (which pins the snapshot at 0).
       if (
         existing &&
         snap.resetAt &&
         typeof existing.createdAt === "string" &&
         existing.createdAt < snap.resetAt
       ) {
-        // Orphan predates the last reset: queue the legacy row for deletion
-        // (no stat decrement - it was never counted in the post-reset epoch).
+        // Pre-reset rows were never counted in the current snapshot epoch.
         await recordGraphTombstone(kv, {
           id: existingId,
           kind: "node",
           reason: "orphan",
           indexKey,
+          observedSourceIds: existing.sourceObservationIds,
+          nodeType: existing.type,
         });
         existing = null;
       }
     }
 
     if (existing) {
+      const tombstone = await kv.get<GraphTombstone>(
+        KV.graphTombstones,
+        existing.id,
+      );
+      const wasLogicallyRemoved =
+        existing.stale === true ||
+        tombstone?.reason === "cascade" ||
+        tombstone?.reason === "retention";
       const merged = mergeNode(existing, node, node.sourceObservationIds, capturedAt);
       await kv.set(KV.graphNodes, existing.id, merged);
+      await kv.delete(KV.graphTombstones, existing.id);
+      canonicalNodeIds.set(node.id, existing.id);
       const topIdx = snap.topNodes.findIndex((n) => n.id === existing!.id);
-      if (topIdx !== -1) snap.topNodes[topIdx] = merged;
+      if (topIdx !== -1) {
+        snap.topNodes[topIdx] = merged;
+        snapshotChanged = true;
+      }
+      if (wasLogicallyRemoved) {
+        snap.stats.totalNodes += 1;
+        snap.stats.nodesByType[merged.type] =
+          (snap.stats.nodesByType[merged.type] ?? 0) + 1;
+        await applyDegreeDelta(kv, snap, merged.id, 0);
+        snapshotChanged = true;
+      }
     } else {
       await kv.set(KV.graphNodes, node.id, node);
       await kv.set(KV.graphNameIndex, indexKey, node.id);
       await kv.set(KV.graphNodeDegree, node.id, 0);
+      canonicalNodeIds.set(node.id, node.id);
       snap.stats.totalNodes += 1;
       snap.stats.nodesByType[node.type] =
         (snap.stats.nodesByType[node.type] ?? 0) + 1;
       newNodeCount += 1;
+      snapshotChanged = true;
       if (snap.topNodes.length < SNAPSHOT_TOP_NODES) {
         snap.topNodes.push(node);
         snap.topDegrees[node.id] = 0;
@@ -666,7 +699,18 @@ async function mergeExtractIntoSnapshot(
   }
 
   for (const edge of edges) {
-    const eKey = edgeIndexKey(edge.sourceNodeId, edge.targetNodeId, edge.type);
+    const canonicalEdge: GraphEdge = {
+      ...edge,
+      sourceNodeId:
+        canonicalNodeIds.get(edge.sourceNodeId) ?? edge.sourceNodeId,
+      targetNodeId:
+        canonicalNodeIds.get(edge.targetNodeId) ?? edge.targetNodeId,
+    };
+    const eKey = edgeIndexKey(
+      canonicalEdge.sourceNodeId,
+      canonicalEdge.targetNodeId,
+      canonicalEdge.type,
+    );
     const existingId = await kv.get<string>(KV.graphEdgeKey, eKey);
 
     let existing: GraphEdge | null = null;
@@ -683,26 +727,50 @@ async function mergeExtractIntoSnapshot(
           kind: "edge",
           reason: "orphan",
           indexKey: eKey,
+          observedSourceIds: existing.sourceObservationIds,
+          edgeType: existing.type,
+          sourceNodeId: existing.sourceNodeId,
+          targetNodeId: existing.targetNodeId,
         });
         existing = null;
       }
     }
 
     if (existing) {
-      const merged = mergeEdge(existing, edge.sourceObservationIds);
+      const tombstone = await kv.get<GraphTombstone>(
+        KV.graphTombstones,
+        existing.id,
+      );
+      const wasLogicallyRemoved =
+        existing.stale === true || tombstone?.reason === "cascade";
+      const merged = mergeEdge(existing, canonicalEdge.sourceObservationIds);
       await kv.set(KV.graphEdges, existing.id, merged);
+      await kv.delete(KV.graphTombstones, existing.id);
       const topIdx = snap.topEdges.findIndex((e) => e.id === existing!.id);
-      if (topIdx !== -1) snap.topEdges[topIdx] = merged;
+      if (topIdx !== -1) {
+        snap.topEdges[topIdx] = merged;
+        snapshotChanged = true;
+      }
+      if (wasLogicallyRemoved) {
+        snap.stats.totalEdges += 1;
+        snap.stats.edgesByType[merged.type] =
+          (snap.stats.edgesByType[merged.type] ?? 0) + 1;
+        await applyDegreeDelta(kv, snap, merged.sourceNodeId, +1);
+        await applyDegreeDelta(kv, snap, merged.targetNodeId, +1);
+        snapshotPushEdgeIfBothInTop(snap, merged);
+        snapshotChanged = true;
+      }
     } else {
-      await kv.set(KV.graphEdges, edge.id, edge);
-      await kv.set(KV.graphEdgeKey, eKey, edge.id);
+      await kv.set(KV.graphEdges, canonicalEdge.id, canonicalEdge);
+      await kv.set(KV.graphEdgeKey, eKey, canonicalEdge.id);
       snap.stats.totalEdges += 1;
-      snap.stats.edgesByType[edge.type] =
-        (snap.stats.edgesByType[edge.type] ?? 0) + 1;
+      snap.stats.edgesByType[canonicalEdge.type] =
+        (snap.stats.edgesByType[canonicalEdge.type] ?? 0) + 1;
       newEdgeCount += 1;
-      await applyDegreeDelta(kv, snap, edge.sourceNodeId, +1);
-      await applyDegreeDelta(kv, snap, edge.targetNodeId, +1);
-      newEdgesForTopCheck.push(edge);
+      snapshotChanged = true;
+      await applyDegreeDelta(kv, snap, canonicalEdge.sourceNodeId, +1);
+      await applyDegreeDelta(kv, snap, canonicalEdge.targetNodeId, +1);
+      newEdgesForTopCheck.push(canonicalEdge);
     }
   }
 
@@ -710,7 +778,7 @@ async function mergeExtractIntoSnapshot(
     snapshotPushEdgeIfBothInTop(snap, edge);
   }
 
-  if (newNodeCount > 0 || newEdgeCount > 0) {
+  if (snapshotChanged) {
     snap.updatedAt = capturedAt;
     snap.dirty = false;
     await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
@@ -747,6 +815,9 @@ export function registerGraphFunction(
         const obsIds = filtered.map((o) => o.id);
         let nodes: GraphNode[] = [];
         let edges: GraphEdge[] = [];
+        let failedChunks = 0;
+        let failedObservationIds: string[] = [];
+        let totalChunks = 1;
 
         if (filtered.length <= chunkSize) {
           const response = await provider.compress(
@@ -769,6 +840,7 @@ export function registerGraphFunction(
           for (let i = 0; i < filtered.length; i += chunkSize) {
             chunks.push(filtered.slice(i, i + chunkSize));
           }
+          totalChunks = chunks.length;
           const concurrency = getGraphChunkConcurrency();
           logger.info("Graph extract chunking session", {
             chunks: chunks.length,
@@ -797,9 +869,21 @@ export function registerGraphFunction(
           }
           const skipped = resultByIdx.filter((r) => r === null).length;
           if (skipped === chunks.length) {
-            return { success: false, error: "all_chunks_failed" };
+            return {
+              success: false,
+              error: "all_chunks_failed",
+              failedChunks: skipped,
+              totalChunks: chunks.length,
+              failedObservationIds: obsIds,
+            };
           }
           if (skipped > 0) {
+            failedChunks = skipped;
+            failedObservationIds = resultByIdx.flatMap((result, index) =>
+              result === null
+                ? chunks[index].map((observation) => observation.id)
+                : [],
+            );
             logger.warn("Graph extract chunks partially skipped", {
               skipped,
               total: chunks.length,
@@ -821,6 +905,9 @@ export function registerGraphFunction(
         await recordAudit(kv, "observe", "mem::graph-extract", obsIds, {
           nodesExtracted: nodes.length,
           edgesExtracted: edges.length,
+          failedChunks,
+          totalChunks,
+          failedObservationIds,
         });
 
         logger.info("Graph extraction complete", {
@@ -830,9 +917,15 @@ export function registerGraphFunction(
           newEdges: newEdgeCount,
         });
         return {
-          success: true,
+          success: failedChunks === 0,
+          ...(failedChunks > 0
+            ? { error: "partial_chunks_failed", partial: true }
+            : {}),
           nodesAdded: nodes.length,
           edgesAdded: edges.length,
+          failedChunks,
+          totalChunks,
+          failedObservationIds,
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -884,20 +977,15 @@ export function registerGraphFunction(
           offset,
           warning:
             "No graph snapshot available. Either no graph has been " +
-            "extracted yet, or you are on a legacy corpus from a pre-#814 " +
+            "extracted yet, or you are on a corpus from an older " +
             "agentmemory build. Run POST /agentmemory/graph/snapshot-rebuild " +
             "(safe up to ~25K nodes) or POST /agentmemory/graph/reset to " +
             "wipe and let future extracts repopulate.",
         };
       }
 
-      // The query and startNodeId paths previously enumerated the full
-      // graph via kv.list. On a large corpus that serializes a multi-MB
-      // state frame and starves the single-threaded iii worker heartbeat;
-      // the soft withTimeout rejects the promise but cannot abort the
-      // serialization, so the worker reconnects and the caller sees a 500.
-      // Both paths now read the bounded snapshot exclusively, matching
-      // graph-stats, the noWalk branch, and graph-retrieval.ts.
+      // Full graph scope reads can block the iii worker heartbeat, so query
+      // paths use the bounded snapshot.
       const snap = await readGraphSnapshot(kv);
       if (!snap || snap.topNodes.length === 0) {
         return {
@@ -912,7 +1000,7 @@ export function registerGraphFunction(
           fromSnapshot: true,
           warning:
             "No graph snapshot available. Either no graph has been " +
-            "extracted yet, or you are on a legacy corpus from a pre-#814 " +
+            "extracted yet, or you are on a corpus from an older " +
             "agentmemory build. Run POST /agentmemory/graph/snapshot-rebuild " +
             "(safe up to ~25K nodes) or POST /agentmemory/graph/reset to " +
             "wipe and let future extracts repopulate.",
@@ -1017,7 +1105,7 @@ export function registerGraphFunction(
   // on a post-#814 agentmemory the stats are always current without an
   // enumeration. Legacy corpora without a snapshot get an empty
   // envelope + a warning pointing at the snapshot-rebuild or graph-reset
-  // endpoints — never a 500.
+  // endpoints, never a 500.
   sdk.registerFunction("mem::graph-stats", async () => {
     const snap = await readGraphSnapshot(kv);
     if (snap) {
@@ -1051,7 +1139,7 @@ export function registerGraphFunction(
   // edge-key / degree indexes from existing graphNodes/graphEdges
   // scopes. This is the path operators run once after upgrading to a
   // post-#814 build to bring legacy corpora online. It enumerates via
-  // kv.list — the same pair that breaks at 75K+ — so we refuse to
+  // kv.list, the same pair that breaks at 75K+, so we refuse to
   // run on corpora large enough that the response payload would
   // block the worker heartbeat. Above the ceiling the only safe path
   // is mem::graph-reset followed by incremental re-extraction.
@@ -1061,16 +1149,16 @@ export function registerGraphFunction(
       const started = Date.now();
       // #825: pre-flight refusal for legacy corpora. The old guard
       // checked node count AFTER kv.list, but the heartbeat dies at
-      // ~0.35s on a 75K-node response — long before the wall-clock
+      // ~0.35s on a 75K-node response, long before the wall-clock
       // budget can fire. We can't safely enumerate to discover size.
       //
       // Heuristic: if no snapshot exists, the corpus is either empty
       // or legacy. The empty case has nothing to rebuild; the legacy
       // case will crash. Refuse both unless `force: true` is passed
       // (operator opt-in to attempt rebuild on a corpus they know is
-      // small enough — typically under 10K nodes on the default iii
+      // small enough, typically under 10K nodes on the default iii
       // state adapter).
-      // Strict boolean check on force — accept only literal `true`,
+      // Strict boolean check on force accepts only literal `true`,
       // never truthy strings/numbers, so a hand-crafted JSON payload
       // can't accidentally bypass the legacy-corpus safeguard.
       const forceRebuild = data?.force === true;
@@ -1130,7 +1218,7 @@ export function registerGraphFunction(
       // Backfill the targeted-lookup indexes so post-rebuild
       // graph-extract calls hit the O(1) path instead of falling
       // through to the (already-removed) full-scope scan. Batch
-      // writes via Promise.all to avoid N sequential round-trips —
+      // writes via Promise.all to avoid N sequential round-trips.
       // BATCH_SIZE bounds in-flight writes so we don't open thousands
       // of concurrent state channels on huge corpora.
       const liveNodes = nodes.filter((n) => !n.stale);
@@ -1188,35 +1276,12 @@ export function registerGraphFunction(
     }
   });
 
-  // #814 v2 + #825: clean-restart escape hatch for corpora of any
-  // size, including the legacy 75K+ case that crashes kv.list.
-  //
-  // Previous reset walked kv.list<GraphNode/Edge>(...) which is the
-  // exact primitive that heartbeat-crashes the worker on the corpus
-  // this reset was meant to recover (Allan's repro, 0.35s death).
-  //
-  // The new design is enumeration-free: write an empty snapshot and
-  // return. The hot path (mem::graph-query empty-body, mem::graph-stats)
-  // reads ONLY the snapshot post-#816, so a fresh empty snapshot
-  // makes the graph behave as if it were empty for every read.
-  //
-  // Future extracts repopulate the snapshot + side-indexes
-  // incrementally (graph-extract is O(1) per node post-#816 — it does
-  // not consult the legacy rows).
-  //
-  // Trade-off: legacy rows in KV.graphNodes / KV.graphEdges remain on
-  // disk as unreferenced orphans. They consume disk but are never
-  // read by any post-#816 code path. Cleanup is deferred to a future
-  // chunked-vacuum job; #816's broken vacuum-via-list strategy is
-  // what we are leaving behind here.
+  // Reset is enumeration-free because full graph scope reads can block the
+  // worker. Existing rows remain unreachable until vacuum deletes them.
   sdk.registerFunction("mem::graph-reset", async () => {
     const started = Date.now();
-    // Stamp resetAt=now on the empty snapshot. Future
-    // mem::graph-extract calls compare each name-index lookup's
-    // existing node `createdAt` against this timestamp; anything
-    // older counts as an orphan and is dropped from the merge path,
-    // forcing extract to write a fresh row instead of reconnecting
-    // to a pre-reset entry.
+    // resetAt prevents extracts from reconnecting indexed rows from an older
+    // snapshot epoch.
     const resetSnapshot: GraphSnapshot = {
       ...emptySnapshot(),
       resetAt: new Date().toISOString(),
@@ -1230,90 +1295,175 @@ export function registerGraphFunction(
     return { success: true, cleared: counts, tookMs };
   });
 
-  // Task 16 Item 3: one-shot repair for graph nodes whose `type` was
-  // written before write-time normalization existed (malformed values
-  // like " file" or "decison"). Fixes the stored node rows AND the
-  // precomputed snapshot (topNodes copies + stats.nodesByType keys,
-  // merging malformed keys into their normalized form). Idempotent: a
-  // second pass over already-normalized data updates nothing.
+  // Normalizes stored node rows and their snapshot copies in one pass.
   sdk.registerFunction(
     "mem::graph-normalize-types",
     async (data?: { dryRun?: boolean }) => {
       const dryRun = data?.dryRun === true;
       const started = Date.now();
-      let scanned = 0;
-      let fixed = 0;
-      const remap = new Map<string, string>();
+      let result:
+        | {
+            success: true;
+            scanned: number;
+            fixed: number;
+            snapshotUpdated: boolean;
+          }
+        | {
+            success: false;
+            scanned: number;
+            fixed: number;
+            snapshotUpdated: false;
+            error: string;
+          };
 
-      const nodes = await kv
-        .list<GraphNode>(KV.graphNodes)
-        .catch(() => [] as GraphNode[]);
-      for (const node of nodes) {
-        if (!node || typeof node.id !== "string") continue;
-        scanned++;
-        const norm = normalizeGraphNodeType(node.type);
-        if (norm && norm !== node.type) {
-          remap.set(node.id, norm);
-          if (!dryRun) {
-            await kv.set(KV.graphNodes, node.id, {
-              ...node,
-              type: norm as GraphNode["type"],
+      try {
+        result = await withKeyedLock("graph:merge", async () => {
+          const nodes = await kv.list<GraphNode>(KV.graphNodes);
+          const rawSnapshot = await kv.get<GraphSnapshot>(
+            KV.graphSnapshot,
+            SNAPSHOT_KEY,
+          );
+          const snap = rawSnapshot?.version === 1 ? rawSnapshot : null;
+          const plans: Array<{
+            node: GraphNode;
+            normalizedType: GraphNode["type"];
+            oldIndexKey: string;
+            newIndexKey: string;
+          }> = [];
+          let scanned = 0;
+          const plannedOwners = new Map<string, string>();
+
+          for (const node of nodes) {
+            if (!node || typeof node.id !== "string") continue;
+            scanned++;
+            const normalized = normalizeGraphNodeType(node.type);
+            if (
+              !normalized ||
+              normalized === node.type ||
+              !GRAPH_NODE_TYPE_SET.has(normalized)
+            ) {
+              continue;
+            }
+            const newIndexKey = nameIndexKey(normalized, node.name);
+            const plannedOwner = plannedOwners.get(newIndexKey);
+            const storedOwner = await kv.get<string>(
+              KV.graphNameIndex,
+              newIndexKey,
+            );
+            const collisionOwner = plannedOwner ?? storedOwner;
+            if (collisionOwner && collisionOwner !== node.id) {
+              return {
+                success: false as const,
+                scanned,
+                fixed: 0,
+                snapshotUpdated: false as const,
+                error: `normalized name-index collision for ${newIndexKey}`,
+              };
+            }
+            plannedOwners.set(newIndexKey, node.id);
+            plans.push({
+              node,
+              normalizedType: normalized as GraphNode["type"],
+              oldIndexKey: nameIndexKey(node.type, node.name),
+              newIndexKey,
             });
           }
-          fixed++;
-        }
+
+          if (!dryRun) {
+            for (const plan of plans) {
+              await kv.set(KV.graphNodes, plan.node.id, {
+                ...plan.node,
+                type: plan.normalizedType,
+              });
+              const oldOwner = await kv.get<string>(
+                KV.graphNameIndex,
+                plan.oldIndexKey,
+              );
+              if (oldOwner === plan.node.id) {
+                await kv.delete(KV.graphNameIndex, plan.oldIndexKey);
+              }
+              await kv.set(
+                KV.graphNameIndex,
+                plan.newIndexKey,
+                plan.node.id,
+              );
+            }
+          }
+
+          const remap = new Map(
+            plans.map((plan) => [plan.node.id, plan.normalizedType]),
+          );
+          let snapshotUpdated = false;
+          if (snap) {
+            for (const node of snap.topNodes) {
+              const normalized =
+                remap.get(node.id) ?? normalizeGraphNodeType(node.type);
+              if (
+                normalized &&
+                normalized !== node.type &&
+                GRAPH_NODE_TYPE_SET.has(normalized)
+              ) {
+                snapshotUpdated = true;
+                if (!dryRun) {
+                  node.type = normalized as GraphNode["type"];
+                }
+              }
+            }
+            const nodesByType: Record<string, number> = {};
+            for (const [type, count] of Object.entries(snap.stats.nodesByType)) {
+              const normalized = normalizeGraphNodeType(type);
+              const target =
+                normalized && GRAPH_NODE_TYPE_SET.has(normalized)
+                  ? normalized
+                  : type;
+              if (target !== type) snapshotUpdated = true;
+              nodesByType[target] = (nodesByType[target] ?? 0) + count;
+            }
+            if (snapshotUpdated && !dryRun) {
+              snap.stats.nodesByType = nodesByType;
+              snap.updatedAt = new Date().toISOString();
+              await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+            }
+          }
+
+          return {
+            success: true as const,
+            scanned,
+            fixed: plans.length,
+            snapshotUpdated,
+          };
+        });
+      } catch (err) {
+        result = {
+          success: false,
+          scanned: 0,
+          fixed: 0,
+          snapshotUpdated: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
       }
 
-      // Snapshot repair runs under the graph:merge lock so a concurrent
-      // extract cannot lose these fixes (same guard extract/vacuum use).
-      let snapshotUpdated = false;
-      await withKeyedLock("graph:merge", async () => {
-        const snap = await readGraphSnapshot(kv).catch(() => null);
-        if (!snap) return;
-        let snapChanged = false;
-        for (const n of snap.topNodes) {
-          const norm = remap.get(n.id) ?? normalizeGraphNodeType(n.type);
-          if (norm && norm !== n.type) {
-            n.type = norm as GraphNode["type"];
-            snapChanged = true;
-          }
-        }
-        const newByType: Record<string, number> = {};
-        let byTypeChanged = false;
-        for (const [ty, count] of Object.entries(snap.stats.nodesByType)) {
-          const norm = normalizeGraphNodeType(ty) ?? ty;
-          if (norm !== ty) byTypeChanged = true;
-          newByType[norm] = (newByType[norm] ?? 0) + count;
-        }
-        if (byTypeChanged) {
-          snap.stats.nodesByType = newByType;
-          snapChanged = true;
-        }
-        if (snapChanged && !dryRun) {
-          await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
-        }
-        snapshotUpdated = snapChanged;
-      });
-
-      if (!dryRun && (fixed > 0 || snapshotUpdated)) {
+      if (!dryRun && result.success && (result.fixed > 0 || result.snapshotUpdated)) {
         await recordAudit(
           kv,
           "consolidate",
           "mem::graph-normalize-types",
           [],
-          { scanned, fixed, snapshotUpdated },
+          {
+            scanned: result.scanned,
+            fixed: result.fixed,
+            snapshotUpdated: result.snapshotUpdated,
+          },
         );
       }
 
       const tookMs = Date.now() - started;
       logger.info("Graph node-type normalization", {
-        scanned,
-        fixed,
-        snapshotUpdated,
+        ...result,
         dryRun,
         tookMs,
       });
-      return { success: true, dryRun, scanned, fixed, snapshotUpdated, tookMs };
+      return { ...result, dryRun, tookMs };
     },
   );
 
@@ -1322,25 +1472,251 @@ export function registerGraphFunction(
   // frame because it is drained faster than produced) and deletes up to
   // `budget` doomed rows from graphNodes/graphEdges plus their side-index
   // entries. Runs under the graph:merge lock so a concurrent extract cannot
-  // resurrect a row this pass deletes. All logical bookkeeping (stats,
-  // degree, topN) already happened when the tombstone was recorded, so this
-  // pass is a pure physical delete.
+  // resurrect a row this pass deletes. Prune tombstones apply snapshot and
+  // degree bookkeeping here after the freshness check succeeds.
   sdk.registerFunction(
     "mem::graph-vacuum",
     async (data?: { budget?: number }) => {
       const DEFAULT_BUDGET = 300;
       const MAX_BUDGET = 5000;
-      const envRaw = process.env.AGENTMEMORY_GRAPH_VACUUM_BUDGET;
-      const envParsed = envRaw ? parseInt(envRaw, 10) : DEFAULT_BUDGET;
+      const envRaw = getEnvVar("AGENTMEMORY_GRAPH_VACUUM_BUDGET");
+      const envParsed = envRaw ? Number(envRaw) : DEFAULT_BUDGET;
       const envBudget =
         Number.isFinite(envParsed) && envParsed > 0 ? envParsed : DEFAULT_BUDGET;
-      const budget = Math.max(1, Math.min(data?.budget ?? envBudget, MAX_BUDGET));
+      const requestedBudget =
+        typeof data?.budget === "number" && Number.isFinite(data.budget)
+          ? data.budget
+          : envBudget;
+      const budget = Math.floor(
+        Math.max(1, Math.min(requestedBudget, MAX_BUDGET)),
+      );
 
       const started = Date.now();
-      const tombstones = await kv
-        .list<GraphTombstone>(KV.graphTombstones)
-        .catch(() => [] as GraphTombstone[]);
-      const batch = tombstones.slice(0, budget);
+      let tombstones: GraphTombstone[] = [];
+      let batch: GraphTombstone[] = [];
+      let deletedNodes = 0;
+      let deletedEdges = 0;
+      let skippedIndex = 0;
+      let skippedStale = 0;
+      let clearedTombstones = 0;
+      let prunedEdgeCount = 0;
+      let prunedNodeCount = 0;
+      const prunedEdgesByType: Record<string, number> = {};
+      const prunedNodesByType: Record<string, number> = {};
+
+      try {
+        await withKeyedLock("graph:merge", async () => {
+          tombstones = await kv.list<GraphTombstone>(KV.graphTombstones);
+          batch = tombstones.slice(0, budget);
+          if (batch.length === 0) return;
+
+          const snap = await readGraphSnapshot(kv);
+          let snapshotChanged = false;
+          const tombstonesToDelete: string[] = [];
+
+          for (const tombstone of batch) {
+            if (!tombstone || typeof tombstone.id !== "string") continue;
+            const queued = await kv.get<GraphTombstone>(
+              KV.graphTombstones,
+              tombstone.id,
+            );
+            if (
+              !queued ||
+              queued.tombstonedAt !== tombstone.tombstonedAt ||
+              queued.kind !== tombstone.kind
+            ) {
+              skippedStale++;
+              continue;
+            }
+
+            const scope =
+              tombstone.kind === "edge" ? KV.graphEdges : KV.graphNodes;
+            const current = await kv.get<GraphNode | GraphEdge>(
+              scope,
+              tombstone.id,
+            );
+            if (
+              current &&
+              ((tombstone.observedSourceFingerprint !== undefined &&
+                fingerprintId(
+                  "graph-source",
+                  [
+                    ...new Set(current.sourceObservationIds ?? []),
+                  ].sort().join("\n"),
+                ) !== tombstone.observedSourceFingerprint) ||
+                (tombstone.observedSourceFingerprint === undefined &&
+                  typeof tombstone.observedSourceCount === "number" &&
+                  (current.sourceObservationIds?.length ?? 0) !==
+                    tombstone.observedSourceCount))
+            ) {
+              tombstonesToDelete.push(tombstone.id);
+              skippedStale++;
+              continue;
+            }
+
+            if (tombstone.kind === "edge") {
+              const edge = current as GraphEdge | null;
+              const snapshotEdge = snap?.topEdges.find(
+                (item) => item.id === tombstone.id,
+              );
+              const edgeType =
+                edge?.type ?? tombstone.edgeType ?? snapshotEdge?.type;
+              const sourceNodeId =
+                edge?.sourceNodeId ??
+                tombstone.sourceNodeId ??
+                snapshotEdge?.sourceNodeId;
+              const targetNodeId =
+                edge?.targetNodeId ??
+                tombstone.targetNodeId ??
+                snapshotEdge?.targetNodeId;
+
+              if (snap) {
+                const previousLength = snap.topEdges.length;
+                snap.topEdges = snap.topEdges.filter(
+                  (item) => item.id !== tombstone.id,
+                );
+                snapshotChanged ||= snap.topEdges.length !== previousLength;
+                if (
+                  tombstone.reason === "prune" &&
+                  sourceNodeId &&
+                  targetNodeId
+                ) {
+                  await applyDegreeDelta(kv, snap, sourceNodeId, -1);
+                  await applyDegreeDelta(kv, snap, targetNodeId, -1);
+                  snapshotChanged = true;
+                }
+              }
+              if (current) {
+                await kv.delete(KV.graphEdges, tombstone.id);
+                deletedEdges++;
+              } else {
+                skippedStale++;
+              }
+              if (tombstone.indexKey) {
+                const indexOwner = await kv.get<string>(
+                  KV.graphEdgeKey,
+                  tombstone.indexKey,
+                );
+                if (indexOwner === tombstone.id) {
+                  await kv.delete(KV.graphEdgeKey, tombstone.indexKey);
+                } else {
+                  skippedIndex++;
+                }
+              }
+              if (tombstone.reason === "prune") {
+                prunedEdgeCount++;
+                if (edgeType) {
+                  prunedEdgesByType[edgeType] =
+                    (prunedEdgesByType[edgeType] ?? 0) + 1;
+                }
+              }
+            } else {
+              const node = current as GraphNode | null;
+              const snapshotNode = snap?.topNodes.find(
+                (item) => item.id === tombstone.id,
+              );
+              const nodeType =
+                node?.type ?? tombstone.nodeType ?? snapshotNode?.type;
+              if (snap) {
+                const previousNodeLength = snap.topNodes.length;
+                const previousEdgeLength = snap.topEdges.length;
+                snap.topNodes = snap.topNodes.filter(
+                  (item) => item.id !== tombstone.id,
+                );
+                snap.topEdges = snap.topEdges.filter(
+                  (item) =>
+                    item.sourceNodeId !== tombstone.id &&
+                    item.targetNodeId !== tombstone.id,
+                );
+                if (snap.topDegrees[tombstone.id] !== undefined) {
+                  delete snap.topDegrees[tombstone.id];
+                  snapshotChanged = true;
+                }
+                snapshotChanged ||=
+                  snap.topNodes.length !== previousNodeLength ||
+                  snap.topEdges.length !== previousEdgeLength;
+              }
+              if (current) {
+                await kv.delete(KV.graphNodes, tombstone.id);
+                deletedNodes++;
+              } else {
+                skippedStale++;
+              }
+              await kv.delete(KV.graphNodeDegree, tombstone.id);
+              if (tombstone.indexKey) {
+                const indexOwner = await kv.get<string>(
+                  KV.graphNameIndex,
+                  tombstone.indexKey,
+                );
+                if (indexOwner === tombstone.id) {
+                  await kv.delete(KV.graphNameIndex, tombstone.indexKey);
+                } else {
+                  skippedIndex++;
+                }
+              }
+              if (tombstone.reason === "prune") {
+                prunedNodeCount++;
+                if (nodeType) {
+                  prunedNodesByType[nodeType] =
+                    (prunedNodesByType[nodeType] ?? 0) + 1;
+                }
+              }
+            }
+            tombstonesToDelete.push(tombstone.id);
+          }
+
+          if (snap) {
+            if (prunedEdgeCount > 0 || prunedNodeCount > 0) {
+              snap.stats.totalEdges = Math.max(
+                0,
+                snap.stats.totalEdges - prunedEdgeCount,
+              );
+              snap.stats.totalNodes = Math.max(
+                0,
+                snap.stats.totalNodes - prunedNodeCount,
+              );
+              for (const [type, count] of Object.entries(prunedEdgesByType)) {
+                const next = Math.max(
+                  0,
+                  (snap.stats.edgesByType[type] ?? 0) - count,
+                );
+                if (next === 0) delete snap.stats.edgesByType[type];
+                else snap.stats.edgesByType[type] = next;
+              }
+              for (const [type, count] of Object.entries(prunedNodesByType)) {
+                const next = Math.max(
+                  0,
+                  (snap.stats.nodesByType[type] ?? 0) - count,
+                );
+                if (next === 0) delete snap.stats.nodesByType[type];
+                else snap.stats.nodesByType[type] = next;
+              }
+              snapshotChanged = true;
+            }
+            if (snapshotChanged) {
+              snap.updatedAt = new Date().toISOString();
+              await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
+            }
+          }
+
+          for (const tombstoneId of tombstonesToDelete) {
+            await kv.delete(KV.graphTombstones, tombstoneId);
+            clearedTombstones++;
+          }
+        });
+      } catch (err) {
+        return {
+          success: false,
+          error: err instanceof Error ? err.message : String(err),
+          deletedNodes,
+          deletedEdges,
+          skippedIndex,
+          skippedStale,
+          remaining: tombstones.length,
+          tookMs: Date.now() - started,
+        };
+      }
+
       if (batch.length === 0) {
         return {
           success: true,
@@ -1353,109 +1729,7 @@ export function registerGraphFunction(
         };
       }
 
-      let deletedNodes = 0;
-      let deletedEdges = 0;
-      let skippedIndex = 0;
-      let skippedStale = 0;
-      let prunedEdgeCount = 0;
-      let prunedNodeCount = 0;
-      const prunedEdgesByType: Record<string, number> = {};
-      const prunedNodesByType: Record<string, number> = {};
-
-      await withKeyedLock("graph:merge", async () => {
-        for (const t of batch) {
-          if (!t || typeof t.id !== "string") continue;
-          let rowType: string | undefined;
-          // Prune freshness guard: a row doomed by the offline sweep may have
-          // gained a live source via a later merge. observedSourceCount is the
-          // source count captured at seed time; if the live row's count has
-          // since changed, the row is no longer that orphan, so drop the
-          // tombstone without deleting.
-          if (typeof t.observedSourceCount === "number") {
-            const scope = t.kind === "edge" ? KV.graphEdges : KV.graphNodes;
-            const cur = await kv.get<{
-              sourceObservationIds?: string[];
-              type?: string;
-            }>(scope, t.id);
-            if (
-              cur &&
-              (cur.sourceObservationIds?.length ?? 0) !== t.observedSourceCount
-            ) {
-              await kv.delete(KV.graphTombstones, t.id);
-              skippedStale++;
-              continue;
-            }
-            rowType = cur?.type;
-          }
-          if (t.kind === "edge") {
-            await kv.delete(KV.graphEdges, t.id);
-            // Verify-then-delete: only drop the edge-key entry if it still
-            // resolves to this doomed id. A newer extract may have recreated
-            // the same source|target|type and repointed it to a live edge.
-            if (t.indexKey) {
-              const cur = await kv.get<string>(KV.graphEdgeKey, t.indexKey);
-              if (cur === t.id) await kv.delete(KV.graphEdgeKey, t.indexKey);
-              else skippedIndex++;
-            }
-            deletedEdges++;
-            if (t.reason === "prune") {
-              prunedEdgeCount++;
-              if (rowType)
-                prunedEdgesByType[rowType] =
-                  (prunedEdgesByType[rowType] ?? 0) + 1;
-            }
-          } else {
-            await kv.delete(KV.graphNodes, t.id);
-            // Degree is keyed by this dead node id, so dropping it is always
-            // safe (a re-extracted node gets a fresh id).
-            await kv.delete(KV.graphNodeDegree, t.id);
-            if (t.indexKey) {
-              const cur = await kv.get<string>(KV.graphNameIndex, t.indexKey);
-              if (cur === t.id) await kv.delete(KV.graphNameIndex, t.indexKey);
-              else skippedIndex++;
-            }
-            deletedNodes++;
-            if (t.reason === "prune") {
-              prunedNodeCount++;
-              if (rowType)
-                prunedNodesByType[rowType] =
-                  (prunedNodesByType[rowType] ?? 0) + 1;
-            }
-          }
-          await kv.delete(KV.graphTombstones, t.id);
-        }
-        // Prune tombstones carry no record-time stats bookkeeping (the seed
-        // path cannot decrement safely because the freshness guard may later
-        // skip the delete), so the counter is adjusted here at delete time,
-        // mirroring the increment mem::graph-extract applies on insert. Runs
-        // under the same graph:merge lock as extract, so no lost update.
-        if (prunedEdgeCount > 0 || prunedNodeCount > 0) {
-          const snap = await readGraphSnapshot(kv);
-          if (snap) {
-            snap.stats.totalEdges = Math.max(
-              0,
-              snap.stats.totalEdges - prunedEdgeCount,
-            );
-            snap.stats.totalNodes = Math.max(
-              0,
-              snap.stats.totalNodes - prunedNodeCount,
-            );
-            for (const [ty, n] of Object.entries(prunedEdgesByType)) {
-              const next = Math.max(0, (snap.stats.edgesByType[ty] ?? 0) - n);
-              if (next === 0) delete snap.stats.edgesByType[ty];
-              else snap.stats.edgesByType[ty] = next;
-            }
-            for (const [ty, n] of Object.entries(prunedNodesByType)) {
-              const next = Math.max(0, (snap.stats.nodesByType[ty] ?? 0) - n);
-              if (next === 0) delete snap.stats.nodesByType[ty];
-              else snap.stats.nodesByType[ty] = next;
-            }
-            await kv.set(KV.graphSnapshot, SNAPSHOT_KEY, snap);
-          }
-        }
-      });
-
-      const remaining = Math.max(0, tombstones.length - batch.length);
+      const remaining = Math.max(0, tombstones.length - clearedTombstones);
       const tookMs = Date.now() - started;
       await recordAudit(kv, "consolidate", "mem::graph-vacuum", [], {
         deletedNodes,
@@ -1500,20 +1774,52 @@ export function registerGraphFunction(
       maxSeed?: number;
       tombstoneCeiling?: number;
     }) => {
-      const maxSeed = Math.max(1, Math.min(data?.maxSeed ?? 1000, 5000));
-      const tombstoneCeiling = Math.max(1, data?.tombstoneCeiling ?? 2000);
-      const nodeIds = Array.isArray(data?.nodeIds) ? data.nodeIds : [];
-      const edgeIds = Array.isArray(data?.edgeIds) ? data.edgeIds : [];
+      const requestedMaxSeed =
+        typeof data?.maxSeed === "number" && Number.isFinite(data.maxSeed)
+          ? data.maxSeed
+          : 1000;
+      const requestedCeiling =
+        typeof data?.tombstoneCeiling === "number" &&
+        Number.isFinite(data.tombstoneCeiling)
+          ? data.tombstoneCeiling
+          : 2000;
+      const maxSeed = Math.floor(
+        Math.max(1, Math.min(requestedMaxSeed, 5000)),
+      );
+      const tombstoneCeiling = Math.floor(Math.max(1, requestedCeiling));
+      const nodeIds = Array.isArray(data?.nodeIds)
+        ? data.nodeIds.filter(
+            (id): id is string => typeof id === "string" && id.length > 0,
+          )
+        : [];
+      const edgeIds = Array.isArray(data?.edgeIds)
+        ? data.edgeIds.filter(
+            (id): id is string => typeof id === "string" && id.length > 0,
+          )
+        : [];
 
-      const queue = await kv
-        .list<GraphTombstone>(KV.graphTombstones)
-        .catch(() => [] as GraphTombstone[]);
-      if (queue.length > tombstoneCeiling) {
+      let queue: GraphTombstone[];
+      try {
+        queue = await kv.list<GraphTombstone>(KV.graphTombstones);
+      } catch (err) {
+        return {
+          success: false,
+          refused: true,
+          reason: "tombstone queue unavailable",
+          error: err instanceof Error ? err.message : String(err),
+          seeded: 0,
+          skippedLive: 0,
+          skippedMissing: 0,
+          remainingCandidates: nodeIds.length + edgeIds.length,
+          tombstoneQueueLen: 0,
+        };
+      }
+      if (queue.length >= tombstoneCeiling) {
         return {
           success: true,
           refused: true,
           reason:
-            "tombstone queue above ceiling; drain via mem::graph-vacuum first",
+            "tombstone queue at ceiling; drain via mem::graph-vacuum first",
           seeded: 0,
           skippedLive: 0,
           skippedMissing: 0,
@@ -1522,113 +1828,202 @@ export function registerGraphFunction(
         };
       }
 
-      const liveSet = new Set<string>();
-      const sessions = await kv
-        .list<{ id?: string }>(KV.sessions)
-        .catch(() => [] as { id?: string }[]);
-      for (const s of sessions) {
-        if (!s?.id) continue;
-        const obs = await kv
-          .list<{ id?: string }>(KV.observations(s.id))
-          .catch(() => [] as { id?: string }[]);
-        for (const o of obs) if (o?.id) liveSet.add(o.id);
-      }
-      const memories = await kv
-        .list<{ id?: string }>(KV.memories)
-        .catch(() => [] as { id?: string }[]);
-      for (const m of memories) if (m?.id) liveSet.add(m.id);
-
-      const candidates: Array<{ id: string; kind: "node" | "edge" }> = [
-        ...edgeIds.map((id) => ({ id, kind: "edge" as const })),
-        ...nodeIds.map((id) => ({ id, kind: "node" as const })),
-      ];
-      const batch = candidates.slice(0, maxSeed);
-      const remainingCandidates = Math.max(0, candidates.length - batch.length);
-
-      let seeded = 0;
-      let skippedLive = 0;
-      let skippedMissing = 0;
-
-      for (const c of batch) {
-        if (c.kind === "edge") {
-          const e = await kv.get<GraphEdge>(KV.graphEdges, c.id);
-          if (!e) {
-            skippedMissing++;
-            continue;
+      try {
+        return await withKeyedLock("graph:merge", async () => {
+          queue = await kv.list<GraphTombstone>(KV.graphTombstones);
+          const availableCapacity = Math.max(
+            0,
+            tombstoneCeiling - queue.length,
+          );
+          if (availableCapacity === 0) {
+            return {
+              success: true,
+              refused: true,
+              reason:
+                "tombstone queue at ceiling; drain via mem::graph-vacuum first",
+              seeded: 0,
+              skippedLive: 0,
+              skippedMissing: 0,
+              remainingCandidates: nodeIds.length + edgeIds.length,
+              tombstoneQueueLen: queue.length,
+            };
           }
-          const sources = e.sourceObservationIds ?? [];
-          // Keep (skip) an edge only if it is fully relevant: a live source AND
-          // both endpoints still exist as live nodes. A dangling edge (missing
-          // endpoint) or an orphan-endpoint edge is trash even when its own obs
-          // are live, so it must fall through to be tombstoned.
-          if (sources.some((s) => liveSet.has(s))) {
-            const src = await kv.get<GraphNode>(KV.graphNodes, e.sourceNodeId);
-            const srcLive =
-              !!src && (src.sourceObservationIds ?? []).some((s) => liveSet.has(s));
-            if (srcLive) {
-              const tgt = await kv.get<GraphNode>(KV.graphNodes, e.targetNodeId);
-              const tgtLive =
-                !!tgt &&
-                (tgt.sourceObservationIds ?? []).some((s) => liveSet.has(s));
-              if (tgtLive) {
+
+          const liveSet = new Set<string>();
+          try {
+            const sessions = await kv.list<{ id?: string }>(KV.sessions);
+            for (const session of sessions) {
+              if (!session?.id) continue;
+              const observations = await kv.list<{ id?: string }>(
+                KV.observations(session.id),
+              );
+              for (const observation of observations) {
+                if (observation?.id) liveSet.add(observation.id);
+              }
+            }
+            const memories = await kv.list<{ id?: string }>(KV.memories);
+            for (const memory of memories) {
+              if (memory?.id) liveSet.add(memory.id);
+            }
+          } catch (err) {
+            return {
+              success: false,
+              refused: true,
+              reason: "live source enumeration failed",
+              error: err instanceof Error ? err.message : String(err),
+              seeded: 0,
+              skippedLive: 0,
+              skippedMissing: 0,
+              remainingCandidates: nodeIds.length + edgeIds.length,
+              tombstoneQueueLen: queue.length,
+            };
+          }
+
+          const queuedIds = new Set(queue.map((tombstone) => tombstone.id));
+          const seenCandidates = new Set<string>();
+          const candidates: Array<{ id: string; kind: "node" | "edge" }> = [
+            ...edgeIds.map((id) => ({ id, kind: "edge" as const })),
+            ...nodeIds.map((id) => ({ id, kind: "node" as const })),
+          ].filter((candidate) => {
+            if (
+              !candidate.id ||
+              queuedIds.has(candidate.id) ||
+              seenCandidates.has(candidate.id)
+            ) {
+              return false;
+            }
+            seenCandidates.add(candidate.id);
+            return true;
+          });
+          const batch = candidates.slice(
+            0,
+            Math.min(maxSeed, availableCapacity),
+          );
+          const remainingCandidates = Math.max(
+            0,
+            candidates.length - batch.length,
+          );
+          let seeded = 0;
+          let skippedLive = 0;
+          let skippedMissing = 0;
+
+          for (const candidate of batch) {
+            if (candidate.kind === "edge") {
+              const edge = await kv.get<GraphEdge>(
+                KV.graphEdges,
+                candidate.id,
+              );
+              if (!edge) {
+                skippedMissing++;
+                continue;
+              }
+              const sources = edge.sourceObservationIds ?? [];
+              if (sources.some((source) => liveSet.has(source))) {
+                const sourceNode = await kv.get<GraphNode>(
+                  KV.graphNodes,
+                  edge.sourceNodeId,
+                );
+                const sourceIsLive =
+                  !!sourceNode &&
+                  (sourceNode.sourceObservationIds ?? []).some((source) =>
+                    liveSet.has(source),
+                  );
+                if (sourceIsLive) {
+                  const targetNode = await kv.get<GraphNode>(
+                    KV.graphNodes,
+                    edge.targetNodeId,
+                  );
+                  const targetIsLive =
+                    !!targetNode &&
+                    (targetNode.sourceObservationIds ?? []).some((source) =>
+                      liveSet.has(source),
+                    );
+                  if (targetIsLive) {
+                    skippedLive++;
+                    continue;
+                  }
+                }
+              }
+              await recordGraphTombstone(kv, {
+                id: edge.id,
+                kind: "edge",
+                reason: "prune",
+                indexKey: edgeIndexKey(
+                  edge.sourceNodeId,
+                  edge.targetNodeId,
+                  edge.type,
+                ),
+                observedSourceIds: sources,
+                edgeType: edge.type,
+                sourceNodeId: edge.sourceNodeId,
+                targetNodeId: edge.targetNodeId,
+              });
+              seeded++;
+            } else {
+              const node = await kv.get<GraphNode>(
+                KV.graphNodes,
+                candidate.id,
+              );
+              if (!node) {
+                skippedMissing++;
+                continue;
+              }
+              const sources = node.sourceObservationIds ?? [];
+              if (sources.some((source) => liveSet.has(source))) {
                 skippedLive++;
                 continue;
               }
+              await recordGraphTombstone(kv, {
+                id: node.id,
+                kind: "node",
+                reason: "prune",
+                indexKey: nameIndexKey(node.type, node.name),
+                observedSourceIds: sources,
+                nodeType: node.type,
+              });
+              seeded++;
             }
           }
-          await recordGraphTombstone(kv, {
-            id: e.id,
-            kind: "edge",
-            reason: "prune",
-            indexKey: edgeIndexKey(e.sourceNodeId, e.targetNodeId, e.type),
-            observedSourceCount: sources.length,
-          });
-          seeded++;
-        } else {
-          const n = await kv.get<GraphNode>(KV.graphNodes, c.id);
-          if (!n) {
-            skippedMissing++;
-            continue;
-          }
-          const sources = n.sourceObservationIds ?? [];
-          if (sources.some((s) => liveSet.has(s))) {
-            skippedLive++;
-            continue;
-          }
-          await recordGraphTombstone(kv, {
-            id: n.id,
-            kind: "node",
-            reason: "prune",
-            indexKey: nameIndexKey(n.type, n.name),
-            observedSourceCount: sources.length,
-          });
-          seeded++;
-        }
-      }
 
-      if (seeded > 0) {
-        await recordAudit(kv, "consolidate", "mem::graph-prune-orphans", [], {
-          seeded,
-          skippedLive,
-          skippedMissing,
-          remainingCandidates,
+          if (seeded > 0) {
+            await recordAudit(
+              kv,
+              "consolidate",
+              "mem::graph-prune-orphans",
+              [],
+              { seeded, skippedLive, skippedMissing, remainingCandidates },
+            );
+          }
+          const tombstoneQueueLen = queue.length + seeded;
+          logger.info("Graph prune-orphans seed pass", {
+            seeded,
+            skippedLive,
+            skippedMissing,
+            remainingCandidates,
+            tombstoneQueueLen,
+          });
+          return {
+            success: true,
+            seeded,
+            skippedLive,
+            skippedMissing,
+            remainingCandidates,
+            tombstoneQueueLen,
+          };
         });
+      } catch (err) {
+        return {
+          success: false,
+          refused: true,
+          reason: "prune seed failed",
+          error: err instanceof Error ? err.message : String(err),
+          seeded: 0,
+          skippedLive: 0,
+          skippedMissing: 0,
+          remainingCandidates: nodeIds.length + edgeIds.length,
+          tombstoneQueueLen: queue.length,
+        };
       }
-      logger.info("Graph prune-orphans seed pass", {
-        seeded,
-        skippedLive,
-        skippedMissing,
-        remainingCandidates,
-        tombstoneQueueLen: queue.length,
-      });
-      return {
-        success: true,
-        seeded,
-        skippedLive,
-        skippedMissing,
-        remainingCandidates,
-        tombstoneQueueLen: queue.length,
-      };
     },
   );
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { handleToolsList } from "../src/mcp/standalone.js";
+import { handleToolCall, handleToolsList } from "../src/mcp/standalone.js";
 import { resetHandleForTests } from "../src/mcp/rest-proxy.js";
 
 type FetchMock = ReturnType<typeof vi.fn>;
@@ -178,5 +178,28 @@ describe("standalone bridge: AGENTMEMORY_TOOLS_DISABLE proxy filter (#blocker)",
     expect(names).not.toContain("memory_export");
     expect(names.length).toBe(5);
     expect(names).toContain("memory_recall");
+  });
+
+  it("rejects a direct call to a disabled tool", async () => {
+    process.env["AGENTMEMORY_TOOLS_DISABLE"] = "memory_save";
+
+    await expect(
+      handleToolCall("memory_save", { content: "hidden" }),
+    ).rejects.toThrow("Unknown or disabled tool: memory_save");
+  });
+
+  it("rejects a direct call hidden by core mode", async () => {
+    const originalMode = process.env["AGENTMEMORY_TOOLS"];
+    process.env["AGENTMEMORY_TOOLS"] = "core";
+    try {
+      await expect(
+        handleToolCall("memory_commit_lookup", {
+          sha: "abc123def456abc123def456abc123def456abcd",
+        }),
+      ).rejects.toThrow("Unknown or disabled tool: memory_commit_lookup");
+    } finally {
+      if (originalMode === undefined) delete process.env["AGENTMEMORY_TOOLS"];
+      else process.env["AGENTMEMORY_TOOLS"] = originalMode;
+    }
   });
 });

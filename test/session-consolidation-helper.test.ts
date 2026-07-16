@@ -11,7 +11,7 @@ vi.mock("../src/functions/slots.js", () => ({
 vi.mock("../src/config.js", () => ({
   isGraphExtractionEnabled: () => true,
   getAgentId: () => undefined,
-  getEnvVar: () => undefined,
+  getEnvVar: (key: string) => process.env[key],
   isAutoCompressEnabled: () => false,
 }));
 
