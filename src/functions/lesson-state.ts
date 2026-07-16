@@ -217,7 +217,7 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.map((value) => value.trim()).filter(Boolean))];
 }
 
-function validateCorrections(
+export function validateCorrections(
   candidateId: string,
   project: string | undefined,
   corrects: string[],

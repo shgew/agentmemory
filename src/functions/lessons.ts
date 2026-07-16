@@ -3,6 +3,7 @@ import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import type { Lesson } from "../types.js";
 import { recordAudit, safeAudit } from "./audit.js";
+import { backfillLessonCorrections } from "./lesson-corrections.js";
 import {
   filterSupersededLessons,
   reinforceLesson,
@@ -11,6 +12,16 @@ import {
 } from "./lesson-state.js";
 
 export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
+  sdk.registerFunction(
+    "mem::lesson-correction-backfill",
+    async (data: { dryRun?: boolean } = {}) => {
+      if (data.dryRun !== undefined && typeof data.dryRun !== "boolean") {
+        return { success: false, error: "dryRun must be a boolean" };
+      }
+      return backfillLessonCorrections(kv, { dryRun: data.dryRun });
+    },
+  );
+
   sdk.registerFunction("mem::lesson-save", 
     async (data: LessonSaveInput) => {
       const result = await saveLesson(kv, data);

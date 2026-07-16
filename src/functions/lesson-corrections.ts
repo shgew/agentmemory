@@ -1,7 +1,15 @@
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import type { Lesson } from "../types.js";
-import { sameLessonProject } from "./lesson-state.js";
+import { safeAudit } from "./audit.js";
+import {
+  CONFIRMED_HISTORICAL_LESSON_CORRECTIONS,
+  deduplicateLessonCorrectionCandidates,
+  findExplicitLessonCorrectionCandidates,
+  type LessonCorrectionCandidate,
+  type LessonCorrectionSkipped,
+} from "./lesson-correction-markers.js";
+import { sameLessonProject, validateCorrections } from "./lesson-state.js";
 
 export type LessonCorrectionDirection = "corrects" | "correctedBy";
 
@@ -9,6 +17,18 @@ export interface LessonCorrectionLink {
   lesson: Lesson;
   hop: number;
   direction: LessonCorrectionDirection;
+}
+
+export interface LessonCorrectionBackfillResult {
+  readonly success: true;
+  readonly dryRun: boolean;
+  readonly scannedLessons: number;
+  readonly explicitMarkerPairs: readonly LessonCorrectionCandidate[];
+  readonly confirmedPairs: readonly LessonCorrectionCandidate[];
+  readonly wouldApply: readonly LessonCorrectionCandidate[];
+  readonly applied: readonly LessonCorrectionCandidate[];
+  readonly alreadyLinked: readonly LessonCorrectionCandidate[];
+  readonly skipped: readonly LessonCorrectionSkipped[];
 }
 
 export function traceLessonCorrections(
@@ -79,6 +99,94 @@ export async function getRelatedLessonResult(
     results: links
       .filter((link) => link.lesson.confidence >= minConfidence)
       .map((link) => ({ ...link, confidence: link.lesson.confidence })),
+  };
+}
+
+export async function backfillLessonCorrections(
+  kv: StateKV,
+  options: {
+    readonly dryRun?: boolean;
+    readonly confirmedPairs?: readonly LessonCorrectionCandidate[];
+  } = {},
+): Promise<LessonCorrectionBackfillResult> {
+  const dryRun = options.dryRun !== false;
+  const lessons = await kv.list<Lesson>(KV.lessons);
+  const workingLessons = lessons.map((lesson) => ({
+    ...lesson,
+    ...(lesson.corrects ? { corrects: [...lesson.corrects] } : {}),
+  }));
+  const byId = new Map(workingLessons.map((lesson) => [lesson.id, lesson]));
+  const explicitMarkerPairs = findExplicitLessonCorrectionCandidates(lessons);
+  const confirmedPairs = [...(options.confirmedPairs ?? CONFIRMED_HISTORICAL_LESSON_CORRECTIONS)];
+  const candidates = deduplicateLessonCorrectionCandidates([
+    ...explicitMarkerPairs,
+    ...confirmedPairs,
+  ]);
+  const wouldApply: LessonCorrectionCandidate[] = [];
+  const applied: LessonCorrectionCandidate[] = [];
+  const alreadyLinked: LessonCorrectionCandidate[] = [];
+  const skipped: LessonCorrectionSkipped[] = [];
+
+  for (const candidate of candidates) {
+    const correction = byId.get(candidate.correctionId);
+    const corrected = byId.get(candidate.correctedId);
+    if (!correction || correction.deleted) {
+      skipped.push({ ...candidate, reason: "correction lesson not found or deleted" });
+      continue;
+    }
+    if (!corrected) {
+      skipped.push({ ...candidate, reason: "correction target not found" });
+      continue;
+    }
+    if (!sameLessonProject(correction.project, corrected.project)) {
+      skipped.push({ ...candidate, reason: "correction targets must use the same project scope" });
+      continue;
+    }
+    if (correction.corrects?.includes(candidate.correctedId)) {
+      alreadyLinked.push(candidate);
+      continue;
+    }
+
+    const proposedCorrects = [...new Set([...(correction.corrects ?? []), candidate.correctedId])];
+    const validation = validateCorrections(
+      correction.id,
+      correction.project,
+      proposedCorrects,
+      workingLessons,
+    );
+    if (validation) {
+      skipped.push({ ...candidate, reason: validation.error });
+      continue;
+    }
+
+    correction.corrects = proposedCorrects;
+    if (dryRun) {
+      wouldApply.push(candidate);
+      continue;
+    }
+
+    correction.updatedAt = new Date().toISOString();
+    await kv.set(KV.lessons, correction.id, correction);
+    await safeAudit(
+      kv,
+      "lesson_strengthen",
+      "mem::lesson-correction-backfill",
+      [correction.id, candidate.correctedId],
+      { action: "correction-link", source: candidate.source, evidence: candidate.evidence },
+    );
+    applied.push(candidate);
+  }
+
+  return {
+    success: true,
+    dryRun,
+    scannedLessons: lessons.length,
+    explicitMarkerPairs,
+    confirmedPairs,
+    wouldApply,
+    applied,
+    alreadyLinked,
+    skipped,
   };
 }
 
