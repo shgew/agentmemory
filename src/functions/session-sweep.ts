@@ -221,6 +221,17 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
                     summaryOnly: Boolean(current.parentSessionId),
                   },
                 });
+              } else {
+                await sdk.trigger({
+                  function_id: "event::session::stopped",
+                  payload: {
+                    sessionId: session.id,
+                    reason: "sweep-finalize",
+                    until: currentAnchor,
+                    waitForCompletion: true,
+                    summaryOnly: true,
+                  },
+                });
               }
               const endedAt = new Date().toISOString();
               await kv.update<Session>(KV.sessions, session.id, [

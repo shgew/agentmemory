@@ -16,7 +16,7 @@ vi.mock("../src/config.js", () => ({
 }));
 
 import { registerSessionSweepFunction } from "../src/functions/session-sweep.js";
-import type { Session, AuditEntry } from "../src/types.js";
+import type { Session, SessionSummary, AuditEntry } from "../src/types.js";
 import { registerEventTriggers } from "../src/triggers/events.js";
 
 function mockKV() {
@@ -103,6 +103,7 @@ function makeSession(overrides: Partial<Session> = {}): Session {
 }
 
 const SESSIONS_SCOPE = "mem:sessions";
+const SUMMARIES_SCOPE = "mem:summaries";
 const AUDIT_SCOPE = "mem:audit";
 
 describe("Session Sweep Function", () => {
@@ -883,8 +884,23 @@ describe("Session Sweep - idle-checkpoint mode + finalize decouple", () => {
     sdk.registerFunction("mem::graph-extract", async () => ({ success: true }));
   });
 
-  it("finalize marks an idle-checkpointed-then-abandoned active session done WITHOUT firing stopped", async () => {
+  it("finalize writes a summary-only result for an idle-checkpointed-then-abandoned session", async () => {
     const anchor = new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString();
+    sdk.registerFunction("mem::summarize", async () => {
+      const summary: SessionSummary = {
+        sessionId: "ses_decouple_noop",
+        project: "test-project",
+        createdAt: new Date().toISOString(),
+        title: "Final summary",
+        narrative: "Session finalized after its idle checkpoint.",
+        keyDecisions: [],
+        filesModified: [],
+        concepts: [],
+        observationCount: 0,
+      };
+      await kv.set(SUMMARIES_SCOPE, summary.sessionId, summary);
+      return { success: true, summary };
+    });
     const session = makeSession({
       id: "ses_decouple_noop",
       startedAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
@@ -905,7 +921,17 @@ describe("Session Sweep - idle-checkpoint mode + finalize decouple", () => {
     const stopped = sdk.triggerCalls.filter(
       (c) => c.function_id === "event::session::stopped",
     );
-    expect(stopped).toHaveLength(0);
+    expect(stopped).toHaveLength(1);
+    expect(stopped[0].payload).toMatchObject({
+      reason: "sweep-finalize",
+      summaryOnly: true,
+      waitForCompletion: true,
+    });
+    expect(sdk.triggerCalls.filter((c) => c.function_id === "mem::summarize")).toHaveLength(1);
+    expect(await kv.get<SessionSummary>(SUMMARIES_SCOPE, "ses_decouple_noop")).toMatchObject({
+      observationCount: 0,
+      title: "Final summary",
+    });
   });
 
   it("finalize consolidates AND marks done when an active session has new activity since last checkpoint", async () => {
