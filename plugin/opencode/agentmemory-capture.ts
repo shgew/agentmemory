@@ -1,10 +1,10 @@
 /// <reference types="node" />
 import { basename, resolve } from "node:path";
 import { env } from "node:process";
+import { execFileSync } from "node:child_process";
 import type { Plugin } from "@opencode-ai/plugin";
 import type { Event as EventV1, Part } from "@opencode-ai/sdk";
 import type { Event as EventV2 } from "@opencode-ai/sdk/v2";
-import { collectGitCommitMetadata, runGit, tryGit } from "./git-commit-metadata";
 
 type AnyEvent = EventV1 | EventV2;
 type ContextResponse = { context?: string };
@@ -64,6 +64,84 @@ const LOOPBACK_HOSTS = new Set([
   "[::1]",
 ]);
 
+// Git commit-link helpers. INLINED here (not split into a sibling module) and
+// they MUST stay module-private / non-exported: OpenCode's legacy plugin loader
+// invokes every runtime export of a plugin file as a plugin factory, so a second
+// export crashes the host (CHANGELOG 0.9.27 incident #2). Inlining also keeps this
+// plugin a single standalone file that `agentmemory connect opencode --with-plugin`
+// (and the manual `cp` docs / nix) can copy alone into ~/.config/opencode/plugins/.
+type GitCommitMetadata = {
+  readonly sha: string;
+  readonly branch?: string;
+  readonly repo?: string;
+  readonly message: string;
+  readonly author: string;
+  readonly authoredAt: string;
+  readonly files: readonly string[];
+};
+
+const GIT_TIMEOUT_MS = 500;
+
+function runGit(cwd: string, args: readonly string[]): string {
+  return execFileSync("git", ["-C", cwd, ...args], {
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: GIT_TIMEOUT_MS,
+  }).toString().trim();
+}
+
+function tryGit(cwd: string, args: readonly string[]): string | null {
+  try {
+    return runGit(cwd, args);
+  } catch (error) {
+    if (DEBUG) {
+      console.error(
+        `[agentmemory] git ${args.join(" ")} failed:`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    return null;
+  }
+}
+
+// Strip embedded credentials (https://user:TOKEN@host/…) from a remote URL
+// before it leaves the machine. scp-style git@host:path URLs carry no userinfo
+// and pass through unchanged.
+function sanitizeRepoUrl(repo: string): string {
+  try {
+    const url = new URL(repo);
+    if (url.username || url.password) {
+      url.username = "";
+      url.password = "";
+    }
+    return url.toString();
+  } catch {
+    return repo.replace(/^(\w+:\/\/)[^@/]+@/, "$1");
+  }
+}
+
+function collectGitCommitMetadata(cwd: string, sha: string): GitCommitMetadata | null {
+  const branchOutput = tryGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
+  if (branchOutput === null) return null;
+  const repoRaw = tryGit(cwd, ["remote", "get-url", "origin"]);
+  const repo = repoRaw ? sanitizeRepoUrl(repoRaw) : repoRaw;
+  const details = tryGit(cwd, ["show", "-s", "--format=%s%x00%an%x00%aI", sha]);
+  const filesOutput = tryGit(cwd, ["diff-tree", "--no-commit-id", "--name-only", "-r", sha]);
+  if (details === null || filesOutput === null) return null;
+
+  const [message, author, authoredAt] = details.split("\u0000");
+  if (message === undefined || author === undefined || authoredAt === undefined) return null;
+
+  return {
+    sha,
+    ...(branchOutput === "HEAD" ? {} : { branch: branchOutput }),
+    ...(repo ? { repo } : {}),
+    message,
+    author,
+    authoredAt,
+    files: filesOutput.split("\n").filter(Boolean),
+  };
+}
+
 // Resolver intentionally duplicated from src/hooks/_project.ts. The plugin file is copied standalone into ~/.config/opencode/plugins/ by 'agentmemory connect opencode --with-plugin' and cannot import from src/. Keep both copies behaviorally identical; parity enforced by test/_fixtures/project-resolver-scenarios.ts.
 function resolveProject(cwd?: string): string {
   const explicit = process.env["AGENTMEMORY_PROJECT_NAME"];
@@ -102,6 +180,24 @@ async function post(path: string, body: Record<string, unknown>, timeoutMs = TIM
     });
   } catch (e) {
     if (DEBUG) console.error(`[agentmemory] POST ${path} failed:`, (e as Error).message);
+  }
+}
+
+// Like post(), but reports whether the request actually succeeded (HTTP 2xx and
+// no transport error). Callers that advance a cursor on success must use this so a
+// transient failure can be retried instead of silently swallowed.
+async function postOk(path: string, body: Record<string, unknown>, timeoutMs = TIMEOUT_MS): Promise<boolean> {
+  try {
+    const res = await fetch(`${API}/agentmemory${path}`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return res.ok;
+  } catch (e) {
+    if (DEBUG) console.error(`[agentmemory] POST ${path} failed:`, (e as Error).message);
+    return false;
   }
 }
 
@@ -165,9 +261,13 @@ async function linkCommitIfHeadChanged(sessionId: string): Promise<void> {
   if (head === previousHead) return;
 
   const metadata = collectGitCommitMetadata(sessionCwd, head);
+  // Metadata collection failed (transient git error): leave the cursor so the next
+  // tool completion retries rather than permanently skipping this commit.
   if (!metadata) return;
-  await post("/session/commit", { ...metadata, sessionId });
-  lastSeenHeads.set(sessionId, head);
+  // Only advance the cursor when the POST landed. A transient network/5xx failure
+  // leaves lastSeenHeads unchanged so the next tool completion retries the link.
+  const posted = await postOk("/session/commit", { ...metadata, sessionId });
+  if (posted) lastSeenHeads.set(sessionId, head);
 }
 
 function enqueueCommitCheck(sessionId: string): Promise<void> {

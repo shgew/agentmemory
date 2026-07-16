@@ -23,8 +23,9 @@ const MESSAGE = 'fix: preserve $(touch /tmp/not-executed); "quotes"';
 
 let activePlugin: PluginInstance | null = null;
 
-function installFetchMock(): PostCall[] {
+function installFetchMock(commitStatusFor?: (attempt: number) => number): PostCall[] {
   const calls: PostCall[] = [];
+  let commitAttempt = 0;
   vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string"
       ? input
@@ -35,6 +36,12 @@ function installFetchMock(): PostCall[] {
       ? JSON.parse(init.body) as Record<string, unknown>
       : null;
     calls.push({ url, body });
+    if (url.endsWith("/agentmemory/session/commit")) {
+      const status = commitStatusFor ? commitStatusFor(++commitAttempt) : 200;
+      if (status !== 200) {
+        return new Response("commit failed", { status });
+      }
+    }
     return new Response(JSON.stringify({ context: "<test-context>" }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -43,7 +50,7 @@ function installFetchMock(): PostCall[] {
   return calls;
 }
 
-function installGitMock(heads: readonly (string | Error)[]): void {
+function installGitMock(heads: readonly (string | Error)[], repoUrl = "git@example.com:team/repo.git"): void {
   let headIndex = 0;
   vi.mocked(execFileSync).mockImplementation((_file, args) => {
     const command = (args ?? []).slice(2).join(" ");
@@ -53,7 +60,7 @@ function installGitMock(heads: readonly (string | Error)[]): void {
       return Buffer.from(`${value}\n`);
     }
     if (command === "rev-parse --abbrev-ref HEAD") return Buffer.from("feature/commit-link\n");
-    if (command === "remote get-url origin") return Buffer.from("git@example.com:team/repo.git\n");
+    if (command === "remote get-url origin") return Buffer.from(`${repoUrl}\n`);
     if (command.startsWith("show -s --format=")) {
       return Buffer.from(`${MESSAGE}\u0000Agent Tester\u00002026-07-16T10:00:00+00:00\n`);
     }
@@ -64,8 +71,8 @@ function installGitMock(heads: readonly (string | Error)[]): void {
   });
 }
 
-async function loadPlugin(): Promise<{ plugin: PluginInstance; calls: PostCall[] }> {
-  const calls = installFetchMock();
+async function loadPlugin(commitStatusFor?: (attempt: number) => number): Promise<{ plugin: PluginInstance; calls: PostCall[] }> {
+  const calls = installFetchMock(commitStatusFor);
   const plugin = await AgentmemoryCapturePlugin(FAKE_CTX);
   activePlugin = plugin;
   return { plugin, calls };
@@ -186,5 +193,49 @@ describe("OpenCode commit-link capture", () => {
     )).resolves.toBeUndefined();
 
     expect(commitCalls(calls)).toHaveLength(0);
+  });
+
+  it("strips embedded credentials from the repo URL before posting", async () => {
+    installGitMock([OLD_SHA, NEW_SHA], "https://user:secret@example.com/team/repo.git");
+    const { plugin, calls } = await loadPlugin();
+    await startSession(plugin, calls, "ses_creds");
+
+    await plugin["tool.execute.after"]!(
+      { tool: "Bash", sessionID: "ses_creds", callID: "call_creds", args: { command: "git commit -m ignored" } } as any,
+      { output: "committed", title: "git commit", metadata: {} } as any,
+    );
+
+    const commitPost = commitCalls(calls);
+    expect(commitPost).toHaveLength(1);
+    expect(commitPost[0]?.body?.repo).toBe("https://example.com/team/repo.git");
+    const serialized = JSON.stringify(commitPost[0]?.body);
+    expect(serialized).not.toContain("secret");
+    expect(serialized).not.toContain("user:");
+  });
+
+  it("does not advance the head cursor when the commit POST fails, and retries on the next tool completion", async () => {
+    // seedSessionHead consumes OLD_SHA; each linkCommitIfHeadChanged consumes one NEW_SHA.
+    installGitMock([OLD_SHA, NEW_SHA, NEW_SHA]);
+    // First /session/commit POST returns 500; subsequent ones succeed.
+    const { plugin, calls } = await loadPlugin((attempt) => (attempt === 1 ? 500 : 200));
+    await startSession(plugin, calls, "ses_retry");
+
+    await plugin["tool.execute.after"]!(
+      { tool: "Bash", sessionID: "ses_retry", callID: "call_retry_1", args: { command: "git commit -m first" } } as any,
+      { output: "committed", title: "git commit", metadata: {} } as any,
+    );
+    // POST attempted once, but it failed so the cursor stayed on OLD_SHA.
+    expect(commitCalls(calls)).toHaveLength(1);
+
+    await plugin["tool.execute.after"]!(
+      { tool: "Bash", sessionID: "ses_retry", callID: "call_retry_2", args: { command: "git commit -m retry" } } as any,
+      { output: "committed", title: "git commit", metadata: {} } as any,
+    );
+
+    // Same HEAD (NEW_SHA) is retried because the cursor never advanced, and now posts.
+    const commitPost = commitCalls(calls);
+    expect(commitPost).toHaveLength(2);
+    expect(commitPost[0]?.body?.sha).toBe(NEW_SHA);
+    expect(commitPost[1]?.body?.sha).toBe(NEW_SHA);
   });
 });
