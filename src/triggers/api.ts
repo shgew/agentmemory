@@ -788,24 +788,56 @@ export function registerApiTriggers(
   sdk.registerFunction("api::session::commit",
     async (req: ApiRequest): Promise<Response> => {
       const body = (req.body ?? {}) as Record<string, unknown>;
-      const sha = asNonEmptyString(body.sha);
-      if (!sha) {
+      const rawSha = asNonEmptyString(body.sha);
+      if (!rawSha || !/^[0-9a-f]{40}$|^[0-9a-f]{64}$/i.test(rawSha)) {
         return {
           status_code: 400,
-          body: { error: "sha is required and must be a non-empty string" },
+          body: { error: "sha must be a 40- or 64-character hex string" },
         };
       }
+      const sha = rawSha.toLowerCase();
       const sessionId = asNonEmptyString(body.sessionId) ?? undefined;
       const branch = asNonEmptyString(body.branch) ?? undefined;
       const repo = asNonEmptyString(body.repo) ?? undefined;
-      const message = asNonEmptyString(body.message) ?? undefined;
       const author = asNonEmptyString(body.author) ?? undefined;
       const authoredAt = asNonEmptyString(body.authoredAt) ?? undefined;
+      for (const [field, value] of Object.entries({ branch, repo, author, authoredAt })) {
+        if (value && value.length > 2000) {
+          return {
+            status_code: 400,
+            body: { error: `${field} exceeds the 2000 character limit` },
+          };
+        }
+      }
+      const message = asNonEmptyString(body.message)?.slice(0, 2000) ?? undefined;
       const files = Array.isArray(body.files)
-        ? (body.files as unknown[]).filter(
-            (f): f is string => typeof f === "string" && f.length > 0,
-          )
+        ? (body.files as unknown[])
+            .filter((f): f is string => typeof f === "string" && f.length > 0)
+            .slice(0, 200)
+            .map((f) => f.slice(0, 1000))
         : undefined;
+
+      // Agent-scope isolation: mirror the filter resolution used by
+      // api::sessions. A body agentId pins the caller; isolated mode falls
+      // back to the env AGENT_ID; "*" opts out entirely.
+      const normalizedAgentId =
+        typeof body.agentId === "string" ? body.agentId.trim() : undefined;
+      const wildcardAgent = normalizedAgentId === "*";
+      const explicitAgentId =
+        normalizedAgentId && !wildcardAgent ? normalizedAgentId : undefined;
+      const filterAgentId = wildcardAgent
+        ? undefined
+        : explicitAgentId ??
+          (isAgentScopeIsolated() ? getAgentId() : undefined);
+      if (sessionId && filterAgentId) {
+        const owner = await kv.get<Session>(KV.sessions, sessionId);
+        if (owner && owner.agentId && owner.agentId !== filterAgentId) {
+          return {
+            status_code: 403,
+            body: { error: "session belongs to a different agent" },
+          };
+        }
+      }
 
       const link = await withKeyedLock(`commit:${sha}`, async () => {
         const existing = await kv.get<CommitLink>(KV.commits, sha);
@@ -814,12 +846,12 @@ export function registerApiTriggers(
         const merged: CommitLink = {
           sha,
           shortSha: existing?.shortSha ?? sha.slice(0, 7),
-          branch: branch ?? existing?.branch,
-          repo: repo ?? existing?.repo,
-          message: message ?? existing?.message,
-          author: author ?? existing?.author,
-          authoredAt: authoredAt ?? existing?.authoredAt,
-          files: files ?? existing?.files,
+          branch: existing?.branch ?? branch,
+          repo: existing?.repo ?? repo,
+          message: existing?.message ?? message,
+          author: existing?.author ?? author,
+          authoredAt: existing?.authoredAt ?? authoredAt,
+          files: existing?.files ?? files,
           sessionIds: Array.from(sessionSet),
           linkedAt: existing?.linkedAt ?? new Date().toISOString(),
         };
@@ -872,7 +904,29 @@ export function registerApiTriggers(
       const fetched = await Promise.all(
         (link.sessionIds ?? []).map((sid) => kv.get<Session>(KV.sessions, sid)),
       );
-      const sessions = fetched.filter((s): s is Session => s !== null);
+      const allSessions = fetched.filter((s): s is Session => s !== null);
+      const normalizedAgentId =
+        typeof req.query_params?.["agentId"] === "string"
+          ? req.query_params["agentId"].trim()
+          : undefined;
+      const wildcardAgent = normalizedAgentId === "*";
+      const explicitAgentId =
+        normalizedAgentId && !wildcardAgent ? normalizedAgentId : undefined;
+      const filterAgentId = wildcardAgent
+        ? undefined
+        : explicitAgentId ??
+          (isAgentScopeIsolated() ? getAgentId() : undefined);
+      const sessions = filterAgentId
+        ? allSessions.filter((s) => s.agentId === filterAgentId)
+        : allSessions;
+      // Don't leak another agent's commit metadata: when a filter is active
+      // and none of the linked sessions are visible, treat it as not found.
+      if (filterAgentId && sessions.length === 0) {
+        return {
+          status_code: 404,
+          body: { error: "no sessions linked to this commit" },
+        };
+      }
       return { status_code: 200, body: { commit: link, sessions } };
     },
   );
@@ -894,8 +948,31 @@ export function registerApiTriggers(
       const repo = asNonEmptyString(req.query_params?.["repo"]);
       const rawLimit = parseOptionalInt(req.query_params?.["limit"]);
       const limit = Math.max(1, Math.min(500, rawLimit ?? 100));
+      const normalizedAgentId =
+        typeof req.query_params?.["agentId"] === "string"
+          ? req.query_params["agentId"].trim()
+          : undefined;
+      const wildcardAgent = normalizedAgentId === "*";
+      const explicitAgentId =
+        normalizedAgentId && !wildcardAgent ? normalizedAgentId : undefined;
+      const filterAgentId = wildcardAgent
+        ? undefined
+        : explicitAgentId ??
+          (isAgentScopeIsolated() ? getAgentId() : undefined);
       const all = await kv.list<CommitLink>(KV.commits);
-      const filtered = all
+      let visible = all;
+      if (filterAgentId) {
+        const sessions = await kv.list<Session>(KV.sessions);
+        const allowedSessionIds = new Set(
+          sessions
+            .filter((s) => s.agentId === filterAgentId)
+            .map((s) => s.id),
+        );
+        visible = all.filter((c) =>
+          (c.sessionIds ?? []).some((sid) => allowedSessionIds.has(sid)),
+        );
+      }
+      const filtered = visible
         .filter((c) => !branch || c.branch === branch)
         .filter((c) => !repo || c.repo === repo)
         .sort((a, b) => ((a.linkedAt ?? "") < (b.linkedAt ?? "") ? 1 : -1))

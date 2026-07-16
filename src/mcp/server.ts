@@ -1296,9 +1296,28 @@ export function registerMcpEndpoints(
             }
             const linkRecord = link as { sessionIds?: string[] };
             const fetched = await Promise.all(
-              (linkRecord.sessionIds ?? []).map((sid) => kv.get(KV.sessions, sid)),
+              (linkRecord.sessionIds ?? []).map((sid) => kv.get<Session>(KV.sessions, sid)),
             );
-            const sessions = fetched.filter((s) => s !== null);
+            const allSessions = fetched.filter((s): s is Session => s !== null);
+            const normalizedAgentId =
+              typeof args.agentId === "string" ? args.agentId.trim() : undefined;
+            const wildcardAgent = normalizedAgentId === "*";
+            const explicitAgentId =
+              normalizedAgentId && !wildcardAgent ? normalizedAgentId : undefined;
+            const filterAgentId = wildcardAgent
+              ? undefined
+              : explicitAgentId ??
+                (isAgentScopeIsolated() ? getAgentId() : undefined);
+            const sessions = filterAgentId
+              ? allSessions.filter((s) => s.agentId === filterAgentId)
+              : allSessions;
+            // Don't leak another agent's commit metadata under isolation.
+            if (filterAgentId && sessions.length === 0) {
+              return {
+                status_code: 200,
+                body: { content: [{ type: "text", text: JSON.stringify({ commit: null, sessions: [] }, null, 2) }] },
+              };
+            }
             return {
               status_code: 200,
               body: { content: [{ type: "text", text: JSON.stringify({ commit: link, sessions }, null, 2) }] },
@@ -1309,8 +1328,29 @@ export function registerMcpEndpoints(
             const branch = typeof args.branch === "string" ? args.branch : undefined;
             const repo = typeof args.repo === "string" ? args.repo : undefined;
             const limit = Math.max(1, Math.min(500, asNumber(args.limit, 100) ?? 100));
+            const normalizedAgentId =
+              typeof args.agentId === "string" ? args.agentId.trim() : undefined;
+            const wildcardAgent = normalizedAgentId === "*";
+            const explicitAgentId =
+              normalizedAgentId && !wildcardAgent ? normalizedAgentId : undefined;
+            const filterAgentId = wildcardAgent
+              ? undefined
+              : explicitAgentId ??
+                (isAgentScopeIsolated() ? getAgentId() : undefined);
             const all = await kv.list(KV.commits);
-            const filtered = (all as Array<{ branch?: string; repo?: string; linkedAt?: string }>)
+            let visible = all as Array<{ branch?: string; repo?: string; linkedAt?: string; sessionIds?: string[] }>;
+            if (filterAgentId) {
+              const sessions = await kv.list<Session>(KV.sessions);
+              const allowedSessionIds = new Set(
+                sessions
+                  .filter((s) => s.agentId === filterAgentId)
+                  .map((s) => s.id),
+              );
+              visible = visible.filter((c) =>
+                (c.sessionIds ?? []).some((sid) => allowedSessionIds.has(sid)),
+              );
+            }
+            const filtered = visible
               .filter((c) => !branch || c.branch === branch)
               .filter((c) => !repo || c.repo === repo)
               .sort((a, b) => ((a.linkedAt ?? "") < (b.linkedAt ?? "") ? 1 : -1))
