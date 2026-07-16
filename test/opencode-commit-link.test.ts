@@ -46,7 +46,7 @@ function installFetchMock(): PostCall[] {
 function installGitMock(heads: readonly (string | Error)[]): void {
   let headIndex = 0;
   vi.mocked(execFileSync).mockImplementation((_file, args) => {
-    const command = args.slice(2).join(" ");
+    const command = (args ?? []).slice(2).join(" ");
     if (command === "rev-parse HEAD") {
       const value = heads[headIndex++];
       if (value instanceof Error) throw value;
@@ -120,7 +120,7 @@ describe("OpenCode commit-link capture", () => {
     });
     for (const [file, args, options] of vi.mocked(execFileSync).mock.calls) {
       expect(file).toBe("git");
-      expect(args.slice(0, 2)).toEqual(["-C", FAKE_CTX.directory]);
+      expect(args?.slice(0, 2)).toEqual(["-C", FAKE_CTX.directory]);
       expect(options).toMatchObject({ timeout: expect.any(Number) });
     }
   });
