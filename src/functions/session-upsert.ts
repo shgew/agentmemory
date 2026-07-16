@@ -15,7 +15,6 @@ export type SessionUpsertInput = {
 
 export type SessionUpsertResult = {
   readonly session: Session;
-  readonly created: boolean;
   readonly projectConflict: boolean;
 };
 
@@ -47,18 +46,13 @@ export function upsertSession(
         ...(input.agentId ? { agentId: input.agentId } : {}),
       };
       await kv.set(KV.sessions, input.sessionId, session);
-      return { session, created: true, projectConflict: false };
+      return { session, projectConflict: false };
     }
 
-    const observations = await kv.list(KV.observations(input.sessionId));
+    // Metadata enrichment only backfills empty durable fields; keep it under
+    // the outer session: lock. The observation-count repair is deliberately
+    // NOT done here — see the nested obs: lock below.
     const ops: UpdateOp[] = [];
-    if (existing.observationCount < observations.length) {
-      ops.push({
-        type: "set",
-        path: "observationCount",
-        value: observations.length,
-      });
-    }
     if (isEmpty(existing.summary) && input.summary) {
       ops.push({ type: "set", path: "summary", value: input.summary });
     }
@@ -79,13 +73,40 @@ export function upsertSession(
       });
     }
 
-    const session =
-      ops.length > 0
-        ? await kv.update<Session>(KV.sessions, input.sessionId, ops)
-        : existing;
+    if (ops.length > 0) {
+      await kv.update<Session>(KV.sessions, input.sessionId, ops);
+    }
+
+    // observationCount is a read-modify-write counter that mem::observe
+    // maintains under withKeyedLock(`obs:${id}`) WITHOUT ever taking the
+    // session: lock (observe.ts:196 lists/updates the sessions row under obs:
+    // only). So the session: lock alone never protected the count: a
+    // concurrent observe could commit N+1 in the window between our list() and
+    // our update(), and our stale write would clobber it (or vice versa).
+    // Serialize the repair with observe's increment by running it under the
+    // SAME obs: lock — re-read the row, list observations, and only grow the
+    // count, never shrink it.
+    //
+    // Lock order: session: -> obs:. NEVER acquire session: while holding obs:.
+    // Verified: the only obs: holders (observe.ts:111/196,
+    // session-checkpoint.ts:35) touch the sessions row via kv.update WITHOUT
+    // taking session:, and the only other session: holder (api.ts commit-link,
+    // api.ts:831) never takes obs:. No path acquires obs: then session:, so
+    // there is no lock-ordering cycle and this nesting cannot deadlock.
+    const session = await withKeyedLock(`obs:${input.sessionId}`, async () => {
+      const current =
+        (await kv.get<Session>(KV.sessions, input.sessionId)) ?? existing;
+      const observations = await kv.list(KV.observations(input.sessionId));
+      if (current.observationCount < observations.length) {
+        return kv.update<Session>(KV.sessions, input.sessionId, [
+          { type: "set", path: "observationCount", value: observations.length },
+        ]);
+      }
+      return current;
+    });
+
     return {
       session,
-      created: false,
       projectConflict: existing.project !== input.project,
     };
   });
