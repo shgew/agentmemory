@@ -26,6 +26,7 @@ import {
 import { getSummarizeTimeoutMs } from "../functions/summarize.js";
 import { getGraphExtractTimeoutMs } from "../functions/graph.js";
 import { validateMapping } from "../functions/migrate.js";
+import { upsertSession } from "../functions/session-upsert.js";
 
 type Response = {
   status_code: number;
@@ -613,26 +614,32 @@ export function registerApiTriggers(
           ? body.agentId.trim().slice(0, 128)
           : undefined;
       const agentId = requestAgentId ?? getAgentId();
-      const session: Session = {
-        id: sessionId,
+      const { session, projectConflict } = await upsertSession(kv, {
+        sessionId,
         project,
         cwd,
-        startedAt: new Date().toISOString(),
-        status: "active",
-        observationCount: 0,
         ...(parentSessionId ? { parentSessionId } : {}),
         ...(title ? { summary: title.slice(0, 200) } : {}),
         ...(title ? { firstPrompt: title.slice(0, 200) } : {}),
         ...(agentId ? { agentId } : {}),
-      };
-      await kv.set(KV.sessions, sessionId, session);
+      });
+      if (projectConflict) {
+        logger.warn("Session project conflict on start", {
+          sessionId,
+          existingProject: session.project,
+          incomingProject: project,
+        });
+      }
       const contextResult = await sdk.trigger<
         { sessionId: string; project: string },
         { context: string }
-      >({ function_id: "mem::context", payload: { sessionId, project } });
+      >({
+        function_id: "mem::context",
+        payload: { sessionId, project: session.project },
+      });
       return {
         status_code: 200,
-        body: { session, context: contextResult.context },
+        body: { session, context: contextResult.context, projectConflict },
       };
     },
   );

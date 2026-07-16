@@ -9,6 +9,7 @@ import { isAfter } from "../state/timestamp-compare.js";
 import { getSummarizeTimeoutMs } from "../functions/summarize.js";
 import { getGraphExtractTimeoutMs } from "../functions/graph.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
+import { upsertSession } from "../functions/session-upsert.js";
 
 // Consolidation runs through a bounded pool (CONSOLIDATION_CONCURRENCY, default
 // 1 = serial). Each task holds withKeyedLock("session:consolidate:<id>") so two
@@ -98,21 +99,20 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction(
     "event::session::started",
     async (data: { sessionId: string; project: string; cwd: string }) => {
-      const session: Session = {
-        id: data.sessionId,
-        project: data.project,
-        cwd: data.cwd,
-        startedAt: new Date().toISOString(),
-        status: "active",
-        observationCount: 0,
-      };
-      await kv.set(KV.sessions, data.sessionId, session);
+      const { session, projectConflict } = await upsertSession(kv, data);
+      if (projectConflict) {
+        logger.warn("Session project conflict on start", {
+          sessionId: data.sessionId,
+          existingProject: session.project,
+          incomingProject: data.project,
+        });
+      }
       const contextResult = await sdk.trigger<
         { sessionId: string; project: string },
         { context: string }
       >({
         function_id: "mem::context",
-        payload: { sessionId: data.sessionId, project: data.project },
+        payload: { sessionId: data.sessionId, project: session.project },
       });
       return { session, context: contextResult.context };
     },
