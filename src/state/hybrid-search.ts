@@ -20,6 +20,12 @@ import { isGraphSearchEnabled } from "../config.js";
 
 const RRF_K = 60;
 
+export interface HybridSearchTimings {
+  bm25SearchMs: number;
+  vectorSearchMs: number;
+  rankingRrfFusionMs: number;
+}
+
 export class HybridSearch {
   private graphRetrieval: GraphRetrieval;
 
@@ -37,8 +43,12 @@ export class HybridSearch {
     this.graphRetrieval = new GraphRetrieval(kv);
   }
 
-  async search(query: string, limit = 20): Promise<HybridSearchResult[]> {
-    return this.tripleStreamSearch(query, limit);
+  async search(
+    query: string,
+    limit = 20,
+    timings?: HybridSearchTimings,
+  ): Promise<HybridSearchResult[]> {
+    return this.tripleStreamSearch(query, limit, undefined, timings);
   }
 
   async searchWithExpansion(
@@ -80,8 +90,16 @@ export class HybridSearch {
     query: string,
     limit: number,
     entityHints?: string[],
+    timings?: HybridSearchTimings,
   ): Promise<HybridSearchResult[]> {
+    if (timings) {
+      timings.bm25SearchMs = 0;
+      timings.vectorSearchMs = 0;
+      timings.rankingRrfFusionMs = 0;
+    }
+    const bm25StartedAt = timings ? performance.now() : 0;
     const bm25Results = this.bm25.search(query, limit * 2);
+    if (timings) timings.bm25SearchMs = performance.now() - bm25StartedAt;
 
     let vectorResults: Array<{
       obsId: string;
@@ -91,11 +109,14 @@ export class HybridSearch {
     let queryEmbedding: Float32Array | null = null;
 
     if (this.vector && this.embeddingProvider && this.vector.size > 0) {
+      const vectorStartedAt = timings ? performance.now() : 0;
       try {
         queryEmbedding = await this.embeddingProvider.embed(query);
         vectorResults = this.vector.search(queryEmbedding, limit * 2);
       } catch {
         // fall through to BM25-only
+      } finally {
+        if (timings) timings.vectorSearchMs = performance.now() - vectorStartedAt;
       }
     }
 
@@ -132,6 +153,7 @@ export class HybridSearch {
       }
     }
 
+    const rankingStartedAt = timings ? performance.now() : 0;
     const scores = new Map<
       string,
       {
@@ -237,12 +259,21 @@ export class HybridSearch {
         const head = enriched.slice(0, rerankWindow);
         const tail = enriched.slice(rerankWindow);
         const reranked = await rerank(query, head, rerankWindow);
+        if (timings) {
+          timings.rankingRrfFusionMs = performance.now() - rankingStartedAt;
+        }
         return reranked.concat(tail).slice(0, limit);
       } catch {
+        if (timings) {
+          timings.rankingRrfFusionMs = performance.now() - rankingStartedAt;
+        }
         return enriched.slice(0, limit);
       }
     }
 
+    if (timings) {
+      timings.rankingRrfFusionMs = performance.now() - rankingStartedAt;
+    }
     return enriched.slice(0, limit);
   }
 

@@ -1,7 +1,10 @@
 /// <reference types="node" />
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { HybridSearch } from "../src/state/hybrid-search.js";
+import {
+  HybridSearch,
+  type HybridSearchTimings,
+} from "../src/state/hybrid-search.js";
 import { SearchIndex } from "../src/state/search-index.js";
 import type {
   CompressedObservation,
@@ -73,6 +76,30 @@ describe("HybridSearch", () => {
     expect(results[0].observation.id).toBe("obs_1");
     expect(results[0].vectorScore).toBe(0);
     expect(results[0].bm25Score).toBeGreaterThan(0);
+  });
+
+  it("records vector, keyword, and RRF timings without changing results", async () => {
+    const obs = makeObs({ id: "obs_1", sessionId: "ses_1" });
+    bm25.add(obs);
+    await kv.set("mem:obs:ses_1", "obs_1", obs);
+    const timings: HybridSearchTimings = {
+      vectorSearchMs: 0,
+      bm25SearchMs: 0,
+      rankingRrfFusionMs: 0,
+    };
+
+    const results = await new HybridSearch(bm25, null, null, kv as never).search(
+      "auth",
+      20,
+      timings,
+    );
+
+    expect(results.map((result) => result.observation.id)).toEqual(["obs_1"]);
+    expect(timings).toEqual({
+      vectorSearchMs: expect.any(Number),
+      bm25SearchMs: expect.any(Number),
+      rankingRrfFusionMs: expect.any(Number),
+    });
   });
 
   it("returns empty results for no-match query", async () => {
