@@ -1,10 +1,10 @@
 /// <reference types="node" />
-import { execFileSync } from "node:child_process";
 import { basename, resolve } from "node:path";
 import { env } from "node:process";
 import type { Plugin } from "@opencode-ai/plugin";
 import type { Event as EventV1, Part } from "@opencode-ai/sdk";
 import type { Event as EventV2 } from "@opencode-ai/sdk/v2";
+import { collectGitCommitMetadata, runGit, tryGit } from "./git-commit-metadata";
 
 type AnyEvent = EventV1 | EventV2;
 type ContextResponse = { context?: string };
@@ -45,21 +45,10 @@ type TodoPayload = { content?: string; priority?: string; status?: string };
 type QuestionOptionPayload = { label?: unknown; description?: unknown };
 type QuestionPayload = { question?: unknown; header?: unknown; options?: readonly QuestionOptionPayload[] };
 type QuestionToolPayload = { callID?: string; messageID?: string };
-export type GitCommitMetadata = {
-  readonly sha: string;
-  readonly branch?: string;
-  readonly repo?: string;
-  readonly message: string;
-  readonly author: string;
-  readonly authoredAt: string;
-  readonly files: readonly string[];
-};
-
 const API = env.AGENTMEMORY_URL || "http://localhost:3111";
 const FILE_TOOLS = new Set(["Read", "Write", "Edit", "Glob", "Grep"]);
 const FILE_KEYS = ["filePath", "file_path", "path", "file", "pattern"];
 const MAX_STASHED_FILES = 20;
-const GIT_TIMEOUT_MS = 500;
 
 const DEBUG = env.OPENCODE_AGENTMEMORY_DEBUG === "1";
 const SECRET = env.AGENTMEMORY_SECRET || "";
@@ -95,49 +84,6 @@ function resolveProject(cwd?: string): string {
 
 function gitRevParse(cwd: string, arg: string): string {
   return runGit(cwd, ["rev-parse", arg]);
-}
-
-function runGit(cwd: string, args: readonly string[]): string {
-  return execFileSync("git", ["-C", cwd, ...args], {
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: GIT_TIMEOUT_MS,
-  }).toString().trim();
-}
-
-function tryGit(cwd: string, args: readonly string[]): string | null {
-  try {
-    return runGit(cwd, args);
-  } catch (error) {
-    if (DEBUG) {
-      console.error(
-        `[agentmemory] git ${args.join(" ")} failed:`,
-        error instanceof Error ? error.message : String(error),
-      );
-    }
-    return null;
-  }
-}
-
-export function collectGitCommitMetadata(cwd: string, sha: string): GitCommitMetadata | null {
-  const branchOutput = tryGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  if (branchOutput === null) return null;
-  const repo = tryGit(cwd, ["remote", "get-url", "origin"]);
-  const details = tryGit(cwd, ["show", "-s", "--format=%s%x00%an%x00%aI", sha]);
-  const filesOutput = tryGit(cwd, ["diff-tree", "--no-commit-id", "--name-only", "-r", sha]);
-  if (details === null || filesOutput === null) return null;
-
-  const [message, author, authoredAt] = details.split("\u0000");
-  if (message === undefined || author === undefined || authoredAt === undefined) return null;
-
-  return {
-    sha,
-    ...(branchOutput === "HEAD" ? {} : { branch: branchOutput }),
-    ...(repo ? { repo } : {}),
-    message,
-    author,
-    authoredAt,
-    files: filesOutput.split("\n").filter(Boolean),
-  };
 }
 
 function authHeaders(): Record<string, string> {
