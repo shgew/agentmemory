@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { backfillLessonCorrections } from "../src/functions/lesson-corrections.js";
 import { registerLessonsFunctions } from "../src/functions/lessons.js";
 import { registerVerifyFunction } from "../src/functions/verify.js";
 import { KV } from "../src/state/schema.js";
-import type { Lesson } from "../src/types.js";
+import type { AuditEntry, Lesson } from "../src/types.js";
 import { mockKV, mockSdk } from "./helpers/mocks.js";
 
 const OBSOLETE_ID = "lsn_559d51303e2a617f";
@@ -131,5 +132,107 @@ describe("Historical lesson correction backfill", () => {
     expect(
       (await kv.get<Lesson>(KV.lessons, markerCorrectionId))?.corrects,
     ).toBeUndefined();
+  });
+
+  it("does not duplicate correction links or provenance when run twice", async () => {
+    const first = (await sdk.trigger("mem::lesson-correction-backfill", {
+      dryRun: false,
+    })) as { applied: unknown[] };
+    const second = (await sdk.trigger("mem::lesson-correction-backfill", {
+      dryRun: false,
+    })) as { applied: unknown[]; alreadyLinked: unknown[] };
+    const correction = await kv.get<Lesson>(KV.lessons, CORRECTION_ID);
+    const audits = await kv.list<AuditEntry>(KV.audit);
+
+    expect(first.applied).toHaveLength(1);
+    expect(second.applied).toEqual([]);
+    expect(second.alreadyLinked).toHaveLength(1);
+    expect(
+      correction?.corrects?.filter((lessonId) => lessonId === OBSOLETE_ID),
+    ).toHaveLength(1);
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toEqual(
+      expect.objectContaining({
+        operation: "lesson_strengthen",
+        functionId: "mem::lesson-correction-backfill",
+        targetIds: [CORRECTION_ID, OBSOLETE_ID],
+      }),
+    );
+  });
+
+  it("skips an explicit marker whose target lesson does not exist", async () => {
+    const correctionId = "lsn_deadbeef00000001";
+    const missingId = "lsn_deadbeef00000002";
+    await kv.set(
+      KV.lessons,
+      correctionId,
+      makeLesson(correctionId, `CORRECTS ${missingId}: use the current API.`),
+    );
+
+    const result = await backfillLessonCorrections(kv as never, {
+      dryRun: false,
+      confirmedPairs: [],
+    });
+
+    expect(result.applied).toEqual([]);
+    expect(result.skipped).toContainEqual(
+      expect.objectContaining({
+        correctionId,
+        correctedId: missingId,
+        reason: "correction target not found",
+      }),
+    );
+    expect((await kv.get<Lesson>(KV.lessons, correctionId))?.corrects).toBeUndefined();
+  });
+
+  it("reports exact cross-project claims instead of applying them", async () => {
+    const targetId = "lsn_deadbeef00000003";
+    const correctionId = "lsn_deadbeef00000004";
+    await kv.set(
+      KV.lessons,
+      targetId,
+      { ...makeLesson(targetId, "Old guidance"), project: "ios-main" },
+    );
+    await kv.set(
+      KV.lessons,
+      correctionId,
+      {
+        ...makeLesson(correctionId, `CORRECTION to ${targetId}: new guidance.`),
+        project: "design-system",
+      },
+    );
+
+    const result = await backfillLessonCorrections(kv as never, {
+      dryRun: false,
+      confirmedPairs: [],
+    });
+
+    expect(result.skipped).toContainEqual(
+      expect.objectContaining({
+        correctionId,
+        correctedId: targetId,
+        reason: "correction targets must use the same project scope",
+      }),
+    );
+  });
+
+  it("ignores lesson references without an explicit correction marker", async () => {
+    const correctionId = "lsn_deadbeef00000005";
+    await kv.set(
+      KV.lessons,
+      correctionId,
+      makeLesson(
+        correctionId,
+        `Current allocator notes discuss ${OBSOLETE_ID} and use similar terminology.`,
+      ),
+    );
+
+    const result = await backfillLessonCorrections(kv as never, {
+      dryRun: false,
+      confirmedPairs: [],
+    });
+
+    expect(result.explicitMarkerPairs).toEqual([]);
+    expect(result.applied).toEqual([]);
   });
 });
