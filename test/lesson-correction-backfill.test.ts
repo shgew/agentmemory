@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { registerLessonsFunctions } from "../src/functions/lessons.js";
 import { registerVerifyFunction } from "../src/functions/verify.js";
 import { KV } from "../src/state/schema.js";
 import type { Lesson } from "../src/types.js";
@@ -32,6 +33,7 @@ describe("Historical lesson correction backfill", () => {
   beforeEach(async () => {
     sdk = mockSdk();
     kv = mockKV();
+    registerLessonsFunctions(sdk as never, kv as never);
     registerVerifyFunction(sdk as never, kv as never);
     await kv.set(
       KV.lessons,
@@ -57,5 +59,77 @@ describe("Historical lesson correction backfill", () => {
     expect(obsolete.correctedBy).toEqual([]);
     expect(correction.correctionChain).toEqual([]);
     expect(correction.corrects).toEqual([]);
+  });
+
+  it("links the confirmed historical pair through the registered backfill", async () => {
+    const result = (await sdk.trigger("mem::lesson-correction-backfill", {
+      dryRun: false,
+    })) as {
+      success: boolean;
+      applied: Array<{
+        correctionId: string;
+        correctedId: string;
+        source: string;
+      }>;
+    };
+
+    const obsolete = (await sdk.trigger("mem::verify", {
+      id: OBSOLETE_ID,
+    })) as {
+      correctedBy: Array<{ lesson: Lesson }>;
+    };
+    const correction = (await sdk.trigger("mem::verify", {
+      id: CORRECTION_ID,
+    })) as {
+      corrects: Array<{ lesson: Lesson }>;
+    };
+
+    expect(result.success).toBe(true);
+    expect(result.applied).toEqual([
+      expect.objectContaining({
+        correctionId: CORRECTION_ID,
+        correctedId: OBSOLETE_ID,
+        source: "confirmed",
+      }),
+    ]);
+    expect(obsolete.correctedBy[0]?.lesson.id).toBe(CORRECTION_ID);
+    expect(correction.corrects[0]?.lesson.id).toBe(OBSOLETE_ID);
+    expect(await kv.list<Lesson>(KV.lessons)).toHaveLength(2);
+    expect((await kv.get<Lesson>(KV.lessons, CORRECTION_ID))?.confidence).toBe(0.7);
+    expect((await kv.get<Lesson>(KV.lessons, CORRECTION_ID))?.reinforcements).toBe(0);
+  });
+
+  it("finds exact prose markers in dry-run mode without mutating lessons", async () => {
+    const markerCorrectionId = "lsn_marker_correction";
+    await kv.set(
+      KV.lessons,
+      markerCorrectionId,
+      makeLesson(
+        markerCorrectionId,
+        `CORRECTION (supersedes the old allocator claim in ${OBSOLETE_ID}): use measured settings.`,
+      ),
+    );
+
+    const result = (await sdk.trigger("mem::lesson-correction-backfill", {
+      dryRun: true,
+    })) as {
+      dryRun: boolean;
+      explicitMarkerPairs: Array<{ correctionId: string; correctedId: string }>;
+      wouldApply: Array<{ correctionId: string; correctedId: string }>;
+      applied: unknown[];
+    };
+
+    expect(result.dryRun).toBe(true);
+    expect(result.explicitMarkerPairs).toContainEqual(
+      expect.objectContaining({
+        correctionId: markerCorrectionId,
+        correctedId: OBSOLETE_ID,
+      }),
+    );
+    expect(result.wouldApply).toHaveLength(2);
+    expect(result.applied).toEqual([]);
+    expect(
+      (await kv.get<Lesson>(KV.lessons, markerCorrectionId))?.corrects,
+    ).toBeUndefined();
   });
 });
