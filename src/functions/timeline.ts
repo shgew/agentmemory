@@ -6,11 +6,12 @@ import type {
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
-import { recordAccessBatch } from "./access-tracker.js";
+import { recordOwnedAccessBatch } from "./access-tracker.js";
 import { logger } from "../logger.js";
 
 export function registerTimelineFunction(sdk: ISdk, kv: StateKV): void {
-  sdk.registerFunction("mem::timeline", 
+  sdk.registerFunction(
+    "mem::timeline",
     async (data: {
       anchor: string;
       project?: string;
@@ -91,9 +92,13 @@ export function registerTimelineFunction(sdk: ISdk, kv: StateKV): void {
         });
       }
 
-      void recordAccessBatch(
+      void recordOwnedAccessBatch(
         kv,
-        entries.map((e) => e.observation.id),
+        entries.map((entry) => ({
+          id: entry.observation.id,
+          scope: "observation" as const,
+          sessionId: entry.sessionId,
+        })),
       );
 
       logger.info("Timeline retrieved", {

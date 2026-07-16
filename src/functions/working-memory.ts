@@ -3,7 +3,7 @@ import type { Memory } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
-import { recordAccessBatch } from "./access-tracker.js";
+import { recordOwnedAccessBatch } from "./access-tracker.js";
 import { logger } from "../logger.js";
 
 const CORE_SCOPE = "mem:core-memory";
@@ -36,7 +36,8 @@ export function registerWorkingMemoryFunctions(
   kv: StateKV,
   tokenBudget: number,
 ): void {
-  sdk.registerFunction("mem::core-add", 
+  sdk.registerFunction(
+    "mem::core-add",
     async (data: {
       content: string;
       importance?: number;
@@ -69,35 +70,32 @@ export function registerWorkingMemoryFunctions(
     },
   );
 
-  sdk.registerFunction("mem::core-remove", 
-    async (data: { id: string }) => {
-      if (!data?.id) return { success: false, error: "id is required" };
-      await kv.delete(CORE_SCOPE, data.id);
+  sdk.registerFunction("mem::core-remove", async (data: { id: string }) => {
+    if (!data?.id) return { success: false, error: "id is required" };
+    await kv.delete(CORE_SCOPE, data.id);
 
-      try {
-        await recordAudit(kv, "core_remove", "mem::core-remove", [data.id], {});
-      } catch {}
+    try {
+      await recordAudit(kv, "core_remove", "mem::core-remove", [data.id], {});
+    } catch {}
 
-      return { success: true };
-    },
-  );
+    return { success: true };
+  });
 
-  sdk.registerFunction("mem::core-list", 
-    async () => {
-      const entries = await kv.list<CoreMemoryEntry>(CORE_SCOPE);
-      entries.sort((a, b) => b.importance - a.importance);
-      return {
-        success: true,
-        entries,
-        totalTokens: entries.reduce(
-          (sum, e) => sum + estimateTokens(e.content),
-          0,
-        ),
-      };
-    },
-  );
+  sdk.registerFunction("mem::core-list", async () => {
+    const entries = await kv.list<CoreMemoryEntry>(CORE_SCOPE);
+    entries.sort((a, b) => b.importance - a.importance);
+    return {
+      success: true,
+      entries,
+      totalTokens: entries.reduce(
+        (sum, e) => sum + estimateTokens(e.content),
+        0,
+      ),
+    };
+  });
 
-  sdk.registerFunction("mem::working-context", 
+  sdk.registerFunction(
+    "mem::working-context",
     async (data: { budget?: number }) => {
       const budget = data.budget || tokenBudget;
       const now = Date.now();
@@ -152,7 +150,10 @@ export function registerWorkingMemoryFunctions(
         usedTokens += tokens;
       }
 
-      void recordAccessBatch(kv, archivalIds);
+      void recordOwnedAccessBatch(
+        kv,
+        archivalIds.map((id) => ({ id, scope: "memory" })),
+      );
 
       const pagedOut = active.length - archivalLines.length;
 
@@ -191,64 +192,62 @@ export function registerWorkingMemoryFunctions(
     },
   );
 
-  sdk.registerFunction("mem::auto-page", 
-    async (data: { budget?: number }) => {
-      const budget = data?.budget || tokenBudget;
-      const coreBudget = Math.floor(budget * 0.3);
+  sdk.registerFunction("mem::auto-page", async (data: { budget?: number }) => {
+    const budget = data?.budget || tokenBudget;
+    const coreBudget = Math.floor(budget * 0.3);
 
-      const entries = await kv.list<CoreMemoryEntry>(CORE_SCOPE);
-      let totalTokens = entries.reduce(
-        (sum, e) => sum + estimateTokens(e.content),
-        0,
-      );
+    const entries = await kv.list<CoreMemoryEntry>(CORE_SCOPE);
+    let totalTokens = entries.reduce(
+      (sum, e) => sum + estimateTokens(e.content),
+      0,
+    );
 
-      if (totalTokens <= coreBudget) {
-        return { success: true, paged: 0, totalTokens, budget: coreBudget };
-      }
+    if (totalTokens <= coreBudget) {
+      return { success: true, paged: 0, totalTokens, budget: coreBudget };
+    }
 
-      const now = Date.now();
-      const unpinned = entries
-        .filter((e) => !e.pinned)
-        .sort((a, b) => scoreEntry(a, now) - scoreEntry(b, now));
+    const now = Date.now();
+    const unpinned = entries
+      .filter((e) => !e.pinned)
+      .sort((a, b) => scoreEntry(a, now) - scoreEntry(b, now));
 
-      let paged = 0;
-      const pagedIds: string[] = [];
-      for (const entry of unpinned) {
-        if (totalTokens <= coreBudget) break;
-        const tokens = estimateTokens(entry.content);
+    let paged = 0;
+    const pagedIds: string[] = [];
+    for (const entry of unpinned) {
+      if (totalTokens <= coreBudget) break;
+      const tokens = estimateTokens(entry.content);
 
-        const archivalMemory: Memory = {
-          id: generateId("mem"),
-          createdAt: entry.createdAt,
-          updatedAt: new Date().toISOString(),
-          type: "fact",
-          title: entry.content.slice(0, 80),
-          content: entry.content,
-          concepts: [],
-          files: [],
-          sessionIds: [],
-          strength: entry.importance / 10,
-          version: 1,
-          isLatest: true,
-        };
-        await kv.set(KV.memories, archivalMemory.id, archivalMemory);
-        await kv.delete(CORE_SCOPE, entry.id);
+      const archivalMemory: Memory = {
+        id: generateId("mem"),
+        createdAt: entry.createdAt,
+        updatedAt: new Date().toISOString(),
+        type: "fact",
+        title: entry.content.slice(0, 80),
+        content: entry.content,
+        concepts: [],
+        files: [],
+        sessionIds: [],
+        strength: entry.importance / 10,
+        version: 1,
+        isLatest: true,
+      };
+      await kv.set(KV.memories, archivalMemory.id, archivalMemory);
+      await kv.delete(CORE_SCOPE, entry.id);
 
-        totalTokens -= tokens;
-        paged++;
-        pagedIds.push(entry.id);
-      }
+      totalTokens -= tokens;
+      paged++;
+      pagedIds.push(entry.id);
+    }
 
-      if (paged > 0) {
-        try {
-          await recordAudit(kv, "auto_page", "mem::auto-page", pagedIds, {
-            paged,
-            budget: coreBudget,
-          });
-        } catch {}
-      }
+    if (paged > 0) {
+      try {
+        await recordAudit(kv, "auto_page", "mem::auto-page", pagedIds, {
+          paged,
+          budget: coreBudget,
+        });
+      } catch {}
+    }
 
-      return { success: true, paged, totalTokens, budget: coreBudget };
-    },
-  );
+    return { success: true, paged, totalTokens, budget: coreBudget };
+  });
 }

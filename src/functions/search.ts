@@ -1,14 +1,21 @@
-import type { ISdk } from 'iii-sdk'
-import type { CompactSearchResult, CompressedObservation, Memory, SearchResult, Session } from '../types.js'
-import { KV } from '../state/schema.js'
-import { StateKV } from '../state/kv.js'
-import { SearchIndex } from '../state/search-index.js'
-import { VectorIndex } from '../state/vector-index.js'
-import type { EmbeddingProvider } from '../types.js'
-import { memoryToObservation } from '../state/memory-utils.js'
-import { migrateVectorIndex } from './migrate-vector-index.js'
-import { recordAccessBatch } from './access-tracker.js'
-import { recordAudit } from './audit.js'
+import type { ISdk } from "iii-sdk";
+import type {
+  CompactSearchResult,
+  CompressedObservation,
+  Memory,
+  SearchResult,
+  Session,
+} from "../types.js";
+import { KV } from "../state/schema.js";
+import { StateKV } from "../state/kv.js";
+import { SearchIndex } from "../state/search-index.js";
+import type { SearchIndexMutation } from "../state/search-index.js";
+import { VectorIndex } from "../state/vector-index.js";
+import type { EmbeddingProvider } from "../types.js";
+import { memoryToObservation } from "../state/memory-utils.js";
+import { migrateVectorIndex } from "./migrate-vector-index.js";
+import { recordOwnedAccessBatch, type AccessTarget } from "./access-tracker.js";
+import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
 import {
@@ -18,33 +25,57 @@ import {
 
 export { clipEmbedInput } from "../state/embedding-input.js";
 
-let index: SearchIndex | null = null
-let vectorIndex: VectorIndex | null = null
-let currentEmbeddingProvider: EmbeddingProvider | null = null
+let index: SearchIndex | null = null;
+let vectorIndex: VectorIndex | null = null;
+let currentEmbeddingProvider: EmbeddingProvider | null = null;
 type VectorMutation =
   | { type: "add"; id: string; sessionId: string; embedding: Float32Array }
-  | { type: "remove"; id: string }
-let activeVectorMutationJournal: VectorMutation[] | null = null
+  | { type: "remove"; id: string };
+let activeVectorMutationJournal: VectorMutation[] | null = null;
+let rebuildQueue: Promise<void> = Promise.resolve();
+let pendingRebuilds = 0;
+
+export function isIndexRebuildPending(): boolean {
+  return pendingRebuilds > 0;
+}
+
+function queueIndexRebuild<T>(operation: () => Promise<T>): Promise<T> {
+  pendingRebuilds++;
+  const queued = rebuildQueue.then(operation);
+  rebuildQueue = queued.then(
+    () => undefined,
+    () => undefined,
+  );
+  return queued.finally(() => {
+    pendingRebuilds--;
+  });
+}
+
+export function withIndexMaintenance<T>(
+  operation: () => Promise<T>,
+): Promise<T> {
+  return queueIndexRebuild(operation);
+}
 
 export function getSearchIndex(): SearchIndex {
-  if (!index) index = new SearchIndex()
-  return index
+  if (!index) index = new SearchIndex();
+  return index;
 }
 
 export function setVectorIndex(idx: VectorIndex | null): void {
-  vectorIndex = idx
+  vectorIndex = idx;
 }
 
 export function getVectorIndex(): VectorIndex | null {
-  return vectorIndex
+  return vectorIndex;
 }
 
 export function setEmbeddingProvider(provider: EmbeddingProvider | null): void {
-  currentEmbeddingProvider = provider
+  currentEmbeddingProvider = provider;
 }
 
 export function getEmbeddingProvider(): EmbeddingProvider | null {
-  return currentEmbeddingProvider
+  return currentEmbeddingProvider;
 }
 
 export function vectorIndexRemove(id: string): void {
@@ -57,14 +88,17 @@ function addVector(
   id: string,
   sessionId: string,
   embedding: Float32Array,
+  recordMutation = true,
 ): void {
-  target.add(id, sessionId, embedding)
-  activeVectorMutationJournal?.push({
-    type: "add",
-    id,
-    sessionId,
-    embedding: new Float32Array(embedding),
-  })
+  target.add(id, sessionId, embedding);
+  if (recordMutation) {
+    activeVectorMutationJournal?.push({
+      type: "add",
+      id,
+      sessionId,
+      embedding: new Float32Array(embedding),
+    });
+  }
 }
 
 // Persistence sync hook. Without this, index removals only live in
@@ -76,10 +110,15 @@ function addVector(
 let indexPersistence: {
   scheduleSave: () => void;
   save: () => Promise<void>;
+  saveStrict?: () => Promise<void>;
 } | null = null;
 
 export function setIndexPersistence(
-  p: { scheduleSave: () => void; save: () => Promise<void> } | null,
+  p: {
+    scheduleSave: () => void;
+    save: () => Promise<void>;
+    saveStrict?: () => Promise<void>;
+  } | null,
 ): void {
   indexPersistence = p;
 }
@@ -98,7 +137,8 @@ export function scheduleIndexSave(): void {
 // flush as a fatal error on the delete itself (the KV delete already
 // committed before this is invoked).
 export async function flushIndexSave(): Promise<void> {
-  await indexPersistence?.save();
+  if (!indexPersistence) return;
+  await (indexPersistence.saveStrict?.() ?? indexPersistence.save());
 }
 
 // Single guarded vector-index write. Returns true on success. Logs and
@@ -114,11 +154,11 @@ export async function vectorIndexAddGuarded(
   text: string,
   context: { kind: "memory" | "observation" | "synthetic"; logId: string },
 ): Promise<boolean> {
-  const vi = vectorIndex
-  const ep = currentEmbeddingProvider
-  if (!vi || !ep) return false
+  const vi = vectorIndex;
+  const ep = currentEmbeddingProvider;
+  if (!vi || !ep) return false;
   try {
-    const embedding = await ep.embed(clipEmbedInput(text))
+    const embedding = await ep.embed(clipEmbedInput(text));
     if (embedding.length !== ep.dimensions) {
       logger.warn("vector-index add: dimension mismatch — skipping", {
         kind: context.kind,
@@ -126,19 +166,19 @@ export async function vectorIndexAddGuarded(
         provider: ep.name,
         expected: ep.dimensions,
         received: embedding.length,
-      })
-      return false
+      });
+      return false;
     }
-    addVector(vi, id, sessionId, embedding)
-    return true
+    addVector(vi, id, sessionId, embedding);
+    return true;
   } catch (err) {
     logger.warn("vector-index add: embed failed — skipping", {
       kind: context.kind,
       id: context.logId,
       provider: ep.name,
       error: err instanceof Error ? err.message : String(err),
-    })
-    return false
+    });
+    return false;
   }
 }
 
@@ -152,28 +192,31 @@ export async function vectorIndexAddGuarded(
 // Per-item failure shape:
 //   - whole-batch network/provider error → all skipped, single warn line
 //   - per-item dimension mismatch → that item skipped, others continue
-export async function vectorIndexAddBatchGuarded(
-  items: Array<{
-    id: string
-    sessionId: string
-    text: string
-    context: { kind: "memory" | "observation" | "synthetic"; logId: string }
-  }>,
-): Promise<{ ok: number; fail: number }> {
-  const vi = vectorIndex
-  const ep = currentEmbeddingProvider
-  if (!vi || !ep || items.length === 0) return { ok: 0, fail: 0 }
+type EmbedJob = {
+  id: string;
+  sessionId: string;
+  text: string;
+  context: { kind: "memory" | "observation" | "synthetic"; logId: string };
+};
 
-  let embeddings: Float32Array[]
+async function addVectorBatch(
+  vi: VectorIndex,
+  ep: EmbeddingProvider,
+  items: EmbedJob[],
+  recordMutations: boolean,
+): Promise<{ ok: number; fail: number }> {
+  if (items.length === 0) return { ok: 0, fail: 0 };
+
+  let embeddings: Float32Array[];
   try {
-    embeddings = await ep.embedBatch(items.map((i) => clipEmbedInput(i.text)))
+    embeddings = await ep.embedBatch(items.map((i) => clipEmbedInput(i.text)));
   } catch (err) {
     logger.warn("vector-index add batch: embed failed — skipping batch", {
       batchSize: items.length,
       provider: ep.name,
       error: err instanceof Error ? err.message : String(err),
-    })
-    return { ok: 0, fail: items.length }
+    });
+    return { ok: 0, fail: items.length };
   }
 
   if (embeddings.length !== items.length) {
@@ -184,145 +227,223 @@ export async function vectorIndexAddBatchGuarded(
         returned: embeddings.length,
         provider: ep.name,
       },
-    )
-    return { ok: 0, fail: items.length }
+    );
+    return { ok: 0, fail: items.length };
   }
 
-  let ok = 0
-  let fail = 0
+  let ok = 0;
+  let fail = 0;
   for (let i = 0; i < items.length; i++) {
-    const item = items[i]
-    const embedding = embeddings[i]
+    const item = items[i];
+    const embedding = embeddings[i];
     if (embedding.length !== ep.dimensions) {
-      logger.warn("vector-index add batch: dimension mismatch — skipping item", {
-        kind: item.context.kind,
-        id: item.context.logId,
-        provider: ep.name,
-        expected: ep.dimensions,
-        received: embedding.length,
-      })
-      fail++
-      continue
+      logger.warn(
+        "vector-index add batch: dimension mismatch - skipping item",
+        {
+          kind: item.context.kind,
+          id: item.context.logId,
+          provider: ep.name,
+          expected: ep.dimensions,
+          received: embedding.length,
+        },
+      );
+      fail++;
+      continue;
     }
     try {
-      addVector(vi, item.id, item.sessionId, embedding)
-      ok++
+      addVector(vi, item.id, item.sessionId, embedding, recordMutations);
+      ok++;
     } catch (err) {
-      logger.warn("vector-index add batch: index write failed — skipping item", {
-        kind: item.context.kind,
-        id: item.context.logId,
-        error: err instanceof Error ? err.message : String(err),
-      })
-      fail++
+      logger.warn(
+        "vector-index add batch: index write failed - skipping item",
+        {
+          kind: item.context.kind,
+          id: item.context.logId,
+          error: err instanceof Error ? err.message : String(err),
+        },
+      );
+      fail++;
     }
   }
-  return { ok, fail }
+  return { ok, fail };
 }
 
-export async function rebuildIndex(
+export async function vectorIndexAddBatchGuarded(
+  items: EmbedJob[],
+): Promise<{ ok: number; fail: number }> {
+  const vi = vectorIndex;
+  const ep = currentEmbeddingProvider;
+  if (!vi || !ep) return { ok: 0, fail: 0 };
+  return addVectorBatch(vi, ep, items, true);
+}
+
+async function rebuildIndexNow(
   kv: StateKV,
   options: { strict?: boolean } = {},
 ): Promise<number> {
-  const idx = getSearchIndex()
-  idx.clear()
-
-  // BM25 clear above wipes stale doc entries; the vector index has the
-  // symmetric concern — memories/observations deleted between runs
-  // would leave orphan embeddings here forever. Clear both before the
-  // repopulation loops run, so BM25 and vector stay in sync.
-  vectorIndex?.clear()
-
-  const batchSize = getRebuildEmbedBatchSize()
-  // Accumulator for the batched embed flush. BM25 add is synchronous and
-  // doesn't need batching — only the vector path benefits.
-  type EmbedJob = {
-    id: string
-    sessionId: string
-    text: string
-    context: { kind: "memory" | "observation" | "synthetic"; logId: string }
+  if (activeVectorMutationJournal) {
+    throw new Error("index rebuild already in progress");
   }
-  const pending: EmbedJob[] = []
-  let count = 0
+  const liveSearchIndex = getSearchIndex();
+  const liveVectorIndex = vectorIndex;
+  const embeddingProvider = currentEmbeddingProvider;
+  const rebuiltSearchIndex = new SearchIndex();
+  const rebuiltVectorIndex = liveVectorIndex ? new VectorIndex() : null;
+  const searchJournal: SearchIndexMutation[] = [];
+  const vectorJournal: VectorMutation[] = [];
+  const recordSearchMutation = (mutation: SearchIndexMutation): void => {
+    if (mutation.type === "remove") {
+      searchJournal.push(mutation);
+      return;
+    }
+    searchJournal.push({
+      type: "add",
+      observation: {
+        ...mutation.observation,
+        facts: [...mutation.observation.facts],
+        concepts: [...mutation.observation.concepts],
+        files: [...mutation.observation.files],
+      },
+    });
+  };
+  liveSearchIndex.setMutationListener(recordSearchMutation);
+  activeVectorMutationJournal = vectorJournal;
+  const batchSize = getRebuildEmbedBatchSize();
+  const pending: EmbedJob[] = [];
+  let count = 0;
 
   const flush = async (): Promise<void> => {
-    if (pending.length === 0) return
-    await vectorIndexAddBatchGuarded(pending)
-    pending.length = 0
-  }
-  const enqueue = async (job: EmbedJob): Promise<void> => {
-    pending.push(job)
-    if (pending.length >= batchSize) await flush()
-  }
-
-  // Memories live in their own KV scope outside per-session observation
-  // scopes, so they need a separate walk. Without this, mem::remember
-  // entries vanish from BM25 on every restart even after the live-write
-  // fix in remember.ts (#257).
-  try {
-    const memories = await kv.list<Memory>(KV.memories)
-    for (const memory of memories) {
-      if (memory.isLatest === false) continue
-      if (!memory.title || !memory.content) continue
-      idx.add(memoryToObservation(memory))
-      await enqueue({
-        id: memory.id,
-        sessionId: memory.sessionIds?.[0] ?? 'memory',
-        text: memory.title + ' ' + memory.content,
-        context: { kind: "memory", logId: memory.id },
-      })
-      count++
+    if (pending.length === 0) return;
+    if (rebuiltVectorIndex && embeddingProvider) {
+      await addVectorBatch(
+        rebuiltVectorIndex,
+        embeddingProvider,
+        pending,
+        false,
+      );
     }
-  } catch (err) {
-    if (options.strict) throw err
-    logger.warn('rebuildIndex: failed to load memories', {
-      error: err instanceof Error ? err.message : String(err),
-    })
-  }
+    pending.length = 0;
+  };
+  const enqueue = async (job: EmbedJob): Promise<void> => {
+    pending.push(job);
+    if (pending.length >= batchSize) await flush();
+  };
 
-  const sessions = await kv.list<Session>(KV.sessions)
-  if (!sessions.length) {
-    await flush()
-    return count
-  }
-
-  const obsPerSession: CompressedObservation[][] = []
-  const failedSessions: string[] = []
-  for (let batch = 0; batch < sessions.length; batch += 10) {
-    const chunk = sessions.slice(batch, batch + 10)
-    const results = await Promise.all(
-      chunk.map(async (s) => {
-        try {
-          return await kv.list<CompressedObservation>(KV.observations(s.id))
-        } catch (err) {
-          if (options.strict) throw err
-          failedSessions.push(s.id)
-          return [] as CompressedObservation[]
-        }
-      })
-    )
-    obsPerSession.push(...results)
-  }
-  if (failedSessions.length > 0) {
-    logger.warn('rebuildIndex: failed to load observations for sessions', { failedSessions })
-  }
-  for (const observations of obsPerSession) {
-    for (const obs of observations) {
-      if (obs.title && obs.narrative) {
-        idx.add(obs)
+  try {
+    try {
+      const memories = await kv.list<Memory>(KV.memories);
+      for (const memory of memories) {
+        if (memory.isLatest === false) continue;
+        if (!memory.title || !memory.content) continue;
+        rebuiltSearchIndex.add(memoryToObservation(memory));
         await enqueue({
-          id: obs.id,
-          sessionId: obs.sessionId,
-          text: obs.title + ' ' + obs.narrative,
-          context: { kind: "observation", logId: obs.id },
-        })
-        count++
+          id: memory.id,
+          sessionId: memory.sessionIds?.[0] ?? "memory",
+          text: memory.title + " " + memory.content,
+          context: { kind: "memory", logId: memory.id },
+        });
+        count++;
+      }
+    } catch (err) {
+      if (options.strict) throw err;
+      logger.warn("rebuildIndex: failed to load memories", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    const sessions = await kv.list<Session>(KV.sessions);
+    const obsPerSession: CompressedObservation[][] = [];
+    const failedSessions: string[] = [];
+    for (let batch = 0; batch < sessions.length; batch += 10) {
+      const chunk = sessions.slice(batch, batch + 10);
+      const results = await Promise.all(
+        chunk.map(async (s) => {
+          try {
+            return await kv.list<CompressedObservation>(KV.observations(s.id));
+          } catch (err) {
+            if (options.strict) throw err;
+            failedSessions.push(s.id);
+            return [] as CompressedObservation[];
+          }
+        }),
+      );
+      obsPerSession.push(...results);
+    }
+    if (failedSessions.length > 0) {
+      logger.warn("rebuildIndex: failed to load observations for sessions", {
+        failedSessions,
+      });
+    }
+    for (const observations of obsPerSession) {
+      for (const obs of observations) {
+        if (obs.title && obs.narrative) {
+          rebuiltSearchIndex.add(obs);
+          await enqueue({
+            id: obs.id,
+            sessionId: obs.sessionId,
+            text: obs.title + " " + obs.narrative,
+            context: { kind: "observation", logId: obs.id },
+          });
+          count++;
+        }
       }
     }
-  }
 
-  // Drain the last partial batch.
-  await flush()
-  return count
+    await flush();
+    if (
+      vectorIndex !== liveVectorIndex ||
+      (liveVectorIndex && currentEmbeddingProvider !== embeddingProvider)
+    ) {
+      throw new Error(
+        "embedding provider or vector index changed during index rebuild",
+      );
+    }
+
+    liveSearchIndex.setMutationListener(null);
+    activeVectorMutationJournal = null;
+    liveSearchIndex.restoreFrom(rebuiltSearchIndex);
+    for (const mutation of searchJournal) {
+      if (mutation.type === "remove") {
+        liveSearchIndex.remove(mutation.id);
+      } else {
+        liveSearchIndex.add(mutation.observation);
+      }
+    }
+    if (liveVectorIndex && rebuiltVectorIndex) {
+      liveVectorIndex.restoreFrom(rebuiltVectorIndex);
+      for (const mutation of vectorJournal) {
+        if (mutation.type === "remove") {
+          liveVectorIndex.remove(mutation.id);
+        } else {
+          liveVectorIndex.add(
+            mutation.id,
+            mutation.sessionId,
+            mutation.embedding,
+          );
+        }
+      }
+    }
+    return count;
+  } finally {
+    liveSearchIndex.setMutationListener(null);
+    if (activeVectorMutationJournal === vectorJournal) {
+      activeVectorMutationJournal = null;
+    }
+  }
+}
+
+export function rebuildIndex(
+  kv: StateKV,
+  options: { strict?: boolean } = {},
+): Promise<number> {
+  return queueIndexRebuild(() => rebuildIndexNow(kv, options));
+}
+
+export function rebuildIndexWithinMaintenance(
+  kv: StateKV,
+  options: { strict?: boolean } = {},
+): Promise<number> {
+  return rebuildIndexNow(kv, options);
 }
 
 // Re-embed the whole corpus against the active embedding provider and swap
@@ -335,18 +456,18 @@ export async function rebuildIndex(
 // VectorIndex, so replacing the reference would desync persistence. The swap
 // only happens on a fully clean rebuild (failed === 0); on any failure the
 // live index is left untouched and the caller gets failedSessions to retry.
-export async function reindexVectors(kv: StateKV): Promise<{
-  success: boolean
-  swapped: boolean
-  totalProcessed: number
-  failed: number
-  vectorSize: number
-  failedSessions: string[]
-  provider: string | null
-  dimensions: number | null
-  error?: string
+async function reindexVectorsNow(kv: StateKV): Promise<{
+  success: boolean;
+  swapped: boolean;
+  totalProcessed: number;
+  failed: number;
+  vectorSize: number;
+  failedSessions: string[];
+  provider: string | null;
+  dimensions: number | null;
+  error?: string;
 }> {
-  const ep = currentEmbeddingProvider
+  const ep = currentEmbeddingProvider;
   if (!ep) {
     return {
       success: false,
@@ -358,10 +479,10 @@ export async function reindexVectors(kv: StateKV): Promise<{
       provider: null,
       dimensions: null,
       error:
-        'no embedding provider configured; set EMBEDDING_PROVIDER or a provider API key and restart',
-    }
+        "no embedding provider configured; set EMBEDDING_PROVIDER or a provider API key and restart",
+    };
   }
-  const vi = vectorIndex
+  const vi = vectorIndex;
   if (!vi) {
     return {
       success: false,
@@ -372,29 +493,20 @@ export async function reindexVectors(kv: StateKV): Promise<{
       failedSessions: [],
       provider: ep.name,
       dimensions: ep.dimensions,
-      error: 'vector index not initialized',
-    }
+      error: "vector index not initialized",
+    };
   }
-  if (activeVectorMutationJournal) {
-    return {
-      success: false,
-      swapped: false,
-      totalProcessed: 0,
-      failed: 0,
-      vectorSize: vi.size,
-      failedSessions: [],
-      provider: ep.name,
-      dimensions: ep.dimensions,
-      error: 'vector reindex already in progress',
-    }
-  }
-
-  const journal: VectorMutation[] = []
-  activeVectorMutationJournal = journal
+  const journal: VectorMutation[] = [];
+  activeVectorMutationJournal = journal;
   try {
-    const { index, ...stats } = await migrateVectorIndex(kv, ep)
+    const { index, ...stats } = await migrateVectorIndex(kv, ep);
     if (!stats.success) {
-      return { ...stats, swapped: false, provider: ep.name, dimensions: ep.dimensions }
+      return {
+        ...stats,
+        swapped: false,
+        provider: ep.name,
+        dimensions: ep.dimensions,
+      };
     }
     if (currentEmbeddingProvider !== ep || vectorIndex !== vi) {
       return {
@@ -403,72 +515,90 @@ export async function reindexVectors(kv: StateKV): Promise<{
         swapped: false,
         provider: ep.name,
         dimensions: ep.dimensions,
-        error: 'embedding provider or vector index changed during reindex',
-      }
+        error: "embedding provider or vector index changed during reindex",
+      };
     }
 
-    activeVectorMutationJournal = null
-    vi.restoreFrom(index)
+    activeVectorMutationJournal = null;
+    vi.restoreFrom(index);
     for (const mutation of journal) {
       if (mutation.type === "remove") {
-        vi.remove(mutation.id)
+        vi.remove(mutation.id);
       } else {
-        vi.add(mutation.id, mutation.sessionId, mutation.embedding)
+        vi.add(mutation.id, mutation.sessionId, mutation.embedding);
       }
     }
-    await flushIndexSave()
-    await recordAudit(kv, 'vector_index_swap', 'mem::reindex-vectors', [ep.name], {
-      provider: ep.name,
-      dimensions: ep.dimensions,
-      totalProcessed: stats.totalProcessed,
-    })
+    await flushIndexSave();
+    await recordAudit(
+      kv,
+      "vector_index_swap",
+      "mem::reindex-vectors",
+      [ep.name],
+      {
+        provider: ep.name,
+        dimensions: ep.dimensions,
+        totalProcessed: stats.totalProcessed,
+      },
+    );
     return {
       ...stats,
       swapped: true,
       vectorSize: vi.size,
       provider: ep.name,
       dimensions: ep.dimensions,
-    }
+    };
   } finally {
     if (activeVectorMutationJournal === journal) {
-      activeVectorMutationJournal = null
+      activeVectorMutationJournal = null;
     }
   }
 }
 
+export function reindexVectors(
+  kv: StateKV,
+): ReturnType<typeof reindexVectorsNow> {
+  return queueIndexRebuild(() => reindexVectorsNow(kv));
+}
+
 export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
-  sdk.registerFunction('mem::reindex-vectors', async () => {
-    return await reindexVectors(kv)
-  })
+  sdk.registerFunction("mem::reindex-vectors", async () => {
+    return await reindexVectors(kv);
+  });
 
   sdk.registerFunction(
-    'mem::search',
+    "mem::search",
     async (data: {
-      query: string
-      limit?: number
-      project?: string
-      cwd?: string
-      format?: string
-      token_budget?: number
-      agentId?: string
+      query: string;
+      limit?: number;
+      project?: string;
+      cwd?: string;
+      format?: string;
+      token_budget?: number;
+      agentId?: string;
     }) => {
-      const idx = getSearchIndex()
+      const idx = getSearchIndex();
 
       // Input validation / normalization.
-      if (typeof data?.query !== 'string' || !data.query.trim()) {
-        throw new Error('mem::search: query must be a non-empty string')
+      if (typeof data?.query !== "string" || !data.query.trim()) {
+        throw new Error("mem::search: query must be a non-empty string");
       }
-      const query = data.query.trim()
-      const MAX_LIMIT = 100
-      let effectiveLimit = 20
+      const query = data.query.trim();
+      const MAX_LIMIT = 100;
+      let effectiveLimit = 20;
       if (data.limit !== undefined) {
         if (!Number.isInteger(data.limit) || data.limit < 1) {
-          throw new Error('mem::search: limit must be a positive integer')
+          throw new Error("mem::search: limit must be a positive integer");
         }
-        effectiveLimit = Math.min(data.limit, MAX_LIMIT)
+        effectiveLimit = Math.min(data.limit, MAX_LIMIT);
       }
-      const projectFilter = typeof data.project === 'string' && data.project.trim().length > 0 ? data.project.trim() : undefined
-      const cwdFilter = typeof data.cwd === 'string' && data.cwd.trim().length > 0 ? data.cwd.trim() : undefined
+      const projectFilter =
+        typeof data.project === "string" && data.project.trim().length > 0
+          ? data.project.trim()
+          : undefined;
+      const cwdFilter =
+        typeof data.cwd === "string" && data.cwd.trim().length > 0
+          ? data.cwd.trim()
+          : undefined;
       // #817: agent-scope isolation. mem::search backs REST /search,
       // memory_recall and recall_context. Without filtering here a
       // worker booted with AGENT_ID=B + AGENTMEMORY_AGENT_SCOPE=isolated
@@ -491,13 +621,8 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
       const envAgentId = isolated ? getAgentId() : undefined;
       const filterAgentId = wildcardAgent
         ? undefined
-        : explicitAgentId ?? envAgentId;
-      if (
-        isolated &&
-        !wildcardAgent &&
-        !explicitAgentId &&
-        !envAgentId
-      ) {
+        : (explicitAgentId ?? envAgentId);
+      if (isolated && !wildcardAgent && !explicitAgentId && !envAgentId) {
         throw new Error(
           "mem::search: AGENTMEMORY_AGENT_SCOPE=isolated is set but no " +
             "agent id is available (env AGENT_ID unset and no explicit " +
@@ -505,21 +630,32 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
             'Pass agentId: "*" to opt in to a wildcard read.',
         );
       }
-      const format = typeof data.format === 'string' ? data.format : 'full'
-      if (!['full', 'compact', 'narrative'].includes(format)) {
-        throw new Error("mem::search: format must be one of 'full', 'compact', or 'narrative'")
+      const format = typeof data.format === "string" ? data.format : "full";
+      if (!["full", "compact", "narrative"].includes(format)) {
+        throw new Error(
+          "mem::search: format must be one of 'full', 'compact', or 'narrative'",
+        );
       }
-      let tokenBudget: number | undefined
+      let tokenBudget: number | undefined;
       if (data.token_budget !== undefined) {
         if (!Number.isInteger(data.token_budget) || data.token_budget < 1) {
-          throw new Error('mem::search: token_budget must be a positive integer')
+          throw new Error(
+            "mem::search: token_budget must be a positive integer",
+          );
         }
-        tokenBudget = data.token_budget
+        tokenBudget = data.token_budget;
       }
 
-      if (idx.size === 0) {
-        const count = await rebuildIndex(kv)
-        logger.info('Search index rebuilt', { entries: count })
+      if (idx.size === 0 && !isIndexRebuildPending()) {
+        void rebuildIndex(kv)
+          .then((count) =>
+            logger.info("Search index rebuilt", { entries: count }),
+          )
+          .catch((error) =>
+            logger.warn("Search index rebuild failed", {
+              error: error instanceof Error ? error.message : String(error),
+            }),
+          );
       }
 
       // When filtering by project/cwd, over-fetch from the index so the
@@ -529,32 +665,39 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
       // doesn't carry it), so without the over-fetch isolated-mode
       // queries return underfilled pages when same-agent matches
       // rank lower than cross-agent ones in the hybrid score.
-      const filtering = !!(projectFilter || cwdFilter || filterAgentId)
-      const fetchLimit = filtering ? Math.max(effectiveLimit * 10, 100) : effectiveLimit
-      const results = idx.search(query, fetchLimit)
+      const filtering = !!(projectFilter || cwdFilter || filterAgentId);
+      const fetchLimit = filtering
+        ? Math.max(effectiveLimit * 10, 100)
+        : effectiveLimit;
+      const results = idx.search(query, fetchLimit);
 
       // Resolve session -> project/cwd once per sessionId we touch.
-      const sessionCache = new Map<string, Session | null>()
-      const loadSession = async (sessionId: string): Promise<Session | null> => {
-        if (sessionCache.has(sessionId)) return sessionCache.get(sessionId)!
-        const s = await kv.get<Session>(KV.sessions, sessionId)
-        sessionCache.set(sessionId, s ?? null)
-        return s ?? null
-      }
+      const sessionCache = new Map<string, Session | null>();
+      const loadSession = async (
+        sessionId: string,
+      ): Promise<Session | null> => {
+        if (sessionCache.has(sessionId)) return sessionCache.get(sessionId)!;
+        const s = await kv.get<Session>(KV.sessions, sessionId);
+        sessionCache.set(sessionId, s ?? null);
+        return s ?? null;
+      };
 
       // Cache for memory project lookups. Memories indexed via mem::remember
       // use a synthetic sessionId ('memory' or the first real sessionId) that
       // either has no KV.sessions entry or belongs to a different project.
       // When loadSession returns null we fall through to a KV.memories probe
       // so project-filtered search can include or exclude them correctly.
-      const memoryProjectCache = new Map<string, string | null>()
-      const loadMemoryProject = async (obsId: string): Promise<string | null> => {
-        if (memoryProjectCache.has(obsId)) return memoryProjectCache.get(obsId)!
-        const mem = await kv.get<Memory>(KV.memories, obsId).catch(() => null)
-        const proj = mem?.project ?? null
-        memoryProjectCache.set(obsId, proj)
-        return proj
-      }
+      const memoryProjectCache = new Map<string, string | null>();
+      const loadMemoryProject = async (
+        obsId: string,
+      ): Promise<string | null> => {
+        if (memoryProjectCache.has(obsId))
+          return memoryProjectCache.get(obsId)!;
+        const mem = await kv.get<Memory>(KV.memories, obsId).catch(() => null);
+        const proj = mem?.project ?? null;
+        memoryProjectCache.set(obsId, proj);
+        return proj;
+      };
 
       // First pass: filter by session (sequential — benefits from session cache).
       // Memory entries with a synthetic sessionId take a secondary KV.memories
@@ -565,15 +708,15 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
       // rows, and capping early would underfill the result page. Use
       // fetchLimit as the upper bound in that case; the final
       // truncation lives at the end of the second pass.
-      const earlyCap = filterAgentId ? fetchLimit : effectiveLimit
-      const candidates: typeof results = []
+      const earlyCap = filterAgentId ? fetchLimit : effectiveLimit;
+      const candidates: typeof results = [];
       for (const r of results) {
-        if (candidates.length >= earlyCap) break
+        if (candidates.length >= earlyCap) break;
         if (filtering) {
-          const s = await loadSession(r.sessionId)
+          const s = await loadSession(r.sessionId);
           if (s) {
-            if (projectFilter && s.project !== projectFilter) continue
-            if (cwdFilter && s.cwd !== cwdFilter) continue
+            if (projectFilter && s.project !== projectFilter) continue;
+            if (cwdFilter && s.cwd !== cwdFilter) continue;
           } else {
             // Session not found. Two cases arrive here:
             //   1. Synthetic sessionId — memories indexed via mem::remember use
@@ -590,13 +733,13 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
             // In both cases, a null memProject means "project unknown — treat as
             // unscoped and let it through" to preserve backward-compatibility.
             if (projectFilter) {
-              const memProject = await loadMemoryProject(r.obsId)
-              if (memProject !== null && memProject !== projectFilter) continue
+              const memProject = await loadMemoryProject(r.obsId);
+              if (memProject !== null && memProject !== projectFilter) continue;
             }
             // cwd filter does not apply to unbound entries.
           }
         }
-        candidates.push(r)
+        candidates.push(r);
       }
 
       // Second pass: load observations in parallel. Fall back to
@@ -607,59 +750,85 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
         candidates.map(async (r) => {
           const obs = await kv
             .get<CompressedObservation>(KV.observations(r.sessionId), r.obsId)
-            .catch(() => null)
-          if (obs) return obs
+            .catch(() => null);
+          if (obs) {
+            return {
+              observation: obs,
+              target: {
+                id: obs.id,
+                scope: "observation",
+                sessionId: r.sessionId,
+              } satisfies AccessTarget,
+            };
+          }
           const mem = await kv
             .get<Memory>(KV.memories, r.obsId)
-            .catch(() => null)
-          return mem ? memoryToObservation(mem) : null
-        })
-      )
-      const enriched: SearchResult[] = []
+            .catch(() => null);
+          return mem
+            ? {
+                observation: memoryToObservation(mem),
+                target: { id: mem.id, scope: "memory" } satisfies AccessTarget,
+              }
+            : null;
+        }),
+      );
+      const enriched: SearchResult[] = [];
+      const accessTargets: AccessTarget[] = [];
       for (let i = 0; i < candidates.length; i++) {
-        const obs = obsResults[i]
-        if (!obs) continue
+        const loaded = obsResults[i];
+        if (!loaded) continue;
+        const obs = loaded.observation;
         // #817: enforce agent-scope after the observation/memory is
         // loaded. The BM25 index doesn't carry agentId so the filter
         // happens post-lookup. Wildcard ("*") and no-isolation paths
         // resolved filterAgentId=undefined upstream and pass through.
-        if (filterAgentId !== undefined && obs.agentId !== filterAgentId) continue
-        if (enriched.length >= effectiveLimit) break
+        if (filterAgentId !== undefined && obs.agentId !== filterAgentId)
+          continue;
+        if (enriched.length >= effectiveLimit) break;
         enriched.push({
           observation: obs,
           score: candidates[i].score,
           sessionId: candidates[i].sessionId,
-        })
+        });
+        accessTargets.push(loaded.target);
       }
 
-      void recordAccessBatch(
-        kv,
-        enriched.map((r) => r.observation.id),
-      )
+      void recordOwnedAccessBatch(kv, accessTargets);
 
       const estimateTokens = (value: unknown): number =>
-        Math.max(1, Math.ceil(JSON.stringify(value).length / 3))
+        Math.max(1, Math.ceil(JSON.stringify(value).length / 3));
 
-      const applyTokenBudget = <T>(items: T[]): {
-        items: T[]
-        used: number
-        truncated: boolean
+      const applyTokenBudget = <T>(
+        items: T[],
+      ): {
+        items: T[];
+        used: number;
+        truncated: boolean;
       } => {
-        if (!tokenBudget) return { items, used: items.reduce((sum, item) => sum + estimateTokens(item), 0), truncated: false }
-        const selected: T[] = []
-        let used = 0
+        if (!tokenBudget)
+          return {
+            items,
+            used: items.reduce((sum, item) => sum + estimateTokens(item), 0),
+            truncated: false,
+          };
+        const selected: T[] = [];
+        let used = 0;
         for (const item of items) {
-          const itemTokens = estimateTokens(item)
+          const itemTokens = estimateTokens(item);
           if (used + itemTokens > tokenBudget) {
-            return { items: selected, used, truncated: selected.length < items.length }
+            return {
+              items: selected,
+              used,
+              truncated: selected.length < items.length,
+            };
           }
-          selected.push(item)
-          used += itemTokens
+          selected.push(item);
+          used += itemTokens;
         }
-        return { items: selected, used, truncated: false }
-      }
+        return { items: selected, used, truncated: false };
+      };
 
-      if (format === 'compact') {
+      if (format === "compact") {
         const compactResults: CompactSearchResult[] = enriched.map((r) => ({
           obsId: r.observation.id,
           sessionId: r.sessionId,
@@ -667,18 +836,18 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
           type: r.observation.type,
           score: r.score,
           timestamp: r.observation.timestamp,
-        }))
-        const packed = applyTokenBudget(compactResults)
+        }));
+        const packed = applyTokenBudget(compactResults);
         return {
           format,
           results: packed.items,
           tokens_used: packed.used,
           tokens_budget: tokenBudget,
           truncated: packed.truncated,
-        }
+        };
       }
 
-      if (format === 'narrative') {
+      if (format === "narrative") {
         const narrativeResults = enriched.map((r) => ({
           obsId: r.observation.id,
           sessionId: r.sessionId,
@@ -686,11 +855,11 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
           narrative: r.observation.narrative,
           score: r.score,
           timestamp: r.observation.timestamp,
-        }))
-        const packed = applyTokenBudget(narrativeResults)
+        }));
+        const packed = applyTokenBudget(narrativeResults);
         const text = packed.items
           .map((r, index) => `${index + 1}. ${r.title}\n${r.narrative}`)
-          .join('\n\n')
+          .join("\n\n");
         return {
           format,
           results: packed.items,
@@ -698,25 +867,25 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
           tokens_used: packed.used,
           tokens_budget: tokenBudget,
           truncated: packed.truncated,
-        }
+        };
       }
 
-      const packed = applyTokenBudget(enriched)
+      const packed = applyTokenBudget(enriched);
 
       // Avoid logging raw cwd/project (host paths). Log only that filters were active.
-      logger.info('Search completed', {
+      logger.info("Search completed", {
         query,
         results: packed.items.length,
         hasProjectFilter: !!projectFilter,
         hasCwdFilter: !!cwdFilter,
-      })
+      });
       return {
         format,
         results: packed.items,
         tokens_used: packed.used,
         tokens_budget: tokenBudget,
         truncated: packed.truncated,
-      }
-    }
-  )
+      };
+    },
+  );
 }

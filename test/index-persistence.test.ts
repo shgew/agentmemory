@@ -685,6 +685,58 @@ describe("IndexPersistence", () => {
     expect(saved).not.toBeNull();
   });
 
+  it("publishes overlapping saves in call order", async () => {
+    const bm25 = makeBm25("obs_old", "alpha old snapshot");
+    let firstPublishStarted: (() => void) | undefined;
+    let releaseFirstPublish: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      firstPublishStarted = resolve;
+    });
+    const orderedKv = {
+      ...kv,
+      set: vi.fn(async <T>(scope: string, key: string, data: T): Promise<T> => {
+        const generation = (data as { generation?: string })?.generation;
+        if (
+          scope === BM25_SCOPE &&
+          key === BM25_MANIFEST_KEY &&
+          generation === "gen_1"
+        ) {
+          firstPublishStarted?.();
+          await new Promise<void>((resolve) => {
+            releaseFirstPublish = resolve;
+          });
+        }
+        return kv.set(scope, key, data);
+      }),
+    };
+    let generation = 0;
+    const persistence = new IndexPersistence(
+      orderedKv as never,
+      bm25,
+      null,
+      {
+        shardChars: 80,
+        createGeneration: () => `gen_${++generation}`,
+      },
+    );
+
+    const olderSave = persistence.save();
+    await started;
+    bm25.remove("obs_old");
+    bm25.add(makeObs({ id: "obs_new", title: "bravo new snapshot" }));
+    const newerSave = persistence.save();
+
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(generation).toBe(1);
+    releaseFirstPublish?.();
+    await Promise.all([olderSave, newerSave]);
+
+    const loaded = await persistence.load();
+    expect(loaded.bm25!.search("bravo")).toHaveLength(1);
+    expect(loaded.bm25!.search("alpha")).toHaveLength(0);
+  });
+
   it("stop clears the pending timer", async () => {
     const bm25 = new SearchIndex();
     bm25.add(makeObs({ id: "obs_1", title: "auth handler" }));
@@ -754,6 +806,20 @@ describe("IndexPersistence", () => {
     const persistence = new IndexPersistence(failingKv as never, bm25, null);
 
     await expect(persistence.save()).resolves.toBeUndefined();
+  });
+
+  it("saveStrict reports kv.set rejection to deletion journals", async () => {
+    const failingKv = {
+      ...mockKV(),
+      set: vi.fn(async () => {
+        throw new Error("TIMEOUT");
+      }),
+    };
+    const bm25 = new SearchIndex();
+    bm25.add(makeObs({ id: "obs_1", title: "auth handler" }));
+    const persistence = new IndexPersistence(failingKv as never, bm25, null);
+
+    await expect(persistence.saveStrict()).rejects.toThrow("TIMEOUT");
   });
 
   // #797: first run after upgrading to 0.9.25 crashed with

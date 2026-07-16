@@ -292,7 +292,7 @@ describe("session sweep final summary", () => {
       checkpointed: [sessionId],
       failed: [],
     });
-    expect(compress).toHaveBeenCalledOnce();
+    expect(compress).not.toHaveBeenCalled();
     expect(graphExtract).toHaveBeenCalledWith(
       expect.objectContaining({
         observations: expect.arrayContaining([

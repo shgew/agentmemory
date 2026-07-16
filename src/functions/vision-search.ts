@@ -5,6 +5,7 @@ import { StateKV } from "../state/kv.js";
 import { isManagedImagePath } from "../utils/image-store.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { getImageRefCount } from "./image-refs.js";
 
 interface StoredEmbedding {
   imageRef: string;
@@ -37,8 +38,8 @@ export function registerVisionSearchFunctions(
       if (!isManagedImagePath(data.imageRef)) {
         return { success: false, error: "imageRef must point to a file under the managed image store" };
       }
-      const refCount = await kv.get<number>(KV.imageRefs, data.imageRef);
-      if (!refCount || Number(refCount) < 1) {
+      const refCount = await getImageRefCount(kv, data.imageRef);
+      if (refCount < 1) {
         return { success: false, error: "imageRef not registered in mem:image-refs" };
       }
       try {
@@ -99,8 +100,8 @@ export function registerVisionSearchFunctions(
           if (!isManagedImagePath(data.queryImageRef)) {
             return { success: false, error: "queryImageRef must point to a file under the managed image store" };
           }
-          const refCount = await kv.get<number>(KV.imageRefs, data.queryImageRef);
-          if (!refCount || Number(refCount) < 1) {
+          const refCount = await getImageRefCount(kv, data.queryImageRef);
+          if (refCount < 1) {
             return { success: false, error: "queryImageRef not registered in mem:image-refs" };
           }
           queryVec = await imageProvider.embedImage(data.queryImageRef);

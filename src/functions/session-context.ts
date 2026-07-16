@@ -57,7 +57,12 @@ async function buildSubagentRollup(
   );
   const labels = visibleChildren.map((child, index) => {
     const summary = summaries[index];
-    return summary?.title ?? child.summary ?? child.firstPrompt ?? child.id.slice(0, 8);
+    return (
+      summary?.title ??
+      child.summary ??
+      child.firstPrompt ??
+      child.id.slice(0, 8)
+    );
   });
   const files = Array.from(
     new Set(summaries.flatMap((summary) => summary?.filesModified ?? [])),
@@ -66,18 +71,23 @@ async function buildSubagentRollup(
     (total, child) => total + child.observationCount,
     0,
   );
-  const taskLines = labels.map((label) => `- ${escapeXmlText(label)}`).join("\n");
+  const taskLines = labels
+    .map((label) => `- ${escapeXmlText(label)}`)
+    .join("\n");
   const omitted = children.length - visibleChildren.length;
   const omittedLine = omitted > 0 ? `\n- ${omitted} more tasks` : "";
-  const filesLine = files.length > 0
-    ? `\nKey files touched: ${files.map(escapeXmlText).join(", ")}`
-    : "";
+  const filesLine =
+    files.length > 0
+      ? `\nKey files touched: ${files.map(escapeXmlText).join(", ")}`
+      : "";
   const content = `<subagent-activity-summary task-count="${children.length}" observation-count="${observationCount}">\n## Subagent activity summary\nTasks:\n${taskLines}${omittedLine}${filesLine}\n</subagent-activity-summary>`;
   const recency = children.reduce((latest, child) => {
     const timestamp = new Date(
       child.updatedAt ?? child.endedAt ?? child.startedAt,
     ).getTime();
-    return Number.isFinite(timestamp) && timestamp > latest ? timestamp : latest;
+    return Number.isFinite(timestamp) && timestamp > latest
+      ? timestamp
+      : latest;
   }, 0);
 
   return {
@@ -149,7 +159,11 @@ export async function buildSessionContextBlocks(
     ),
   );
 
-  for (let resultIndex = 0; resultIndex < sessionsNeedingObservations.length; resultIndex++) {
+  for (
+    let resultIndex = 0;
+    resultIndex < sessionsNeedingObservations.length;
+    resultIndex++
+  ) {
     const sessionIndex = sessionsNeedingObservations[resultIndex];
     const important = observationResults[resultIndex].filter(
       (observation) => observation.title && observation.importance >= 5,
@@ -173,6 +187,8 @@ export async function buildSessionContextBlocks(
       tokens: estimateTokens(content),
       recency: new Date(session.startedAt).getTime(),
       sourceIds: top.map((observation) => observation.id),
+      sourceScope: "observation",
+      sourceSessionId: session.id,
     });
   }
 

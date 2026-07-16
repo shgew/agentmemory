@@ -41,6 +41,27 @@ describe("SearchIndex", () => {
     expect(results[0].obsId).toBe("obs_1");
   });
 
+  it("replaces an existing observation without retaining old terms", () => {
+    index.add(
+      makeObs({
+        id: "obs_replace",
+        title: "obsolete sentinel",
+        narrative: "old content",
+      }),
+    );
+    index.add(
+      makeObs({
+        id: "obs_replace",
+        title: "current marker",
+        narrative: "new content",
+      }),
+    );
+
+    expect(index.size).toBe(1);
+    expect(index.search("obsolete sentinel")).toEqual([]);
+    expect(index.search("current marker")[0]?.obsId).toBe("obs_replace");
+  });
+
   it("returns empty for no matches", () => {
     index.add(makeObs());
     expect(index.search("database")).toEqual([]);

@@ -4,15 +4,13 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-vi.mock("../src/state/keyed-mutex.js", () => ({
-  withKeyedLock: <T>(_key: string, fn: () => Promise<T>) => fn(),
-}));
-
 import { registerRememberFunction } from "../src/functions/remember.js";
+import { registerObserveFunction } from "../src/functions/observe.js";
 import {
   getSearchIndex,
   setIndexPersistence,
 } from "../src/functions/search.js";
+import { KV } from "../src/state/schema.js";
 import { memoryToObservation } from "../src/state/memory-utils.js";
 import type { Memory } from "../src/types.js";
 
@@ -25,6 +23,19 @@ function mockKV() {
       if (!store.has(scope)) store.set(scope, new Map());
       store.get(scope)!.set(key, data);
       return data;
+    },
+    update: async <T>(
+      scope: string,
+      key: string,
+      updates: Array<{ path: string; value: unknown }>,
+    ): Promise<T | null> => {
+      const current = store.get(scope)?.get(key) as
+        Record<string, unknown> | undefined;
+      if (!current) return null;
+      const updated = { ...current };
+      for (const update of updates) updated[update.path] = update.value;
+      store.get(scope)!.set(key, updated);
+      return updated as T;
     },
     delete: async (scope: string, key: string): Promise<void> => {
       store.get(scope)?.delete(key);
@@ -107,6 +118,72 @@ describe("mem::forget audit coverage (issue #125)", () => {
     expect(row.details.observationsDeleted).toBe(2);
     expect(row.details.sessionDeleted).toBe(true);
     expect(row.details.deleted).toBe(4);
+  });
+
+  it("deletes an observation from a concurrent capture that already owns the session lock", async () => {
+    const sessionId = "sess_concurrent";
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+    registerObserveFunction(sdk as never, kv as never);
+
+    await kv.set(KV.sessions, sessionId, {
+      id: sessionId,
+      project: "agentmemory",
+      cwd: "/repo",
+      startedAt: "2026-07-16T10:00:00.000Z",
+      status: "active",
+      observationCount: 0,
+    });
+    await kv.set(KV.summaries, sessionId, { sessionId });
+
+    let captureReachedWrite!: () => void;
+    const captureAtWrite = new Promise<void>((resolve) => {
+      captureReachedWrite = resolve;
+    });
+    let resumeCapture!: () => void;
+    const captureCanWrite = new Promise<void>((resolve) => {
+      resumeCapture = resolve;
+    });
+    const originalSet = kv.set;
+    let captureBlocked = false;
+    kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+      if (!captureBlocked && scope === KV.pendingCompression(sessionId)) {
+        captureBlocked = true;
+        captureReachedWrite();
+        await captureCanWrite;
+      }
+      return originalSet(scope, key, data);
+    };
+
+    const capture = sdk.trigger({
+      function_id: "mem::observe",
+      payload: {
+        sessionId,
+        project: "agentmemory",
+        cwd: "/repo",
+        hookType: "post_tool_use",
+        timestamp: "2026-07-16T10:01:00.000Z",
+        data: { tool_name: "Read" },
+      },
+    });
+    await captureAtWrite;
+
+    const forget = sdk.trigger({
+      function_id: "mem::forget",
+      payload: { sessionId },
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    resumeCapture();
+    await Promise.all([capture, forget]);
+
+    expect(await kv.get(KV.sessions, sessionId)).toBeNull();
+    expect(await kv.list(KV.observations(sessionId))).toHaveLength(0);
+    expect(
+      (await kv.list<{ sessionId: string }>(KV.rawPayloads)).filter(
+        (raw) => raw.sessionId === sessionId,
+      ),
+    ).toHaveLength(0);
   });
 
   it("does not emit an audit row when nothing is deleted", async () => {
@@ -207,5 +284,43 @@ describe("mem::forget search-index cleanup", () => {
     });
 
     expect(persistence.save).toHaveBeenCalled();
+  });
+
+  it("flushes persistence once when multiple observations are forgotten", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+    const persistence = { scheduleSave: vi.fn(), save: vi.fn(async () => {}) };
+    setIndexPersistence(persistence);
+    await kv.set("mem:obs:ses_1", "obs_a", { id: "obs_a" });
+    await kv.set("mem:obs:ses_1", "obs_b", { id: "obs_b" });
+
+    await sdk.trigger({
+      function_id: "mem::forget",
+      payload: {
+        sessionId: "ses_1",
+        observationIds: ["obs_a", "obs_b"],
+      },
+    });
+
+    expect(persistence.save).toHaveBeenCalledTimes(1);
+  });
+
+  it("flushes persistence once when a full session is forgotten", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerRememberFunction(sdk as never, kv as never);
+    const persistence = { scheduleSave: vi.fn(), save: vi.fn(async () => {}) };
+    setIndexPersistence(persistence);
+    await kv.set(KV.sessions, "ses_full", { id: "ses_full" });
+    await kv.set(KV.observations("ses_full"), "obs_a", { id: "obs_a" });
+    await kv.set(KV.observations("ses_full"), "obs_b", { id: "obs_b" });
+
+    await sdk.trigger({
+      function_id: "mem::forget",
+      payload: { sessionId: "ses_full" },
+    });
+
+    expect(persistence.save).toHaveBeenCalledTimes(1);
   });
 });

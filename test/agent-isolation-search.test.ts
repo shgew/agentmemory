@@ -13,7 +13,7 @@ vi.mock("../src/functions/audit.js", () => ({
 }));
 
 vi.mock("../src/functions/access-tracker.js", () => ({
-  recordAccessBatch: vi.fn(),
+  recordOwnedAccessBatch: vi.fn(),
   deleteAccessLog: vi.fn(),
 }));
 
@@ -33,7 +33,11 @@ import {
   setIndexPersistence,
 } from "../src/functions/search.js";
 import { KV } from "../src/state/schema.js";
-import type { CompressedObservation, Session, SearchResult } from "../src/types.js";
+import type {
+  CompressedObservation,
+  Session,
+  SearchResult,
+} from "../src/types.js";
 
 function makeMockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -69,7 +73,9 @@ function makeMockSdk() {
       const id =
         typeof idOrInput === "string" ? idOrInput : idOrInput.function_id;
       const payload =
-        typeof idOrInput === "string" ? data : (idOrInput as { payload: unknown }).payload;
+        typeof idOrInput === "string"
+          ? data
+          : (idOrInput as { payload: unknown }).payload;
       const fn = functions.get(id);
       if (!fn) throw new Error(`No function registered: ${id}`);
       return fn(payload);
@@ -159,7 +165,9 @@ describe("mem::search agent-scope isolation (#817 follow-up)", () => {
     for (const r of result.results) {
       expect(r.observation.agentId).toBe("agent_a");
     }
-    expect(result.results.find((r) => r.observation.id === "obs-b-public")).toBeUndefined();
+    expect(
+      result.results.find((r) => r.observation.id === "obs-b-public"),
+    ).toBeUndefined();
   });
 
   it('isolated mode + agentId: "*" wildcard bypasses and returns both agents', async () => {

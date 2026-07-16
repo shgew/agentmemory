@@ -3,7 +3,7 @@ import type { CompressedObservation, Session } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
-import { recordAccessBatch } from "./access-tracker.js";
+import { recordOwnedAccessBatch } from "./access-tracker.js";
 import { logger } from "../logger.js";
 
 interface FileHistory {
@@ -20,9 +20,11 @@ interface FileHistory {
 }
 
 export function registerFileIndexFunction(sdk: ISdk, kv: StateKV): void {
-  sdk.registerFunction("mem::file-context", 
+  sdk.registerFunction(
+    "mem::file-context",
     async (
-      data: { sessionId?: string; files?: string[]; project?: string } | undefined,
+      data:
+        { sessionId?: string; files?: string[]; project?: string } | undefined,
     ) => {
       const sessionId =
         data && typeof data.sessionId === "string" ? data.sessionId.trim() : "";
@@ -34,12 +36,18 @@ export function registerFileIndexFunction(sdk: ISdk, kv: StateKV): void {
             .filter(Boolean)
         : [];
       if (files.length === 0) {
-        await recordAudit(kv, "observe", "mem::file-context", [sessionId || "unknown"], {
-          error: "invalid_payload",
-          hasSessionId: !!sessionId,
-          hasProject: !!normalizedProject,
-          fileCount: files.length,
-        });
+        await recordAudit(
+          kv,
+          "observe",
+          "mem::file-context",
+          [sessionId || "unknown"],
+          {
+            error: "invalid_payload",
+            hasSessionId: !!sessionId,
+            hasProject: !!normalizedProject,
+            fileCount: files.length,
+          },
+        );
         return { context: "", files: [] };
       }
       const results: FileHistory[] = [];
@@ -49,7 +57,9 @@ export function registerFileIndexFunction(sdk: ISdk, kv: StateKV): void {
         ? sessions.filter((s) => s.id !== sessionId)
         : sessions;
       if (normalizedProject) {
-        otherSessions = otherSessions.filter((s) => s.project === normalizedProject);
+        otherSessions = otherSessions.filter(
+          (s) => s.project === normalizedProject,
+        );
       }
       otherSessions = otherSessions
         .sort(
@@ -117,11 +127,17 @@ export function registerFileIndexFunction(sdk: ISdk, kv: StateKV): void {
       }
       lines.push("</agentmemory-file-context>");
 
-      const accessedIds: string[] = [];
+      const accessed = [];
       for (const fh of results) {
-        for (const obs of fh.observations) accessedIds.push(obs.obsId);
+        for (const obs of fh.observations) {
+          accessed.push({
+            id: obs.obsId,
+            scope: "observation" as const,
+            sessionId: obs.sessionId,
+          });
+        }
       }
-      void recordAccessBatch(kv, accessedIds);
+      void recordOwnedAccessBatch(kv, accessed);
 
       const context = lines.join("\n");
       logger.info("File context generated", {

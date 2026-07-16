@@ -37,13 +37,20 @@ function mockKV() {
 function mockSdk() {
   const functions = new Map<string, Function>();
   return {
-    registerFunction: (idOrOpts: string | { id: string }, handler: Function) => {
+    registerFunction: (
+      idOrOpts: string | { id: string },
+      handler: Function,
+    ) => {
       const id = typeof idOrOpts === "string" ? idOrOpts : idOrOpts.id;
       functions.set(id, handler);
     },
     registerTrigger: () => {},
-    trigger: async (idOrInput: string | { function_id: string; payload: unknown }, data?: unknown) => {
-      const id = typeof idOrInput === "string" ? idOrInput : idOrInput.function_id;
+    trigger: async (
+      idOrInput: string | { function_id: string; payload: unknown },
+      data?: unknown,
+    ) => {
+      const id =
+        typeof idOrInput === "string" ? idOrInput : idOrInput.function_id;
       const payload = typeof idOrInput === "string" ? data : idOrInput.payload;
       const fn = functions.get(id);
       if (!fn) throw new Error(`No function: ${id}`);
@@ -80,8 +87,16 @@ describe("Smart Search Function", () => {
     sdk = mockSdk();
     kv = mockKV();
 
-    const obs1 = makeObs({ id: "obs_1", sessionId: "ses_1", title: "Auth handler" });
-    const obs2 = makeObs({ id: "obs_2", sessionId: "ses_1", title: "Database setup" });
+    const obs1 = makeObs({
+      id: "obs_1",
+      sessionId: "ses_1",
+      title: "Auth handler",
+    });
+    const obs2 = makeObs({
+      id: "obs_2",
+      sessionId: "ses_1",
+      title: "Database setup",
+    });
 
     searchResults = [
       {
@@ -167,7 +182,10 @@ describe("Smart Search Function", () => {
   it("expand mode returns full observations for given IDs", async () => {
     const result = (await sdk.trigger("mem::smart-search", {
       expandIds: ["obs_1"],
-    })) as { mode: string; results: Array<{ obsId: string; observation: CompressedObservation }> };
+    })) as {
+      mode: string;
+      results: Array<{ obsId: string; observation: CompressedObservation }>;
+    };
 
     expect(result.mode).toBe("expanded");
     expect(result.results.length).toBe(1);
@@ -205,7 +223,7 @@ describe("Smart Search Function", () => {
 
   it("compact mode records access for every returned observation id (#119)", async () => {
     await sdk.trigger("mem::smart-search", { query: "auth" });
-    // recordAccessBatch is fire-and-forget — let the microtask queue drain.
+    // Access recording is fire-and-forget, so let the microtask queue drain.
     await new Promise((r) => setImmediate(r));
 
     const log1 = (await kv.get("mem:access", "obs_1")) as {
@@ -229,13 +247,109 @@ describe("Smart Search Function", () => {
     expect(log?.count).toBe(1);
   });
 
+  it("records memory results against the memory owner scope", async () => {
+    const memoryObservation = makeObs({
+      id: "mem_owned",
+      sessionId: "memory",
+      sourceType: "memory",
+      title: "Owned memory",
+    });
+    searchResults = [
+      {
+        observation: memoryObservation,
+        ownerScope: "memory",
+        bm25Score: 0.8,
+        vectorScore: 0,
+        graphScore: 0,
+        combinedScore: 0.8,
+        sessionId: "memory",
+      },
+    ];
+    await kv.set("mem:memories", memoryObservation.id, {
+      id: memoryObservation.id,
+    });
+
+    await sdk.trigger("mem::smart-search", { query: "owned" });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(await kv.get("mem:access", memoryObservation.id)).toMatchObject({
+      count: 1,
+    });
+  });
+
+  it("uses retrieval provenance instead of observation sourceType", async () => {
+    const observation = makeObs({
+      id: "obs_memory_hook",
+      sessionId: "ses_1",
+      sourceType: "memory",
+    });
+    searchResults = [
+      {
+        observation,
+        ownerScope: "observation",
+        bm25Score: 0.8,
+        vectorScore: 0,
+        graphScore: 0,
+        combinedScore: 0.8,
+        sessionId: observation.sessionId,
+      },
+    ];
+    await kv.set(
+      `mem:obs:${observation.sessionId}`,
+      observation.id,
+      observation,
+    );
+
+    await sdk.trigger("mem::smart-search", { query: "memory hook" });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(await kv.get("mem:access", observation.id)).toMatchObject({
+      count: 1,
+    });
+  });
+
+  it("does not record a stale result after its durable owner is gone", async () => {
+    const stale = makeObs({ id: "obs_stale", sessionId: "ses_1" });
+    searchResults = [
+      {
+        observation: stale,
+        bm25Score: 0.8,
+        vectorScore: 0,
+        graphScore: 0,
+        combinedScore: 0.8,
+        sessionId: stale.sessionId,
+      },
+    ];
+
+    await sdk.trigger("mem::smart-search", { query: "stale" });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(await kv.get("mem:access", stale.id)).toBeNull();
+  });
+
   describe("lesson inclusion (#lesson-visibility)", () => {
     it("compact mode returns lessons array alongside observation results", async () => {
       sdk.registerFunction("mem::lesson-recall", async (_payload: any) => ({
         success: true,
         lessons: [
-          { id: "lsn_a", content: "always rebase before push", confidence: 0.9, createdAt: "2026-04-01T00:00:00Z", project: "p", tags: ["git"], score: 0.81 },
-          { id: "lsn_b", content: "never force-push to main", confidence: 0.95, createdAt: "2026-04-02T00:00:00Z", project: "p", tags: ["git"], score: 0.76 },
+          {
+            id: "lsn_a",
+            content: "always rebase before push",
+            confidence: 0.9,
+            createdAt: "2026-04-01T00:00:00Z",
+            project: "p",
+            tags: ["git"],
+            score: 0.81,
+          },
+          {
+            id: "lsn_b",
+            content: "never force-push to main",
+            confidence: 0.95,
+            createdAt: "2026-04-02T00:00:00Z",
+            project: "p",
+            tags: ["git"],
+            score: 0.76,
+          },
         ],
       }));
 
@@ -259,7 +373,16 @@ describe("Smart Search Function", () => {
       const long = "x".repeat(500);
       sdk.registerFunction("mem::lesson-recall", async () => ({
         success: true,
-        lessons: [{ id: "lsn_long", content: long, confidence: 0.5, createdAt: "", tags: [], score: 0.4 }],
+        lessons: [
+          {
+            id: "lsn_long",
+            content: long,
+            confidence: 0.5,
+            createdAt: "",
+            tags: [],
+            score: 0.4,
+          },
+        ],
       }));
 
       const result = (await sdk.trigger("mem::smart-search", {
@@ -275,7 +398,11 @@ describe("Smart Search Function", () => {
       const result = (await sdk.trigger("mem::smart-search", {
         query: "auth",
         includeLessons: false,
-      })) as { mode: string; results: CompactSearchResult[]; lessons?: unknown };
+      })) as {
+        mode: string;
+        results: CompactSearchResult[];
+        lessons?: unknown;
+      };
 
       expect(result.results.length).toBe(2);
       expect(result.lessons).toBeUndefined();
@@ -329,7 +456,11 @@ describe("Smart Search Function", () => {
 });
 
 describe("Smart Search project scoping", () => {
-  function makeResult(obsId: string, sessionId: string, score: number): HybridSearchResult {
+  function makeResult(
+    obsId: string,
+    sessionId: string,
+    score: number,
+  ): HybridSearchResult {
     return {
       observation: makeObs({ id: obsId, sessionId, title: obsId }),
       bm25Score: score,
@@ -364,7 +495,10 @@ describe("Smart Search project scoping", () => {
       includeLessons: false,
     })) as { results: CompactSearchResult[] };
 
-    expect(res.results.map((r) => r.obsId).sort()).toEqual(["mem_a", "mem_unscoped"]);
+    expect(res.results.map((r) => r.obsId).sort()).toEqual([
+      "mem_a",
+      "mem_unscoped",
+    ]);
   });
 
   it("drops observation hits whose session belongs to a different project", async () => {
@@ -372,9 +506,22 @@ describe("Smart Search project scoping", () => {
       makeResult("obs_a", "ses_A", 0.9),
       makeResult("obs_b", "ses_B", 0.8),
     ]);
-    const baseSession = { cwd: "/x", startedAt: "", status: "completed" as const, observationCount: 1 };
-    await kv.set("mem:sessions", "ses_A", { id: "ses_A", project: "proj-A", ...baseSession });
-    await kv.set("mem:sessions", "ses_B", { id: "ses_B", project: "proj-B", ...baseSession });
+    const baseSession = {
+      cwd: "/x",
+      startedAt: "",
+      status: "completed" as const,
+      observationCount: 1,
+    };
+    await kv.set("mem:sessions", "ses_A", {
+      id: "ses_A",
+      project: "proj-A",
+      ...baseSession,
+    });
+    await kv.set("mem:sessions", "ses_B", {
+      id: "ses_B",
+      project: "proj-B",
+      ...baseSession,
+    });
 
     const res = (await sdk.trigger("mem::smart-search", {
       query: "anything",

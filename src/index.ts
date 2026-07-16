@@ -99,6 +99,7 @@ import { registerTemporalGraphFunctions } from "./functions/temporal-graph.js";
 import { registerRetentionFunctions } from "./functions/retention.js";
 import { registerCompressFileFunction } from "./functions/compress-file.js";
 import { registerReplayFunctions } from "./functions/replay.js";
+import { drainPendingImageReleases } from "./functions/image-owner.js";
 import { registerApiTriggers } from "./triggers/api.js";
 import { registerEventTriggers } from "./triggers/events.js";
 import { registerMcpEndpoints } from "./mcp/server.js";
@@ -511,6 +512,13 @@ async function main() {
         `Loaded persisted vector index (${vectorIndex.size} vectors)`,
       );
     }
+  }
+
+  const pendingImageReleaseDrain = await drainPendingImageReleases(sdk, kv);
+  if (pendingImageReleaseDrain.failed > 0) {
+    console.warn(
+      `[agentmemory] ${pendingImageReleaseDrain.failed} pending image release(s) remain`,
+    );
   }
 
   const needsRebuild = bm25Index.size === 0;

@@ -118,6 +118,7 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
     vi.clearAllMocks();
     vi.stubEnv("AGENTMEMORY_IDLE_CHECKPOINT_MS", String(IDLE_THRESHOLD_MS));
     vi.stubEnv("AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS", "");
+    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "false");
     sdk = mockSdk();
     kv = mockKV();
     registerSessionCheckpoint(sdk as never, kv as never);
@@ -292,6 +293,7 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
   });
 
   it("retries pending compression before advancing the watermark", async () => {
+    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "true");
     const startedAt = pastThreshold();
     const sessionId = "ses_pending";
     const session = makeSession({
@@ -312,6 +314,10 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
     };
     await kv.set(SESSIONS_SCOPE, sessionId, session);
     await kv.set(KV.rawPayloads, raw.id, raw);
+    await kv.set(KV.pendingCompression(sessionId), raw.id, {
+      id: raw.id,
+      sessionId,
+    });
 
     let shouldFail = true;
     let compressCalls = 0;
@@ -389,7 +395,7 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
 
   it("allows observations while pending compression is blocked", async () => {
     vi.stubEnv("AGENTMEMORY_IDLE_CHECKPOINT_MS", "0");
-    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "false");
+    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "true");
     registerObserveFunction(sdk as never, kv as never);
 
     const checkpointAt = pastThreshold();
@@ -408,6 +414,10 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
       makeSession({ id: sessionId, updatedAt: checkpointAt }),
     );
     await kv.set(KV.rawPayloads, raw.id, raw);
+    await kv.set(KV.pendingCompression(sessionId), raw.id, {
+      id: raw.id,
+      sessionId,
+    });
 
     let markCompressionStarted: () => void = () => {};
     const compressionStarted = new Promise<void>((resolve) => {
@@ -417,13 +427,17 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
     const compressionFinished = new Promise<void>((resolve) => {
       finishCompression = resolve;
     });
-    sdk.registerFunction("mem::compress", async () => {
-      markCompressionStarted();
-      await compressionFinished;
+    sdk.registerFunction("mem::compress", async (payload) => {
+      const observationId = (payload as { observationId: string }).observationId;
+      if (observationId === raw.id) {
+        markCompressionStarted();
+        await compressionFinished;
+      }
       const compressed: CompressedObservation = {
-        id: raw.id,
+        id: observationId,
         sessionId,
-        timestamp: raw.timestamp,
+        timestamp:
+          observationId === raw.id ? raw.timestamp : new Date().toISOString(),
         sourceType: raw.hookType,
         type: "conversation",
         title: "Recovered pending observation",
@@ -433,7 +447,7 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
         files: [],
         importance: 5,
       };
-      await kv.set(KV.observations(sessionId), raw.id, compressed);
+      await kv.set(KV.observations(sessionId), observationId, compressed);
       return { success: true };
     });
 
@@ -642,7 +656,7 @@ describe("Session Checkpoint Function (trailing-edge idle gate)", () => {
     const originalList = kv.list;
     let blockedRawList = false;
     kv.list = (async <T>(scope: string): Promise<T[]> => {
-      if (scope === KV.rawPayloads && !blockedRawList) {
+      if (scope === KV.pendingCompression(sessionId) && !blockedRawList) {
         blockedRawList = true;
         const snapshot = await originalList<T>(scope);
         rawListRead.resolve();

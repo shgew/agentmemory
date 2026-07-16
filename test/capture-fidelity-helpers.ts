@@ -10,7 +10,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 vi.mock("../src/functions/search.js", () => ({
-  getSearchIndex: () => ({ add: mocks.searchAdd }),
+  getSearchIndex: () => ({ add: mocks.searchAdd, has: () => false }),
   vectorIndexAddGuarded: vi.fn().mockResolvedValue(false),
 }));
 

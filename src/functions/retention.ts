@@ -8,14 +8,13 @@ import type {
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import type { AccessLog } from "./access-tracker.js";
-import {
-  emptyAccessLog,
-  deleteAccessLog,
-  normalizeAccessLog,
-} from "./access-tracker.js";
+import { emptyAccessLog, normalizeAccessLog } from "./access-tracker.js";
 import { recordAudit } from "./audit.js";
-import { getSearchIndex, vectorIndexRemove, flushIndexSave } from "./search.js";
 import { logger } from "../logger.js";
+import {
+  deleteImageBackedRecord,
+  withImageDeletionBatch,
+} from "./image-owner.js";
 
 const DEFAULT_DECAY: DecayConfig = {
   lambda: 0.01,
@@ -55,8 +54,7 @@ function resolveDecayConfig(
   }
   if (!(hot >= warm && warm >= cold && cold >= 0)) {
     return {
-      error:
-        "config.tierThresholds must satisfy hot >= warm >= cold >= 0",
+      error: "config.tierThresholds must satisfy hot >= warm >= cold >= 0",
     };
   }
   return { config };
@@ -97,18 +95,19 @@ function computeSalience(
   }
 
   if ("confidence" in memory) {
-    baseSalience = Math.max(baseSalience, (memory as SemanticMemory).confidence);
+    baseSalience = Math.max(
+      baseSalience,
+      (memory as SemanticMemory).confidence,
+    );
   }
 
   const accessBonus = Math.min(0.2, accessCount * 0.02);
   return Math.min(1, baseSalience + accessBonus);
 }
 
-export function registerRetentionFunctions(
-  sdk: ISdk,
-  kv: StateKV,
-): void {
-  sdk.registerFunction("mem::retention-score",
+export function registerRetentionFunctions(sdk: ISdk, kv: StateKV): void {
+  sdk.registerFunction(
+    "mem::retention-score",
     async (data: { config?: Partial<DecayConfig> }) => {
       const resolved = resolveDecayConfig(data?.config);
       if ("error" in resolved) {
@@ -231,8 +230,7 @@ export function registerRetentionFunctions(
       scores.sort((a, b) => b.score - a.score);
 
       const tiers = {
-        hot: scores.filter((s) => s.score >= config.tierThresholds.hot)
-          .length,
+        hot: scores.filter((s) => s.score >= config.tierThresholds.hot).length,
         warm: scores.filter(
           (s) =>
             s.score >= config.tierThresholds.warm &&
@@ -243,9 +241,8 @@ export function registerRetentionFunctions(
             s.score >= config.tierThresholds.cold &&
             s.score < config.tierThresholds.warm,
         ).length,
-        evictable: scores.filter(
-          (s) => s.score < config.tierThresholds.cold,
-        ).length,
+        evictable: scores.filter((s) => s.score < config.tierThresholds.cold)
+          .length,
       };
 
       logger.info("Retention scores computed", {
@@ -273,124 +270,124 @@ export function registerRetentionFunctions(
     },
   );
 
-  sdk.registerFunction("mem::retention-evict", 
+  sdk.registerFunction(
+    "mem::retention-evict",
     async (data?: {
       threshold?: number;
       dryRun?: boolean;
       maxEvict?: number;
     }) => {
-      const threshold =
-        typeof data?.threshold === "number" && Number.isFinite(data.threshold)
-          ? data.threshold
-          : DEFAULT_DECAY.tierThresholds.cold;
-      const maxEvictRaw =
-        typeof data?.maxEvict === "number" && Number.isInteger(data.maxEvict)
-          ? data.maxEvict
-          : 50;
-      const maxEvict = Math.min(1000, Math.max(0, maxEvictRaw));
-      const { decrementImageRef } = await import("./image-refs.js");
+      return withImageDeletionBatch(kv, async (batch) => {
+        const threshold =
+          typeof data?.threshold === "number" && Number.isFinite(data.threshold)
+            ? data.threshold
+            : DEFAULT_DECAY.tierThresholds.cold;
+        const maxEvictRaw =
+          typeof data?.maxEvict === "number" && Number.isInteger(data.maxEvict)
+            ? data.maxEvict
+            : 50;
+        const maxEvict = Math.min(1000, Math.max(0, maxEvictRaw));
+        const allScores = await kv.list<RetentionScore>(KV.retentionScores);
+        const candidates = allScores
+          .filter((s) => s.score < threshold)
+          .sort((a, b) => a.score - b.score)
+          .slice(0, maxEvict);
 
-      const allScores = await kv.list<RetentionScore>(KV.retentionScores);
-      const candidates = allScores
-        .filter((s) => s.score < threshold)
-        .sort((a, b) => a.score - b.score)
-        .slice(0, maxEvict);
+        if (data?.dryRun) {
+          return {
+            success: true,
+            dryRun: true,
+            wouldEvict: candidates.length,
+            candidates: candidates.map((c) => ({
+              id: c.memoryId,
+              score: c.score,
+            })),
+          };
+        }
 
-      if (data?.dryRun) {
-        return {
-          success: true,
-          dryRun: true,
-          wouldEvict: candidates.length,
-          candidates: candidates.map((c) => ({
-            id: c.memoryId,
-            score: c.score,
-          })),
-        };
-      }
-
-      // Branch on source (#124). Pre-0.8.10 rows have no `source` field,
-      // and that includes semantic retention rows that were written by
-      // the old scorer — so we can't just default to episodic, that
-      // would silently no-op the delete and leave the stranded semantic
-      // memory alive (the exact bug #124 is about). When `source` is
-      // missing, probe both namespaces to find where the memoryId
-      // actually lives and route the delete there. After one re-score
-      // (mem::retention-score) every row will have the correct tag.
-      let evicted = 0;
-      let evictedEpisodic = 0;
-      let evictedSemantic = 0;
-      const evictedIds: string[] = [];
-      for (const candidate of candidates) {
-        try {
-          let scope: string | null = null;
-          let resolvedSource: "episodic" | "semantic" | null = null;
-          if (candidate.source === "semantic") {
-            scope = KV.semantic;
-            resolvedSource = "semantic";
-          } else if (candidate.source === "episodic") {
-            scope = KV.memories;
-            resolvedSource = "episodic";
-          } else {
-            const episodic = await kv.get(KV.memories, candidate.memoryId);
-            if (episodic !== null) {
+        // Branch on source (#124). Pre-0.8.10 rows have no `source` field,
+        // and that includes semantic retention rows that were written by
+        // the old scorer, so we can't just default to episodic, that
+        // would silently no-op the delete and leave the stranded semantic
+        // memory alive (the exact bug #124 is about). When `source` is
+        // missing, probe both namespaces to find where the memoryId
+        // actually lives and route the delete there. After one re-score
+        // (mem::retention-score) every row will have the correct tag.
+        let evicted = 0;
+        let evictedEpisodic = 0;
+        let evictedSemantic = 0;
+        const evictedIds: string[] = [];
+        for (const candidate of candidates) {
+          try {
+            let scope: string | null = null;
+            let resolvedSource: "episodic" | "semantic" | null = null;
+            if (candidate.source === "semantic") {
+              scope = KV.semantic;
+              resolvedSource = "semantic";
+            } else if (candidate.source === "episodic") {
               scope = KV.memories;
               resolvedSource = "episodic";
             } else {
-              const semantic = await kv.get(KV.semantic, candidate.memoryId);
-              if (semantic !== null) {
-                scope = KV.semantic;
-                resolvedSource = "semantic";
+              const episodic = await kv.get(KV.memories, candidate.memoryId);
+              if (episodic !== null) {
+                scope = KV.memories;
+                resolvedSource = "episodic";
+              } else {
+                const semantic = await kv.get(KV.semantic, candidate.memoryId);
+                if (semantic !== null) {
+                  scope = KV.semantic;
+                  resolvedSource = "semantic";
+                }
               }
             }
-          }
 
-          if (!scope || !resolvedSource) {
+            if (!scope || !resolvedSource) {
+              continue;
+            }
+
+            const mem = await deleteImageBackedRecord<Memory>(
+              sdk,
+              kv,
+              scope,
+              candidate.memoryId,
+              batch,
+            );
+            if (!mem) continue;
+            await kv.delete(KV.retentionScores, candidate.memoryId);
+            evicted++;
+            evictedIds.push(candidate.memoryId);
+            if (resolvedSource === "semantic") evictedSemantic++;
+            else evictedEpisodic++;
+          } catch {
             continue;
           }
-
-          const mem = await kv.get<Memory>(scope, candidate.memoryId);
-          if (mem && mem.imageRef) {
-            await decrementImageRef(kv, sdk, mem.imageRef);
-          }
-          await kv.delete(scope, candidate.memoryId);
-          await kv.delete(KV.retentionScores, candidate.memoryId);
-          await deleteAccessLog(kv, candidate.memoryId);
-          getSearchIndex().remove(candidate.memoryId);
-          vectorIndexRemove(candidate.memoryId);
-          evicted++;
-          evictedIds.push(candidate.memoryId);
-          if (resolvedSource === "semantic") evictedSemantic++;
-          else evictedEpisodic++;
-        } catch {
-          continue;
         }
-      }
 
-      // Retention eviction is a structural delete path that removes
-      // memories, retention scores, and access logs, so it needs to
-      // emit an audit record per the repo's audit-coverage policy (see
-      // mem::governance-delete for the reference pattern). Batched,
-      // one record per invocation — per-candidate audits would flood
-      // the audit log during normal eviction sweeps.
-      if (evicted > 0) {
-        await flushIndexSave();
-        await recordAudit(kv, "delete", "mem::retention-evict", evictedIds, {
-          threshold,
+        // Retention eviction is a structural delete path that removes
+        // memories, retention scores, and access logs, so it needs to
+        // emit an audit record per the repo's audit-coverage policy (see
+        // mem::governance-delete for the reference pattern). Batched,
+        // one record per invocation, per-candidate audits would flood
+        // the audit log during normal eviction sweeps.
+        if (evicted > 0) {
+          await recordAudit(kv, "delete", "mem::retention-evict", evictedIds, {
+            threshold,
+            evicted,
+            evictedEpisodic,
+            evictedSemantic,
+            reason: "retention score below threshold",
+          });
+        }
+
+        logger.info("Retention-based eviction complete", {
           evicted,
           evictedEpisodic,
           evictedSemantic,
-          reason: "retention score below threshold",
+          threshold,
         });
-      }
 
-      logger.info("Retention-based eviction complete", {
-        evicted,
-        evictedEpisodic,
-        evictedSemantic,
-        threshold,
+        return { success: true, evicted, evictedEpisodic, evictedSemantic };
       });
-
-      return { success: true, evicted, evictedEpisodic, evictedSemantic };
     },
   );
 }

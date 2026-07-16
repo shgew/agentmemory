@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
+const configMocks = vi.hoisted(() => ({ autoCompress: false }));
+
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
@@ -12,7 +14,7 @@ vi.mock("../src/config.js", () => ({
   isGraphExtractionEnabled: () => false,
   getAgentId: () => undefined,
   getEnvVar: () => undefined,
-  isAutoCompressEnabled: () => false,
+  isAutoCompressEnabled: () => configMocks.autoCompress,
 }));
 
 import { registerSessionSweepFunction } from "../src/functions/session-sweep.js";
@@ -27,6 +29,7 @@ import type {
 } from "../src/types.js";
 import { registerEventTriggers } from "../src/triggers/events.js";
 import { KV } from "../src/state/schema.js";
+import { withImageOwnershipLock } from "../src/functions/observation-lock.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -128,9 +131,80 @@ describe("Session Sweep Function", () => {
   let kv: ReturnType<typeof mockKV>;
 
   beforeEach(() => {
+    configMocks.autoCompress = false;
     sdk = mockSdk();
     kv = mockKV();
     registerSessionSweepFunction(sdk as never, kv as never);
+  });
+
+  it("drains pending image releases during a live sweep", async () => {
+    const releaseId = `record:${KV.memories}:mem_deleted`;
+    await kv.set(KV.imageReleases, releaseId, {
+      id: releaseId,
+      refs: [],
+      kind: "record",
+      scope: KV.memories,
+      recordId: "mem_deleted",
+      owner: { id: "mem_deleted" },
+    });
+
+    await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    });
+
+    expect(await kv.get(KV.imageReleases, releaseId)).toBeNull();
+  });
+
+  it("keeps replace imports out of pending compression recovery", async () => {
+    const session = makeSession({
+      id: "ses_pending_barrier",
+      startedAt: new Date(Date.now() - 7 * 60 * 60 * 1000).toISOString(),
+    });
+    const raw: RawObservation = {
+      id: "obs_pending_barrier",
+      sessionId: session.id,
+      timestamp: session.startedAt,
+      hookType: "prompt_submit",
+      raw: { prompt: "recover" },
+      userPrompt: "recover",
+    };
+    await kv.set(KV.sessions, session.id, session);
+    await kv.set(KV.rawPayloads, raw.id, raw);
+    await kv.set(KV.pendingCompression(session.id), raw.id, {
+      id: raw.id,
+      sessionId: session.id,
+    });
+
+    const listRecord = kv.list;
+    const pendingReadStarted = deferred();
+    const releasePendingRead = deferred();
+    let blockPendingRead = true;
+    kv.list = async <T>(scope: string): Promise<T[]> => {
+      if (blockPendingRead && scope === KV.pendingCompression(session.id)) {
+        blockPendingRead = false;
+        pendingReadStarted.resolve();
+        await releasePendingRead.promise;
+      }
+      return listRecord<T>(scope);
+    };
+
+    const sweeping = sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    });
+    await pendingReadStarted.promise;
+
+    let importEntered = false;
+    const importing = withImageOwnershipLock(async () => {
+      importEntered = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(importEntered).toBe(false);
+
+    releasePendingRead.resolve();
+    await Promise.all([sweeping, importing]);
+    expect(importEntered).toBe(true);
   });
 
   it("sweeps active sessions older than the 6h default", async () => {
@@ -387,6 +461,7 @@ describe("Session Sweep Scheduling", () => {
   let kv: ReturnType<typeof mockKV>;
 
   beforeEach(() => {
+    configMocks.autoCompress = false;
     sdk = mockSdk();
     kv = mockKV();
     registerSessionSweepFunction(sdk as never, kv as never);
@@ -581,6 +656,7 @@ describe("Session Sweep Scheduling", () => {
   });
 
   it("does not finalize a completed session resumed during pending compression", async () => {
+    configMocks.autoCompress = true;
     const staleAt = new Date(
       Date.now() - 10 * 60 * 60 * 1000,
     ).toISOString();

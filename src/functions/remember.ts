@@ -1,17 +1,24 @@
 import { TriggerAction, type ISdk } from "iii-sdk";
-import type { Memory } from "../types.js";
+import type { Memory, RawObservation } from "../types.js";
 import { KV, generateId, jaccardSimilarity } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { memoryToObservation } from "../state/memory-utils.js";
-import { deleteAccessLog } from "./access-tracker.js";
 import { recordAudit } from "./audit.js";
-import { getSearchIndex, vectorIndexAddGuarded, vectorIndexRemove, flushIndexSave } from "./search.js";
+import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
 import { getAgentId } from "../config.js";
 import { logger } from "../logger.js";
+import {
+  deleteImageBackedRecord,
+  deleteObservationOwners,
+  deleteObservationOwnersWithinSessionLock,
+  withImageDeletionBatch,
+  withObservationSessionOwnerLock,
+} from "./image-owner.js";
 
 export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
-  sdk.registerFunction("mem::remember", 
+  sdk.registerFunction(
+    "mem::remember",
     async (data: {
       content: string;
       type?: string;
@@ -35,8 +42,14 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
       if (data.concepts && !Array.isArray(data.concepts)) {
         return { success: false, error: "concepts must be an array" };
       }
-      if (data.sourceObservationIds && !Array.isArray(data.sourceObservationIds)) {
-        return { success: false, error: "sourceObservationIds must be an array" };
+      if (
+        data.sourceObservationIds &&
+        !Array.isArray(data.sourceObservationIds)
+      ) {
+        return {
+          success: false,
+          error: "sourceObservationIds must be an array",
+        };
       }
       const validTypes = new Set([
         "pattern",
@@ -117,8 +130,14 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
           ...(project !== undefined && { project }),
         };
 
-        if (data.ttlDays && typeof data.ttlDays === "number" && data.ttlDays > 0) {
-          memory.forgetAfter = new Date(Date.now() + data.ttlDays * 86400000).toISOString();
+        if (
+          data.ttlDays &&
+          typeof data.ttlDays === "number" &&
+          data.ttlDays > 0
+        ) {
+          memory.forgetAfter = new Date(
+            Date.now() + data.ttlDays * 86400000,
+          ).toISOString();
         }
 
         if (supersededMemory) {
@@ -167,7 +186,8 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
     },
   );
 
-  sdk.registerFunction("mem::forget",
+  sdk.registerFunction(
+    "mem::forget",
     async (data: {
       sessionId?: string;
       observationIds?: string[];
@@ -177,84 +197,87 @@ export function registerRememberFunction(sdk: ISdk, kv: StateKV): void {
       const deletedMemoryIds: string[] = [];
       const deletedObservationIds: string[] = [];
       let deletedSession = false;
-      const { decrementImageRef } = await import("./image-refs.js");
-
-      if (data.memoryId) {
-        const mem = await kv.get<Memory>(KV.memories, data.memoryId);
-        await kv.delete(KV.memories, data.memoryId);
-        if (mem?.imageRef) {
-          await decrementImageRef(kv, sdk, mem.imageRef);
-        }
-        await deleteAccessLog(kv, data.memoryId);
-        getSearchIndex().remove(data.memoryId);
-        vectorIndexRemove(data.memoryId);
-        deletedMemoryIds.push(data.memoryId);
-        deleted++;
-      }
-
-      if (
-        data.sessionId &&
-        data.observationIds &&
-        data.observationIds.length > 0
-      ) {
-        for (const obsId of data.observationIds) {
-          const obs = await kv.get<{ imageData?: string; imageRef?: string }>(
-            KV.observations(data.sessionId),
-            obsId,
+      await withImageDeletionBatch(kv, async (batch) => {
+        if (data.memoryId) {
+          const mem = await deleteImageBackedRecord<Memory>(
+            sdk,
+            kv,
+            KV.memories,
+            data.memoryId,
+            batch,
           );
-          await kv.delete(KV.observations(data.sessionId), obsId);
-          await kv.delete(KV.rawPayloads, obsId);
-          if (obs?.imageData) await decrementImageRef(kv, sdk, obs.imageData);
-          if (obs?.imageRef && obs.imageRef !== obs.imageData) {
-            await decrementImageRef(kv, sdk, obs.imageRef);
-          }
-          getSearchIndex().remove(obsId);
-          vectorIndexRemove(obsId);
-          deletedObservationIds.push(obsId);
-          deleted++;
-        }
-      }
-
-      if (
-        data.sessionId &&
-        (!data.observationIds || data.observationIds.length === 0) &&
-        !data.memoryId
-      ) {
-        const observations = await kv.list<{ id: string; imageData?: string; imageRef?: string }>(
-          KV.observations(data.sessionId),
-        );
-        for (const obs of observations) {
-          await kv.delete(KV.observations(data.sessionId), obs.id);
-          await kv.delete(KV.rawPayloads, obs.id);
-          if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
-          if (obs.imageRef && obs.imageRef !== obs.imageData) {
-            await decrementImageRef(kv, sdk, obs.imageRef);
-          }
-          getSearchIndex().remove(obs.id);
-          vectorIndexRemove(obs.id);
-          deletedObservationIds.push(obs.id);
-          deleted++;
-        }
-        const rawPayloads = (
-          await kv.list<{ id: string; sessionId: string }>(KV.rawPayloads)
-        ).filter((raw) => raw.sessionId === data.sessionId);
-        const deletedIds = new Set(deletedObservationIds);
-        for (const raw of rawPayloads) {
-          if (!deletedIds.has(raw.id)) {
-            await kv.delete(KV.rawPayloads, raw.id);
-            deletedObservationIds.push(raw.id);
-            deletedIds.add(raw.id);
+          if (mem) {
+            deletedMemoryIds.push(data.memoryId);
             deleted++;
           }
         }
-        await kv.delete(KV.sessions, data.sessionId);
-        await kv.delete(KV.summaries, data.sessionId);
-        deletedSession = true;
-        deleted += 2;
-      }
+
+        if (
+          data.sessionId &&
+          data.observationIds &&
+          data.observationIds.length > 0
+        ) {
+          for (const obsId of data.observationIds) {
+            const ownersDeleted = await deleteObservationOwners<{
+              imageData?: string;
+              imageRef?: string;
+            }>(sdk, kv, data.sessionId, obsId, batch);
+            if (!ownersDeleted) continue;
+            deletedObservationIds.push(obsId);
+            deleted++;
+          }
+        }
+
+        if (
+          data.sessionId &&
+          (!data.observationIds || data.observationIds.length === 0) &&
+          !data.memoryId
+        ) {
+          const sessionId = data.sessionId;
+          await withObservationSessionOwnerLock(sessionId, async () => {
+            const observations = await kv.list<{
+              id: string;
+              imageData?: string;
+              imageRef?: string;
+            }>(KV.observations(sessionId));
+            for (const obs of observations) {
+              const ownersDeleted =
+                await deleteObservationOwnersWithinSessionLock<typeof obs>(
+                  sdk,
+                  kv,
+                  sessionId,
+                  obs.id,
+                  batch,
+                );
+              if (!ownersDeleted) continue;
+              deletedObservationIds.push(obs.id);
+              deleted++;
+            }
+            const rawPayloads = (
+              await kv.list<RawObservation>(KV.rawPayloads)
+            ).filter((raw) => raw.sessionId === sessionId);
+            const deletedIds = new Set(deletedObservationIds);
+            for (const raw of rawPayloads) {
+              if (deletedIds.has(raw.id)) continue;
+              const ownersDeleted =
+                await deleteObservationOwnersWithinSessionLock<{
+                  imageData?: string;
+                  imageRef?: string;
+                }>(sdk, kv, sessionId, raw.id, batch);
+              if (!ownersDeleted) continue;
+              deletedObservationIds.push(raw.id);
+              deletedIds.add(raw.id);
+              deleted++;
+            }
+            await kv.delete(KV.sessions, sessionId);
+            await kv.delete(KV.summaries, sessionId);
+            deletedSession = true;
+            deleted += 2;
+          });
+        }
+      });
 
       if (deleted > 0) {
-        await flushIndexSave();
         await recordAudit(
           kv,
           "forget",

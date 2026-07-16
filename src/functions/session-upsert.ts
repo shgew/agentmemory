@@ -2,6 +2,7 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import type { Session } from "../types.js";
+import { withImageOwnershipReadLock } from "./observation-lock.js";
 
 export type SessionUpsertInput = {
   readonly sessionId: string;
@@ -30,72 +31,69 @@ export function upsertSession(
   kv: StateKV,
   input: SessionUpsertInput,
 ): Promise<SessionUpsertResult> {
-  return withKeyedLock(`session:${input.sessionId}`, async () => {
-    const existing = await kv.get<Session>(KV.sessions, input.sessionId);
-    if (!existing) {
-      if (input.parentSessionId) {
-        const parent = await kv.get<Session>(KV.sessions, input.parentSessionId);
-        if (
-          parent &&
-          (parent.project !== input.project ||
-            (parent.agentId && input.agentId && parent.agentId !== input.agentId))
-        ) {
-          return {
-            session: null,
-            projectConflict: parent.project !== input.project,
-            identityConflict: "parent",
-          };
+  return withImageOwnershipReadLock(() =>
+    withKeyedLock(`session:${input.sessionId}`, async () => {
+      const existing = await kv.get<Session>(KV.sessions, input.sessionId);
+      if (!existing) {
+        if (input.parentSessionId) {
+          const parent = await kv.get<Session>(
+            KV.sessions,
+            input.parentSessionId,
+          );
+          if (
+            parent &&
+            (parent.project !== input.project ||
+              (parent.agentId &&
+                input.agentId &&
+                parent.agentId !== input.agentId))
+          ) {
+            return {
+              session: null,
+              projectConflict: parent.project !== input.project,
+              identityConflict: "parent",
+            };
+          }
         }
+        const session: Session = {
+          id: input.sessionId,
+          project: input.project,
+          cwd: input.cwd,
+          startedAt: new Date().toISOString(),
+          status: "active",
+          observationCount: 0,
+          ...(input.parentSessionId
+            ? { parentSessionId: input.parentSessionId }
+            : {}),
+          ...(input.summary ? { summary: input.summary } : {}),
+          ...(input.firstPrompt ? { firstPrompt: input.firstPrompt } : {}),
+          ...(input.agentId ? { agentId: input.agentId } : {}),
+        };
+        await kv.set(KV.sessions, input.sessionId, session);
+        return { session, projectConflict: false };
       }
-      const session: Session = {
-        id: input.sessionId,
-        project: input.project,
-        cwd: input.cwd,
-        startedAt: new Date().toISOString(),
-        status: "active",
-        observationCount: 0,
-        ...(input.parentSessionId
-          ? { parentSessionId: input.parentSessionId }
-          : {}),
-        ...(input.summary ? { summary: input.summary } : {}),
-        ...(input.firstPrompt ? { firstPrompt: input.firstPrompt } : {}),
-        ...(input.agentId ? { agentId: input.agentId } : {}),
-      };
-      await kv.set(KV.sessions, input.sessionId, session);
-      return { session, projectConflict: false };
-    }
 
-    if (existing.project !== input.project) {
-      return {
-        session: existing,
-        projectConflict: true,
-        identityConflict: "project",
-      };
-    }
-    if (existing.agentId && input.agentId && existing.agentId !== input.agentId) {
-      return {
-        session: existing,
-        projectConflict: false,
-        identityConflict: "agent",
-      };
-    }
-    if (
-      existing.parentSessionId &&
-      input.parentSessionId &&
-      existing.parentSessionId !== input.parentSessionId
-    ) {
-      return {
-        session: existing,
-        projectConflict: false,
-        identityConflict: "parent",
-      };
-    }
-    if (!existing.parentSessionId && input.parentSessionId) {
-      const parent = await kv.get<Session>(KV.sessions, input.parentSessionId);
+      if (existing.project !== input.project) {
+        return {
+          session: existing,
+          projectConflict: true,
+          identityConflict: "project",
+        };
+      }
       if (
-        parent &&
-        (parent.project !== existing.project ||
-          (parent.agentId && existing.agentId && parent.agentId !== existing.agentId))
+        existing.agentId &&
+        input.agentId &&
+        existing.agentId !== input.agentId
+      ) {
+        return {
+          session: existing,
+          projectConflict: false,
+          identityConflict: "agent",
+        };
+      }
+      if (
+        existing.parentSessionId &&
+        input.parentSessionId &&
+        existing.parentSessionId !== input.parentSessionId
       ) {
         return {
           session: existing,
@@ -103,75 +101,91 @@ export function upsertSession(
           identityConflict: "parent",
         };
       }
-    }
-
-    // Metadata enrichment only backfills empty durable fields; keep it under
-    // the outer session: lock. The observation-count repair is deliberately
-    // NOT done here. See the nested obs: lock below.
-    const ops: UpdateOp[] = [];
-    if (isEmpty(existing.summary) && input.summary) {
-      ops.push({ type: "set", path: "summary", value: input.summary });
-    }
-    if (isEmpty(existing.firstPrompt) && input.firstPrompt) {
-      ops.push({ type: "set", path: "firstPrompt", value: input.firstPrompt });
-    }
-    if (isEmpty(existing.cwd)) {
-      ops.push({ type: "set", path: "cwd", value: input.cwd });
-    }
-    if (isEmpty(existing.agentId) && input.agentId) {
-      ops.push({ type: "set", path: "agentId", value: input.agentId });
-    }
-    if (isEmpty(existing.parentSessionId) && input.parentSessionId) {
-      ops.push({
-        type: "set",
-        path: "parentSessionId",
-        value: input.parentSessionId,
-      });
-    }
-    if (input.resumed && existing.status === "completed") {
-      ops.push({ type: "set", path: "status", value: "active" });
-      ops.push({
-        type: "set",
-        path: "updatedAt",
-        value: new Date().toISOString(),
-      });
-    }
-
-    if (ops.length > 0) {
-      await kv.update<Session>(KV.sessions, input.sessionId, ops);
-    }
-
-    // observationCount is a read-modify-write counter that mem::observe
-    // maintains under withKeyedLock(`obs:${id}`) WITHOUT ever taking the
-    // session: lock (observe.ts:196 lists/updates the sessions row under obs:
-    // only). So the session: lock alone never protected the count: a
-    // concurrent observe could commit N+1 in the window between our list() and
-    // our update(), and our stale write would clobber it (or vice versa).
-    // Serialize the repair with observe's increment by running it under the
-    // SAME obs: lock. Re-read the row, list observations, and only grow the
-    // count, never shrink it.
-    //
-    // Lock order: session: -> obs:. NEVER acquire session: while holding obs:.
-    // Verified: the only obs: holders (observe.ts:111/196,
-    // session-checkpoint.ts:35) touch the sessions row via kv.update WITHOUT
-    // taking session:, and the only other session: holder (api.ts commit-link,
-    // api.ts:831) never takes obs:. No path acquires obs: then session:, so
-    // there is no lock-ordering cycle and this nesting cannot deadlock.
-    const session = await withKeyedLock(`obs:${input.sessionId}`, async () => {
-      const current =
-        (await kv.get<Session>(KV.sessions, input.sessionId)) ?? existing;
-      const observations = await kv.list(KV.observations(input.sessionId));
-      if (current.observationCount < observations.length) {
-        return kv.update<Session>(KV.sessions, input.sessionId, [
-          { type: "set", path: "observationCount", value: observations.length },
-        ]);
+      if (!existing.parentSessionId && input.parentSessionId) {
+        const parent = await kv.get<Session>(
+          KV.sessions,
+          input.parentSessionId,
+        );
+        if (
+          parent &&
+          (parent.project !== existing.project ||
+            (parent.agentId &&
+              existing.agentId &&
+              parent.agentId !== existing.agentId))
+        ) {
+          return {
+            session: existing,
+            projectConflict: false,
+            identityConflict: "parent",
+          };
+        }
       }
-      return current;
-    });
 
-    return {
-      session,
-      projectConflict: false,
-    };
-  });
+      // Metadata enrichment only backfills empty durable fields; keep it under
+      // the outer session: lock. The observation-count repair is deliberately
+      // NOT done here. See the nested obs: lock below.
+      const ops: UpdateOp[] = [];
+      if (isEmpty(existing.summary) && input.summary) {
+        ops.push({ type: "set", path: "summary", value: input.summary });
+      }
+      if (isEmpty(existing.firstPrompt) && input.firstPrompt) {
+        ops.push({
+          type: "set",
+          path: "firstPrompt",
+          value: input.firstPrompt,
+        });
+      }
+      if (isEmpty(existing.cwd)) {
+        ops.push({ type: "set", path: "cwd", value: input.cwd });
+      }
+      if (isEmpty(existing.agentId) && input.agentId) {
+        ops.push({ type: "set", path: "agentId", value: input.agentId });
+      }
+      if (isEmpty(existing.parentSessionId) && input.parentSessionId) {
+        ops.push({
+          type: "set",
+          path: "parentSessionId",
+          value: input.parentSessionId,
+        });
+      }
+      if (input.resumed && existing.status === "completed") {
+        ops.push({ type: "set", path: "status", value: "active" });
+        ops.push({
+          type: "set",
+          path: "updatedAt",
+          value: new Date().toISOString(),
+        });
+      }
+
+      if (ops.length > 0) {
+        await kv.update<Session>(KV.sessions, input.sessionId, ops);
+      }
+
+      // Keep session, ownership, observation lock order aligned with capture,
+      // deletion, import, and snapshot restore.
+      const session = await withKeyedLock(
+        `obs:${input.sessionId}`,
+        async () => {
+          const current =
+            (await kv.get<Session>(KV.sessions, input.sessionId)) ?? existing;
+          const observations = await kv.list(KV.observations(input.sessionId));
+          if (current.observationCount < observations.length) {
+            return kv.update<Session>(KV.sessions, input.sessionId, [
+              {
+                type: "set",
+                path: "observationCount",
+                value: observations.length,
+              },
+            ]);
+          }
+          return current;
+        },
+      );
+
+      return {
+        session,
+        projectConflict: false,
+      };
+    }),
+  );
 }

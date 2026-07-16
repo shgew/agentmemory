@@ -27,6 +27,20 @@ function mockKV() {
       store.get(scope)!.set(key, value);
       return value;
     },
+    update: async <T>(
+      scope: string,
+      key: string,
+      updates: Array<{ path: string; value: unknown }>,
+    ): Promise<T | null> => {
+      const current = store.get(scope)?.get(key) as
+        | Record<string, unknown>
+        | undefined;
+      if (!current) return null;
+      const updated = { ...current };
+      for (const update of updates) updated[update.path] = update.value;
+      store.get(scope)!.set(key, updated);
+      return updated as T;
+    },
     delete: async (scope: string, key: string) => {
       store.get(scope)?.delete(key);
     },
@@ -125,13 +139,9 @@ describe("import-jsonl re-key on parsed.sessionId (#775)", () => {
       .filter((c) => c.scope === KV.sessions && c.key === undefined);
     expect(undefinedKeyWrites.length).toBe(0);
 
-    const sessionWrites = kv
-      .getSetCalls()
-      .filter((c) => c.scope === KV.sessions && c.key === "sess-no-id");
-    expect(sessionWrites.length).toBeGreaterThan(0);
-    // The handler also backfills the missing id field so future reads
-    // are well-formed.
-    expect((sessionWrites.at(-1)!.value as any).id).toBe("sess-no-id");
+    expect(
+      (await kv.get<{ id?: string }>(KV.sessions, "sess-no-id"))?.id,
+    ).toBe("sess-no-id");
   });
 
   it("fresh import (no existing row) still writes session keyed by parsed.sessionId", async () => {

@@ -80,6 +80,19 @@ function mockKV(store: Store, listFailures: Set<string> = new Set()) {
       store.get(scope)!.set(key, data);
       return data;
     },
+    update: async <T>(
+      scope: string,
+      key: string,
+      ops: Array<{ path: string; value?: unknown }>,
+    ): Promise<T> => {
+      const next = {
+        ...((store.get(scope)?.get(key) as Record<string, unknown>) ?? {}),
+      };
+      for (const op of ops) next[op.path] = op.value;
+      if (!store.has(scope)) store.set(scope, new Map());
+      store.get(scope)!.set(key, next);
+      return next as T;
+    },
     delete: async (scope: string, key: string): Promise<void> => {
       store.get(scope)?.delete(key);
     },
@@ -161,6 +174,12 @@ describe("mem::evict stale sessions", () => {
       ],
       [KV.observations(session.id), new Map([[observation.id, observation]])],
       [KV.rawPayloads, new Map([[rawPayload.id, rawPayload]])],
+      [
+        KV.pendingCompression(sessionId),
+        new Map([
+          [rawPayload.id, { id: rawPayload.id, sessionId }],
+        ]),
+      ],
       [KV.config, new Map()],
       [KV.audit, new Map()],
     ]);
@@ -172,6 +191,9 @@ describe("mem::evict stale sessions", () => {
 
     expect(await kv.get(KV.observations(sessionId), observation.id)).toBeNull();
     expect(await kv.get(KV.rawPayloads, rawPayload.id)).toBeNull();
+    expect(
+      await kv.get(KV.pendingCompression(sessionId), rawPayload.id),
+    ).toBeNull();
   });
 
   it("runs session recovery before deleting a stale observed session", async () => {

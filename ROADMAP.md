@@ -37,7 +37,7 @@ Anything not on this list that a contributor wants to pursue is welcome — open
 
 ### Planned
 - [ ] **GitHub connector** (`@agentmemory/github-watcher`) — sync issues, PRs, discussions as observations. Shares the `POST /agentmemory/observe` wire format with the filesystem connector.
-- [x] **OpenCode capture plugin** (#156) - 40 capture paths covering session lifecycle, completed assistant text, prompts, tool results, diffs, permissions, tasks, commands, diagnostics, questions, MCP events, PTY events, commit links, and context injection. See `plugin/opencode/`.
+- [x] **OpenCode capture plugin** (#156) - 41 capture paths covering session lifecycle, completed assistant text, prompts, tool results, diffs, permissions, tasks, commands, diagnostics, questions, MCP events, PTY events, commit links, and context injection. See `plugin/opencode/`.
 - [ ] **Session replay UI** in the real-time viewer — scrub the timeline, inspect per-observation payloads.
 - [ ] **Benchmark harness in CI** — keep the 95.2% R@5 number honest across releases by re-running LongMemEval-S on every minor tag.
 

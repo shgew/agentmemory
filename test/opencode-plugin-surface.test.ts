@@ -45,6 +45,7 @@ const TYPED_HOOKS = [
   "chat.message",
   "tool.execute.before",
   "tool.execute.after",
+  "shell.env",
   "experimental.chat.system.transform",
   "experimental.session.compacting",
   "experimental.compaction.autocontinue",

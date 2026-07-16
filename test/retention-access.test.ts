@@ -5,10 +5,7 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-function mockKV(
-  memories: Memory[] = [],
-  semanticMems: SemanticMemory[] = [],
-) {
+function mockKV(memories: Memory[] = [], semanticMems: SemanticMemory[] = []) {
   const store = new Map<string, Map<string, unknown>>();
   const memMap = new Map<string, unknown>();
   for (const m of memories) memMap.set(m.id, m);
@@ -48,8 +45,7 @@ function mockSdk() {
       input: string | { function_id: string; payload: unknown },
       data?: unknown,
     ) => {
-      const functionId =
-        typeof input === "string" ? input : input.function_id;
+      const functionId = typeof input === "string" ? input : input.function_id;
       const payload = typeof input === "string" ? data : input.payload;
       const fn = fns.get(functionId);
       if (fn) return fn(payload);
@@ -59,9 +55,7 @@ function mockSdk() {
 }
 
 function makeMemory(id: string, daysOld = 30): Memory {
-  const created = new Date(
-    Date.now() - daysOld * 86_400_000,
-  ).toISOString();
+  const created = new Date(Date.now() - daysOld * 86_400_000).toISOString();
   return {
     id,
     createdAt: created,
@@ -83,9 +77,7 @@ function makeSemantic(
   daysOld: number,
   accessCount = 0,
 ): SemanticMemory {
-  const created = new Date(
-    Date.now() - daysOld * 86_400_000,
-  ).toISOString();
+  const created = new Date(Date.now() - daysOld * 86_400_000).toISOString();
   return {
     id,
     fact: `Fact ${id}`,
@@ -102,17 +94,12 @@ function makeSemantic(
 
 describe("RetentionScoring with access log (issue #119)", () => {
   it("episodic memories with recorded reads get higher reinforcementBoost than untouched ones", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
-    const { recordAccess } = await import(
-      "../src/functions/access-tracker.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
+    const { recordOwnedAccess } =
+      await import("../src/functions/access-tracker.js");
 
-    const memories = [
-      makeMemory("mem_hot", 30),
-      makeMemory("mem_cold", 30),
-    ];
+    const memories = [makeMemory("mem_hot", 30), makeMemory("mem_cold", 30)];
     const sdk = mockSdk();
     const kv = mockKV(memories);
     registerRetentionFunctions(sdk as never, kv as never);
@@ -120,10 +107,17 @@ describe("RetentionScoring with access log (issue #119)", () => {
     // Simulate 5 agent reads of mem_hot in the past 24h
     const now = Date.now();
     for (let i = 0; i < 5; i++) {
-      await recordAccess(kv as never, "mem_hot", now - i * 60_000);
+      await recordOwnedAccess(
+        kv as never,
+        { id: "mem_hot", scope: "memory" },
+        now - i * 60_000,
+      );
     }
 
-    const result = (await sdk.trigger({ function_id: "mem::retention-score", payload: {} })) as any;
+    const result = (await sdk.trigger({
+      function_id: "mem::retention-score",
+      payload: {},
+    })) as any;
 
     const hot = result.scores.find((s: any) => s.memoryId === "mem_hot");
     const cold = result.scores.find((s: any) => s.memoryId === "mem_cold");
@@ -136,12 +130,10 @@ describe("RetentionScoring with access log (issue #119)", () => {
   });
 
   it("recent reads contribute more to reinforcement than ancient reads", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
-    const { recordAccess } = await import(
-      "../src/functions/access-tracker.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
+    const { recordOwnedAccess } =
+      await import("../src/functions/access-tracker.js");
 
     const memories = [
       makeMemory("mem_recent_read", 60),
@@ -153,25 +145,33 @@ describe("RetentionScoring with access log (issue #119)", () => {
 
     const now = Date.now();
     // mem_recent_read: 1 access yesterday
-    await recordAccess(kv as never, "mem_recent_read", now - 86_400_000);
+    await recordOwnedAccess(
+      kv as never,
+      { id: "mem_recent_read", scope: "memory" },
+      now - 86_400_000,
+    );
     // mem_old_read: 1 access 60 days ago
-    await recordAccess(kv as never, "mem_old_read", now - 60 * 86_400_000);
+    await recordOwnedAccess(
+      kv as never,
+      { id: "mem_old_read", scope: "memory" },
+      now - 60 * 86_400_000,
+    );
 
-    const result = (await sdk.trigger({ function_id: "mem::retention-score", payload: {} })) as any;
+    const result = (await sdk.trigger({
+      function_id: "mem::retention-score",
+      payload: {},
+    })) as any;
     const recent = result.scores.find(
       (s: any) => s.memoryId === "mem_recent_read",
     );
-    const old = result.scores.find(
-      (s: any) => s.memoryId === "mem_old_read",
-    );
+    const old = result.scores.find((s: any) => s.memoryId === "mem_old_read");
 
     expect(recent.reinforcementBoost).toBeGreaterThan(old.reinforcementBoost);
   });
 
   it("backwards-compat: semantic memories with only legacy lastAccessedAt still score", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
 
     // Pre-0.8.3 data: semantic memory has lastAccessedAt set by the
     // consolidation pipeline, but no entry in mem:access. The merge in
@@ -187,7 +187,10 @@ describe("RetentionScoring with access log (issue #119)", () => {
     const kv = mockKV([], [semWith, semWithout]);
     registerRetentionFunctions(sdk as never, kv as never);
 
-    const result = (await sdk.trigger({ function_id: "mem::retention-score", payload: {} })) as any;
+    const result = (await sdk.trigger({
+      function_id: "mem::retention-score",
+      payload: {},
+    })) as any;
     const withEntry = result.scores.find(
       (s: any) => s.memoryId === "sem_with_legacy",
     );
@@ -205,9 +208,8 @@ describe("RetentionScoring with access log (issue #119)", () => {
   });
 
   it("corrupted lastAccessedAt does not propagate NaN into the score", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
     const sem = makeSemantic("sem_corrupt", 30, 1);
     sem.lastAccessedAt = "<script>alert(1)</script>";
 
@@ -215,7 +217,10 @@ describe("RetentionScoring with access log (issue #119)", () => {
     const kv = mockKV([], [sem]);
     registerRetentionFunctions(sdk as never, kv as never);
 
-    const result = (await sdk.trigger({ function_id: "mem::retention-score", payload: {} })) as any;
+    const result = (await sdk.trigger({
+      function_id: "mem::retention-score",
+      payload: {},
+    })) as any;
     const entry = result.scores.find((s: any) => s.memoryId === "sem_corrupt");
 
     expect(Number.isFinite(entry.score)).toBe(true);
@@ -223,9 +228,8 @@ describe("RetentionScoring with access log (issue #119)", () => {
   });
 
   it("retention scoring normalizes malformed mem:access rows", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
     const memories = [
       makeMemory("mem_corrupt", 10),
       makeMemory("mem_clean", 10),
@@ -249,7 +253,10 @@ describe("RetentionScoring with access log (issue #119)", () => {
 
     registerRetentionFunctions(sdk as never, kv as never);
 
-    const result = (await sdk.trigger({ function_id: "mem::retention-score", payload: {} })) as any;
+    const result = (await sdk.trigger({
+      function_id: "mem::retention-score",
+      payload: {},
+    })) as any;
     const corrupt = result.scores.find(
       (s: any) => s.memoryId === "mem_corrupt",
     );
@@ -264,9 +271,8 @@ describe("RetentionScoring with access log (issue #119)", () => {
   });
 
   it("retention scoring survives kv.list(mem:access) failures", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
     const memories = [makeMemory("mem_resilient", 10)];
     const sdk = mockSdk();
     const kv = mockKV(memories);
@@ -278,7 +284,10 @@ describe("RetentionScoring with access log (issue #119)", () => {
 
     registerRetentionFunctions(sdk as never, kv as never);
 
-    const result = (await sdk.trigger({ function_id: "mem::retention-score", payload: {} })) as any;
+    const result = (await sdk.trigger({
+      function_id: "mem::retention-score",
+      payload: {},
+    })) as any;
     expect(result.success).toBe(true);
     const entry = result.scores.find(
       (s: any) => s.memoryId === "mem_resilient",
@@ -287,12 +296,10 @@ describe("RetentionScoring with access log (issue #119)", () => {
   });
 
   it("fresh access log overrides legacy single-sample for semantic memories", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
-    const { recordAccess } = await import(
-      "../src/functions/access-tracker.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
+    const { recordOwnedAccess } =
+      await import("../src/functions/access-tracker.js");
 
     const sem = makeSemantic("sem_active", 30, 1);
     const sdk = mockSdk();
@@ -301,13 +308,18 @@ describe("RetentionScoring with access log (issue #119)", () => {
 
     const now = Date.now();
     for (let i = 0; i < 10; i++) {
-      await recordAccess(kv as never, "sem_active", now - i * 30_000);
+      await recordOwnedAccess(
+        kv as never,
+        { id: "sem_active", scope: "semantic" },
+        now - i * 30_000,
+      );
     }
 
-    const result = (await sdk.trigger({ function_id: "mem::retention-score", payload: {} })) as any;
-    const entry = result.scores.find(
-      (s: any) => s.memoryId === "sem_active",
-    );
+    const result = (await sdk.trigger({
+      function_id: "mem::retention-score",
+      payload: {},
+    })) as any;
+    const entry = result.scores.find((s: any) => s.memoryId === "sem_active");
 
     // effectiveCount = max(log=10, sem.accessCount=1) = 10
     expect(entry.accessCount).toBe(10);

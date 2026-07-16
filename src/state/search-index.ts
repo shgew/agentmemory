@@ -9,17 +9,24 @@ interface IndexEntry {
   termCount: number;
 }
 
+export type SearchIndexMutation =
+  | { type: "add"; observation: CompressedObservation }
+  | { type: "remove"; id: string };
+
 export class SearchIndex {
   private entries: Map<string, IndexEntry> = new Map();
   private invertedIndex: Map<string, Set<string>> = new Map();
   private docTermCounts: Map<string, Map<string, number>> = new Map();
   private totalDocLength = 0;
   private sortedTerms: string[] | null = null;
+  private mutationListener: ((mutation: SearchIndexMutation) => void) | null =
+    null;
 
   private readonly k1 = 1.2;
   private readonly b = 0.75;
 
   add(obs: CompressedObservation): void {
+    if (this.entries.has(obs.id)) this.remove(obs.id);
     const terms = this.extractTerms(obs);
     const termFreq = new Map<string, number>();
     let termCount = 0;
@@ -45,6 +52,7 @@ export class SearchIndex {
     }
 
     this.sortedTerms = null;
+    this.mutationListener?.({ type: "add", observation: obs });
   }
 
   has(id: string): boolean {
@@ -57,7 +65,10 @@ export class SearchIndex {
 
   remove(id: string): void {
     const entry = this.entries.get(id);
-    if (!entry) return;
+    if (!entry) {
+      this.mutationListener?.({ type: "remove", id });
+      return;
+    }
 
     const termFreq = this.docTermCounts.get(id);
     if (termFreq) {
@@ -76,6 +87,7 @@ export class SearchIndex {
     this.totalDocLength = Math.max(0, this.totalDocLength - entry.termCount);
     this.entries.delete(id);
     this.sortedTerms = null;
+    this.mutationListener?.({ type: "remove", id });
   }
 
   search(
@@ -173,6 +185,12 @@ export class SearchIndex {
     this.docTermCounts.clear();
     this.totalDocLength = 0;
     this.sortedTerms = null;
+  }
+
+  setMutationListener(
+    listener: ((mutation: SearchIndexMutation) => void) | null,
+  ): void {
+    this.mutationListener = listener;
   }
 
   restoreFrom(other: SearchIndex): void {

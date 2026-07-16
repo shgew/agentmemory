@@ -26,13 +26,7 @@ function contentHash(data: string): string {
   return createHash("sha256").update(data).digest("hex");
 }
 
-export async function saveImageToDisk(base64Data: string): Promise<{ filePath: string; bytesWritten: number }> {
-  if (!base64Data) return { filePath: "", bytesWritten: 0 };
-
-  if (!existsSync(IMAGES_DIR)) {
-    await mkdir(IMAGES_DIR, { recursive: true });
-  }
-
+function imagePayload(base64Data: string): { cleanBase64: string; ext: string } {
   let cleanBase64 = base64Data;
   let ext = "png";
 
@@ -49,8 +43,24 @@ export async function saveImageToDisk(base64Data: string): Promise<{ filePath: s
      ext = "jpg";
   }
 
-  const hash = contentHash(cleanBase64);
-  const filePath = join(IMAGES_DIR, `${hash}.${ext}`);
+  return { cleanBase64, ext };
+}
+
+export function imagePathForData(base64Data: string): string {
+  if (!base64Data) return "";
+  const { cleanBase64, ext } = imagePayload(base64Data);
+  return join(IMAGES_DIR, `${contentHash(cleanBase64)}.${ext}`);
+}
+
+export async function saveImageToDisk(base64Data: string): Promise<{ filePath: string; bytesWritten: number }> {
+  if (!base64Data) return { filePath: "", bytesWritten: 0 };
+
+  if (!existsSync(IMAGES_DIR)) {
+    await mkdir(IMAGES_DIR, { recursive: true });
+  }
+
+  const { cleanBase64 } = imagePayload(base64Data);
+  const filePath = imagePathForData(base64Data);
 
   if (existsSync(filePath)) {
     return { filePath, bytesWritten: 0 };

@@ -27,7 +27,8 @@ import {
   inferObservationType,
   observationImportance,
 } from "./compress-synthetic.js";
-import { withKeyedLock } from "../state/keyed-mutex.js";
+import { clearPendingCompression } from "./raw-observations.js";
+import { withObservationOwnerLock } from "./observation-lock.js";
 
 const VALID_TYPES = new Set<string>([
   "file_read",
@@ -86,45 +87,65 @@ export function registerCompressFunction(
       sessionId: string;
       raw: RawObservation;
       skipIfCompressed?: boolean;
+      requireStoredRaw?: boolean;
     }) =>
-      withKeyedLock(`compress:${data.observationId}`, async () => {
+      withObservationOwnerLock(data.observationId, async () => {
         const startMs = Date.now();
         const existing = await kv.get<CompressedObservation>(
           KV.observations(data.sessionId),
           data.observationId,
         );
         if (data.skipIfCompressed && existing?.title) {
+          const index = getSearchIndex();
+          if (!index.has(existing.id)) index.add(existing);
+          await clearPendingCompression(
+            kv,
+            data.sessionId,
+            data.observationId,
+          );
           return { success: true, compressed: existing, noOp: true };
+        }
+
+        const raw = data.requireStoredRaw
+          ? await kv.get<RawObservation>(KV.rawPayloads, data.observationId)
+          : data.raw;
+        if (!raw || raw.sessionId !== data.sessionId) {
+          await clearPendingCompression(
+            kv,
+            data.sessionId,
+            data.observationId,
+          );
+          return { success: true, noOp: true };
         }
 
         let imageDescription: string | undefined;
         const hasImage =
-          data.raw.modality === "image" || data.raw.modality === "mixed";
+          raw.modality === "image" || raw.modality === "mixed";
 
-        if (hasImage && data.raw.imageData && provider.describeImage) {
+        if (hasImage && raw.imageData && provider.describeImage) {
           try {
-            let base64Data = data.raw.imageData;
+            let base64Data = raw.imageData;
             let mimeType = "image/png";
 
             if (
-              !data.raw.imageData.startsWith("/9j/") &&
-              !data.raw.imageData.startsWith("iVBOR")
+              !raw.imageData.startsWith("/9j/") &&
+              !raw.imageData.startsWith("iVBOR")
             ) {
-              if (!isManagedImagePath(data.raw.imageData)) {
+              if (!isManagedImagePath(raw.imageData)) {
                 throw new Error(
-                  `Refusing to read image outside managed store: ${data.raw.imageData}`,
+                  `Refusing to read image outside managed store: ${raw.imageData}`,
                 );
               }
-              const fileBuffer = readFileSync(data.raw.imageData);
+              const fileBuffer = readFileSync(raw.imageData);
               base64Data = fileBuffer.toString("base64");
               if (
-                data.raw.imageData.endsWith(".jpg") ||
-                data.raw.imageData.endsWith(".jpeg")
+                raw.imageData.endsWith(".jpg") ||
+                raw.imageData.endsWith(".jpeg")
               )
                 mimeType = "image/jpeg";
-              else if (data.raw.imageData.endsWith(".webp"))
+              else if (raw.imageData.endsWith(".webp"))
                 mimeType = "image/webp";
-              else if (data.raw.imageData.endsWith(".gif"))
+              else if (raw.imageData.endsWith(".gif"))
                 mimeType = "image/gif";
             }
 
@@ -149,15 +170,15 @@ export function registerCompressFunction(
         }
 
         const prompt = buildCompressionPrompt({
-          hookType: data.raw.hookType,
-          toolName: data.raw.toolName,
-          toolInput: data.raw.toolInput,
+          hookType: raw.hookType,
+          toolName: raw.toolName,
+          toolInput: raw.toolInput,
           toolOutput: imageDescription
-            ? `[Image Description]: ${imageDescription}\n\n${data.raw.toolOutput ?? ""}`
-            : data.raw.toolOutput,
-          userPrompt: data.raw.userPrompt,
-          assistantResponse: data.raw.assistantResponse,
-          timestamp: data.raw.timestamp,
+            ? `[Image Description]: ${imageDescription}\n\n${raw.toolOutput ?? ""}`
+            : raw.toolOutput,
+          userPrompt: raw.userPrompt,
+          assistantResponse: raw.assistantResponse,
+          timestamp: raw.timestamp,
         });
 
         try {
@@ -196,26 +217,26 @@ export function registerCompressFunction(
           }
 
           const qualityScore = scoreCompression(parsed);
-          const type = inferObservationType(data.raw, parsed.type);
+          const type = inferObservationType(raw, parsed.type);
           const files = [
-            ...new Set([...extractObservationFiles(data.raw), ...parsed.files]),
+            ...new Set([...extractObservationFiles(raw), ...parsed.files]),
           ];
 
           const compressed: CompressedObservation = {
             id: data.observationId,
             sessionId: data.sessionId,
-            timestamp: data.raw.timestamp,
+            timestamp: raw.timestamp,
             ...parsed,
-            sourceType: data.raw.hookType,
-            ...(data.raw.toolName ? { toolName: data.raw.toolName } : {}),
+            sourceType: raw.hookType,
+            ...(raw.toolName ? { toolName: raw.toolName } : {}),
             type,
             files,
-            importance: observationImportance(data.raw, type),
+            importance: observationImportance(raw, type),
             confidence: qualityScore / 100,
-            ...(hasImage ? { modality: data.raw.modality } : {}),
+            ...(hasImage ? { modality: raw.modality } : {}),
             ...(imageDescription ? { imageDescription } : {}),
-            ...(data.raw.imageData ? { imageRef: data.raw.imageData } : {}),
-            ...(data.raw.agentId ? { agentId: data.raw.agentId } : {}),
+            ...(raw.imageData ? { imageRef: raw.imageData } : {}),
+            ...(raw.agentId ? { agentId: raw.agentId } : {}),
           };
 
           await kv.set(
@@ -224,8 +245,11 @@ export function registerCompressFunction(
             compressed,
           );
 
+          let searchIndexed = false;
           try {
-            getSearchIndex().add(compressed);
+            const index = getSearchIndex();
+            if (!index.has(compressed.id)) index.add(compressed);
+            searchIndexed = true;
           } catch (err) {
             logger.warn("Failed to index compressed observation into BM25", {
               obsId: compressed.id,
@@ -241,6 +265,13 @@ export function registerCompressFunction(
             compressed.title + " " + (compressed.narrative || ""),
             { kind: "observation", logId: compressed.id },
           );
+          if (searchIndexed) {
+            await clearPendingCompression(
+              kv,
+              data.sessionId,
+              data.observationId,
+            );
+          }
 
           const streamResults = await Promise.allSettled([
             sdk.trigger({

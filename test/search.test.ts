@@ -4,7 +4,17 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { registerSearchFunction, getSearchIndex, rebuildIndex, setVectorIndex, setEmbeddingProvider, getVectorIndex } from "../src/functions/search.js";
+import {
+  getSearchIndex,
+  getVectorIndex,
+  isIndexRebuildPending,
+  rebuildIndex,
+  registerSearchFunction,
+  setEmbeddingProvider,
+  setVectorIndex,
+  vectorIndexAddGuarded,
+  vectorIndexRemove,
+} from "../src/functions/search.js";
 import { VectorIndex } from "../src/state/vector-index.js";
 import { KV } from "../src/state/schema.js";
 import type { CompressedObservation, Session } from "../src/types.js";
@@ -99,8 +109,9 @@ describe("mem::search", () => {
     await kv.set(KV.observations("ses_1"), obsA.id, obsA);
     await kv.set(KV.observations("ses_1"), obsB.id, obsB);
 
-    // Module-level SearchIndex singleton would leak across tests; reset.
     getSearchIndex().clear();
+    getSearchIndex().add(obsA);
+    getSearchIndex().add(obsB);
   });
 
   it("returns full format by default", async () => {
@@ -202,6 +213,264 @@ describe("mem::search", () => {
     expect(vi!.size).toBeGreaterThan(0);
 
     // Cleanup
+    setVectorIndex(null);
+    setEmbeddingProvider(null);
+  });
+
+  it("keeps live indexes available and replays mutations during rebuild", async () => {
+    const liveOnly: CompressedObservation = {
+      id: "obs_live",
+      sessionId: "ses_1",
+      timestamp: "2026-01-03T00:00:00Z",
+      sourceType: "test",
+      type: "decision",
+      title: "Live sentinel",
+      facts: [],
+      narrative: "Existing live index entry",
+      concepts: [],
+      files: [],
+      importance: 5,
+    };
+    const late: CompressedObservation = {
+      id: "obs_late",
+      sessionId: "ses_1",
+      timestamp: "2026-01-04T00:00:00Z",
+      sourceType: "test",
+      type: "decision",
+      title: "Concurrent addition",
+      facts: [],
+      narrative: "Added while rebuild waits",
+      concepts: [],
+      files: [],
+      importance: 5,
+    };
+    getSearchIndex().add(liveOnly);
+
+    const vectors = new VectorIndex();
+    vectors.add("obs_live", "ses_1", new Float32Array([1, 0, 0]));
+    setVectorIndex(vectors);
+
+    let batchStarted: (() => void) | undefined;
+    let releaseBatch: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      batchStarted = resolve;
+    });
+    setEmbeddingProvider({
+      name: "blocked",
+      dimensions: 3,
+      embed: async () => new Float32Array([0, 1, 0]),
+      embedBatch: async (texts) => {
+        batchStarted?.();
+        await new Promise<void>((resolve) => {
+          releaseBatch = resolve;
+        });
+        return texts.map(() => new Float32Array([0, 1, 0]));
+      },
+    });
+
+    const rebuilding = rebuildIndex(kv as never);
+    await started;
+    const bm25StayedLive = getSearchIndex().search("live sentinel").length === 1;
+    const vectorsStayedLive = getVectorIndex()!.serialize().includes('"obs_live"');
+
+    getSearchIndex().remove("obs_a");
+    getSearchIndex().add(late);
+    vectorIndexRemove("obs_a");
+    await vectorIndexAddGuarded("obs_late", "ses_1", late.narrative, {
+      kind: "observation",
+      logId: late.id,
+    });
+    releaseBatch?.();
+    await rebuilding;
+
+    expect(bm25StayedLive).toBe(true);
+    expect(vectorsStayedLive).toBe(true);
+    expect(getSearchIndex().has("obs_a")).toBe(false);
+    expect(getSearchIndex().has("obs_b")).toBe(true);
+    expect(getSearchIndex().has("obs_late")).toBe(true);
+    expect(getVectorIndex()!.serialize()).not.toContain('"obs_a"');
+    expect(getVectorIndex()!.serialize()).toContain('"obs_b"');
+    expect(getVectorIndex()!.serialize()).toContain('"obs_late"');
+
+    setVectorIndex(null);
+    setEmbeddingProvider(null);
+  });
+
+  it("queues concurrent rebuilds", async () => {
+    let firstListStarted: (() => void) | undefined;
+    let releaseFirstList: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      firstListStarted = resolve;
+    });
+    let memoryListCalls = 0;
+    const blockedKv = {
+      ...kv,
+      list: async <T>(scope: string): Promise<T[]> => {
+        if (scope === KV.memories) {
+          memoryListCalls++;
+          if (memoryListCalls === 1) {
+            firstListStarted?.();
+            await new Promise<void>((resolve) => {
+              releaseFirstList = resolve;
+            });
+          }
+        }
+        return kv.list<T>(scope);
+      },
+    };
+
+    const first = rebuildIndex(blockedKv as never);
+    await started;
+    const second = rebuildIndex(blockedKv as never);
+
+    expect(isIndexRebuildPending()).toBe(true);
+    expect(memoryListCalls).toBe(1);
+
+    releaseFirstList?.();
+    await expect(Promise.all([first, second])).resolves.toEqual([2, 2]);
+    expect(memoryListCalls).toBe(2);
+    expect(isIndexRebuildPending()).toBe(false);
+  });
+
+  it("serves live entries without waiting for a pending rebuild", async () => {
+    let listStarted: (() => void) | undefined;
+    let releaseList: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      listStarted = resolve;
+    });
+    const blockedKv = {
+      ...kv,
+      list: async <T>(scope: string): Promise<T[]> => {
+        if (scope === KV.memories) {
+          listStarted?.();
+          await new Promise<void>((resolve) => {
+            releaseList = resolve;
+          });
+        }
+        return kv.list<T>(scope);
+      },
+    };
+    const pendingSdk = mockSdk();
+    registerSearchFunction(pendingSdk as never, blockedKv as never);
+    getSearchIndex().clear();
+
+    const rebuilding = rebuildIndex(blockedKv as never);
+    await started;
+    const emptyResult = (await pendingSdk.trigger("mem::search", {
+      query: "absent during rebuild",
+      format: "compact",
+    })) as { results: Array<{ obsId: string }> };
+    expect(emptyResult.results).toEqual([]);
+
+    const live: CompressedObservation = {
+      id: "obs_live_pending",
+      sessionId: "ses_1",
+      timestamp: "2026-01-03T00:00:00Z",
+      type: "decision",
+      title: "Pending rebuild sentinel",
+      facts: [],
+      narrative: "Search stays available during rebuild",
+      concepts: [],
+      files: [],
+      importance: 5,
+    };
+    await kv.set(KV.observations("ses_1"), live.id, live);
+    getSearchIndex().add(live);
+
+    const result = (await pendingSdk.trigger("mem::search", {
+      query: "pending rebuild sentinel",
+      format: "compact",
+    })) as { results: Array<{ obsId: string }> };
+
+    expect(result.results.map((entry) => entry.obsId)).toContain(live.id);
+
+    releaseList?.();
+    await rebuilding;
+    expect(isIndexRebuildPending()).toBe(false);
+  });
+
+  it("does not wait for a cold rebuild", async () => {
+    let releaseList = () => {};
+    const listBlocked = new Promise<void>((resolve) => {
+      releaseList = resolve;
+    });
+    let markListStarted = () => {};
+    const listStarted = new Promise<void>((resolve) => {
+      markListStarted = resolve;
+    });
+    const blockedKv = {
+      ...kv,
+      list: async <T>(scope: string): Promise<T[]> => {
+        if (scope === KV.memories) {
+          markListStarted();
+          await listBlocked;
+        }
+        return kv.list<T>(scope);
+      },
+    };
+    const coldSdk = mockSdk();
+    registerSearchFunction(coldSdk as never, blockedKv as never);
+    getSearchIndex().clear();
+    let searchResolved = false;
+    const searching = coldSdk
+      .trigger("mem::search", { query: "cold", format: "compact" })
+      .then((result) => {
+        searchResolved = true;
+        return result;
+      });
+    await listStarted;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    try {
+      expect(searchResolved).toBe(true);
+    } finally {
+      releaseList();
+    }
+
+    await expect(searching).resolves.toMatchObject({ results: [] });
+    await vi.waitFor(() => expect(isIndexRebuildPending()).toBe(false));
+  });
+
+  it("leaves live indexes untouched when strict rebuild fails", async () => {
+    const liveOnly: CompressedObservation = {
+      id: "obs_live",
+      sessionId: "ses_1",
+      timestamp: "2026-01-03T00:00:00Z",
+      sourceType: "test",
+      type: "decision",
+      title: "Live sentinel",
+      facts: [],
+      narrative: "Existing live index entry",
+      concepts: [],
+      files: [],
+      importance: 5,
+    };
+    getSearchIndex().add(liveOnly);
+    const vectors = new VectorIndex();
+    vectors.add("obs_live", "ses_1", new Float32Array([1, 0, 0]));
+    setVectorIndex(vectors);
+    setEmbeddingProvider({
+      name: "test",
+      dimensions: 3,
+      embed: async () => new Float32Array([0, 1, 0]),
+      embedBatch: async (texts) =>
+        texts.map(() => new Float32Array([0, 1, 0])),
+    });
+    const failingKv = {
+      ...kv,
+      list: async <T>(scope: string): Promise<T[]> => {
+        if (scope === KV.sessions) throw new Error("session read failed");
+        return kv.list<T>(scope);
+      },
+    };
+
+    await expect(
+      rebuildIndex(failingKv as never, { strict: true }),
+    ).rejects.toThrow("session read failed");
+
+    expect(getSearchIndex().search("live sentinel")).toHaveLength(1);
+    expect(getVectorIndex()!.serialize()).toContain('"obs_live"');
+
     setVectorIndex(null);
     setEmbeddingProvider(null);
   });

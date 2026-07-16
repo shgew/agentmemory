@@ -10,10 +10,7 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-function mockKV(
-  memories: Memory[] = [],
-  semanticMems: SemanticMemory[] = [],
-) {
+function mockKV(memories: Memory[] = [], semanticMems: SemanticMemory[] = []) {
   const store = new Map<string, Map<string, unknown>>();
 
   const memMap = new Map<string, unknown>();
@@ -65,11 +62,7 @@ function mockSdk() {
   };
 }
 
-function makeMemory(
-  id: string,
-  type: Memory["type"],
-  daysOld: number,
-): Memory {
+function makeMemory(id: string, type: Memory["type"], daysOld: number): Memory {
   const created = new Date(
     Date.now() - daysOld * 24 * 60 * 60 * 1000,
   ).toISOString();
@@ -118,9 +111,8 @@ describe("RetentionScoring", () => {
   });
 
   it("computes retention scores for all memories", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
 
     const memories = [
       makeMemory("mem_recent", "architecture", 1),
@@ -148,17 +140,14 @@ describe("RetentionScoring", () => {
     const recentScore = result.scores.find(
       (s: any) => s.memoryId === "mem_recent",
     );
-    const oldScore = result.scores.find(
-      (s: any) => s.memoryId === "mem_old",
-    );
+    const oldScore = result.scores.find((s: any) => s.memoryId === "mem_old");
 
     expect(recentScore!.score).toBeGreaterThan(oldScore!.score);
   });
 
   it("higher-type memories get higher salience", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
 
     const memories = [
       makeMemory("mem_arch", "architecture", 30),
@@ -174,20 +163,15 @@ describe("RetentionScoring", () => {
       payload: {},
     })) as any;
 
-    const archScore = result.scores.find(
-      (s: any) => s.memoryId === "mem_arch",
-    );
-    const factScore = result.scores.find(
-      (s: any) => s.memoryId === "mem_fact",
-    );
+    const archScore = result.scores.find((s: any) => s.memoryId === "mem_arch");
+    const factScore = result.scores.find((s: any) => s.memoryId === "mem_fact");
 
     expect(archScore.salience).toBeGreaterThan(factScore.salience);
   });
 
   it("classifies memories into tiers", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
 
     const memories = [
       makeMemory("hot1", "architecture", 1),
@@ -204,13 +188,17 @@ describe("RetentionScoring", () => {
       function_id: "mem::retention-score",
       payload: {},
     })) as any;
-    expect(result.tiers.hot + result.tiers.warm + result.tiers.cold + result.tiers.evictable).toBe(4);
+    expect(
+      result.tiers.hot +
+        result.tiers.warm +
+        result.tiers.cold +
+        result.tiers.evictable,
+    ).toBe(4);
   });
 
   it("dry-run eviction shows candidates without deleting", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
 
     const memories = [
       makeMemory("mem_keep", "architecture", 1),
@@ -239,9 +227,8 @@ describe("RetentionScoring", () => {
   });
 
   it("includes semantic memories in scoring", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
 
     const semanticMems = [
       makeSemanticMemory("sem_1", 10, 5),
@@ -264,9 +251,8 @@ describe("RetentionScoring", () => {
   });
 
   it("scores tag rows with their source scope (#124)", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
 
     const sdk = mockSdk();
     const kv = mockKV(
@@ -297,9 +283,8 @@ describe("RetentionScoring", () => {
   });
 
   it("mem::retention-evict deletes semantic memories from mem:semantic, not mem:memories (#124)", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
 
     // Both are 500 days old with zero access → both will score below
     // the default cold threshold. Before #124 the loop silently called
@@ -333,9 +318,8 @@ describe("RetentionScoring", () => {
   });
 
   it("mem::retention-evict emits a single batched audit record on success (#124, audit policy)", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
 
     const sdk = mockSdk();
     const kv = mockKV(
@@ -372,9 +356,8 @@ describe("RetentionScoring", () => {
   });
 
   it("mem::retention-evict skips audit when evicted=0 (no spurious audit rows)", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
 
     const sdk = mockSdk();
     // Memory is 1 day old → score will be high → nothing falls below
@@ -399,9 +382,8 @@ describe("RetentionScoring", () => {
   });
 
   it("mem::retention-score emits a batched audit row per rescore (#124, audit policy)", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
 
     const sdk = mockSdk();
     const kv = mockKV(
@@ -434,9 +416,8 @@ describe("RetentionScoring", () => {
   });
 
   it("mem::retention-evict probes namespaces for legacy semantic rows (backwards-compat, #124)", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
 
     // The actual nasty case from CodeRabbit's review: a pre-0.8.10
     // store that had a semantic memory scored by the old code path.
@@ -475,9 +456,8 @@ describe("RetentionScoring", () => {
   });
 
   it("mem::retention-evict routes pre-0.8.10 episodic rows with missing source to mem:memories (#124)", async () => {
-    const { registerRetentionFunctions } = await import(
-      "../src/functions/retention.js"
-    );
+    const { registerRetentionFunctions } =
+      await import("../src/functions/retention.js");
 
     // Simulate a store that was scored on 0.8.9 or earlier: retention
     // rows exist but they have no `source` field. The new eviction
@@ -520,10 +500,12 @@ describe("RetentionScoring", () => {
     });
 
     it("removes evicted memories from the BM25 index and flushes persistence", async () => {
-      const { registerRetentionFunctions } = await import(
-        "../src/functions/retention.js"
-      );
-      const persistence = { scheduleSave: vi.fn(), save: vi.fn(async () => {}) };
+      const { registerRetentionFunctions } =
+        await import("../src/functions/retention.js");
+      const persistence = {
+        scheduleSave: vi.fn(),
+        save: vi.fn(async () => {}),
+      };
       setIndexPersistence(persistence);
 
       const evictee = makeMemory("mem_evict", "fact", 500);
@@ -544,10 +526,12 @@ describe("RetentionScoring", () => {
     });
 
     it("does not flush persistence when nothing is evicted", async () => {
-      const { registerRetentionFunctions } = await import(
-        "../src/functions/retention.js"
-      );
-      const persistence = { scheduleSave: vi.fn(), save: vi.fn(async () => {}) };
+      const { registerRetentionFunctions } =
+        await import("../src/functions/retention.js");
+      const persistence = {
+        scheduleSave: vi.fn(),
+        save: vi.fn(async () => {}),
+      };
       setIndexPersistence(persistence);
 
       const sdk = mockSdk();
@@ -561,6 +545,31 @@ describe("RetentionScoring", () => {
       });
 
       expect(persistence.save).not.toHaveBeenCalled();
+    });
+
+    it("flushes persistence once when multiple memories are evicted", async () => {
+      const { registerRetentionFunctions } =
+        await import("../src/functions/retention.js");
+      const persistence = {
+        scheduleSave: vi.fn(),
+        save: vi.fn(async () => {}),
+      };
+      setIndexPersistence(persistence);
+
+      const sdk = mockSdk();
+      const kv = mockKV([
+        makeMemory("mem_evict_a", "fact", 500),
+        makeMemory("mem_evict_b", "fact", 500),
+      ]);
+      registerRetentionFunctions(sdk as never, kv as never);
+
+      await sdk.trigger({ function_id: "mem::retention-score", payload: {} });
+      await sdk.trigger({
+        function_id: "mem::retention-evict",
+        payload: { threshold: 0.9 },
+      });
+
+      expect(persistence.save).toHaveBeenCalledTimes(1);
     });
   });
 });

@@ -2,6 +2,7 @@
 import { basename, resolve } from "node:path";
 import { env } from "node:process";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import type { Plugin } from "@opencode-ai/plugin";
 import type { Event as EventV1, Part } from "@opencode-ai/sdk";
 import type { Event as EventV2 } from "@opencode-ai/sdk/v2";
@@ -61,6 +62,26 @@ type GitCommitMetadata = {
   readonly files: readonly string[];
 };
 
+type PendingCommitCheck = {
+  readonly marker: string;
+  readonly cwd: string;
+  readonly knownRefTips: readonly string[];
+  readonly baselineAvailable: boolean;
+  ready: boolean;
+  completionOrder?: number;
+};
+
+type QueuedCommit = {
+  readonly cwd: string;
+  readonly sha: string;
+  readonly detail: string;
+  readonly knownRefTips: readonly string[];
+  readonly baselineAvailable: boolean;
+  readonly completionOrder: number;
+  readonly reflogTimestamp: number;
+  readonly branch?: string;
+};
+
 const GIT_TIMEOUT_MS = 500;
 
 function runGit(cwd: string, args: readonly string[]): string {
@@ -100,9 +121,7 @@ function sanitizeRepoUrl(repo: string): string {
   }
 }
 
-function collectGitCommitMetadata(cwd: string, sha: string): GitCommitMetadata | null {
-  const branchOutput = tryGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
-  if (branchOutput === null) return null;
+function collectGitCommitMetadata(cwd: string, sha: string, branch?: string): GitCommitMetadata | null {
   const repoRaw = tryGit(cwd, ["remote", "get-url", "origin"]);
   const repo = repoRaw ? sanitizeRepoUrl(repoRaw) : repoRaw;
   const details = tryGit(cwd, ["show", "-s", "--format=%s%x00%an%x00%aI", sha]);
@@ -114,13 +133,153 @@ function collectGitCommitMetadata(cwd: string, sha: string): GitCommitMetadata |
 
   return {
     sha,
-    ...(branchOutput === "HEAD" ? {} : { branch: branchOutput }),
+    ...(branch ? { branch } : {}),
     ...(repo ? { repo } : {}),
     message,
     author,
     authoredAt,
     files: filesOutput.split("\n").filter(Boolean),
   };
+}
+
+function commitActionDetail(action: string, marker: string): string | null {
+  if (action === marker || action === `${marker}:`) return null;
+  if (action.startsWith(`${marker} (start):`) || action.startsWith(`${marker} (finish):`)) return null;
+  const isRebaseCommit = [
+    "pick",
+    "reword",
+    "edit",
+    "squash",
+    "fixup",
+    "continue",
+    "merge",
+  ]
+    .some((kind) => action.startsWith(`${marker} (${kind}):`));
+  if (!action.startsWith(`${marker}:`) && !isRebaseCommit) return null;
+  return action.slice(action.indexOf(":") + 1).trim() || null;
+}
+
+function branchFromReflogSelector(selector: string): string | null {
+  const match = selector.match(/^refs\/heads\/(.+)@\{[^}]+\}$/);
+  return match?.[1] || null;
+}
+
+function reflogTimestampFromSelector(selector: string | undefined): number {
+  const match = selector?.match(/@\{(\d+)\}$/);
+  return match ? Number(match[1]) : 0;
+}
+
+function collectGitBaseline(cwd: string): { cwd: string; knownRefTips: string[]; available: boolean } {
+  const output = tryGit(cwd, ["rev-parse", "--show-toplevel", "HEAD", "--all"]);
+  if (output === null) return { cwd, knownRefTips: [], available: false };
+  const [repositoryRoot, ...tips] = output.split("\n").filter(Boolean);
+  return {
+    cwd: repositoryRoot || cwd,
+    knownRefTips: [...new Set(tips)],
+    available: true,
+  };
+}
+
+function collectCreatedCommits(cwd: string, checks: readonly PendingCommitCheck[]): QueuedCommit[] | null {
+  const markers = checks.map((check) => check.marker);
+  const checksByMarker = new Map(checks.map((check) => [check.marker, check]));
+  const grepArgs = markers.map((marker) => `--grep-reflog=^${marker}`);
+  const output = tryGit(cwd, [
+    "reflog",
+    "show",
+    "--date=unix",
+    "--format=%H%x00%gs%x00%gD",
+    ...grepArgs,
+    "HEAD",
+  ]);
+  if (output === null) return null;
+
+  const branchOutput = tryGit(cwd, [
+    "reflog",
+    "show",
+    "--all",
+    "--date=unix",
+    "--format=%H%x00%gs%x00%gD",
+    ...grepArgs,
+  ]);
+  const branches = new Map<string, string>();
+  for (const line of branchOutput?.split("\n") ?? []) {
+    const [sha, action, selector] = line.split("\u0000");
+    if (!sha || !action || !selector) continue;
+    const branch = branchFromReflogSelector(selector);
+    if (branch) branches.set(`${sha}\u0000${action}`, branch);
+  }
+
+  const seen = new Set<string>();
+  const commits: QueuedCommit[] = [];
+  for (const line of output.split("\n").reverse()) {
+    const [sha, action, selector] = line.split("\u0000");
+    if (!sha || !action) continue;
+    const marker = markers.find((candidate) =>
+      action === candidate || action.startsWith(`${candidate}:`) || action.startsWith(`${candidate} (`)
+    );
+    if (!marker || seen.has(sha)) continue;
+    const detail = commitActionDetail(action, marker);
+    if (!detail) continue;
+    const check = checksByMarker.get(marker)!;
+    const branch = branches.get(`${sha}\u0000${action}`);
+    seen.add(sha);
+    commits.push({
+      cwd,
+      sha,
+      detail,
+      knownRefTips: check.knownRefTips,
+      baselineAvailable: check.baselineAvailable,
+      completionOrder: check.completionOrder ?? Number.MAX_SAFE_INTEGER,
+      reflogTimestamp: reflogTimestampFromSelector(selector),
+      ...(branch ? { branch } : {}),
+    });
+  }
+  return commits;
+}
+
+function wasReachableBeforeTool(cwd: string, sha: string, tips: readonly string[]): boolean | null {
+  let unknown = false;
+  for (const tip of tips) {
+    try {
+      runGit(cwd, ["merge-base", "--is-ancestor", sha, tip]);
+      return true;
+    } catch (error) {
+      const status = typeof error === "object" && error !== null && "status" in error
+        ? (error as { status?: unknown }).status
+        : undefined;
+      if (status !== 1) unknown = true;
+    }
+  }
+  return unknown ? null : false;
+}
+
+function isRefMovement(commit: QueuedCommit, commitSubject: string): boolean {
+  const movementDetail = commit.detail === "updating HEAD" ||
+    commit.detail.startsWith("Fast-forward") ||
+    commit.detail.startsWith("moving from ");
+  if (!movementDetail) return false;
+  if (commit.detail !== commitSubject || !commit.baselineAvailable) return true;
+  return wasReachableBeforeTool(commit.cwd, commit.sha, commit.knownRefTips) !== false;
+}
+
+function mergeCommitGroups(groups: QueuedCommit[][]): QueuedCommit[] {
+  const merged: QueuedCommit[] = [];
+  while (groups.some((group) => group.length > 0)) {
+    let nextGroup = -1;
+    for (let index = 0; index < groups.length; index++) {
+      const candidate = groups[index]?.[0];
+      if (!candidate) continue;
+      const current = nextGroup < 0 ? undefined : groups[nextGroup]?.[0];
+      if (!current || candidate.reflogTimestamp < current.reflogTimestamp ||
+        (candidate.reflogTimestamp === current.reflogTimestamp &&
+          candidate.completionOrder < current.completionOrder)) {
+        nextGroup = index;
+      }
+    }
+    merged.push(groups[nextGroup]!.shift()!);
+  }
+  return merged;
 }
 
 // Resolver intentionally duplicated from src/hooks/_project.ts. The plugin file is copied standalone into ~/.config/opencode/plugins/ by 'agentmemory connect opencode --with-plugin' and cannot import from src/. Keep both copies behaviorally identical; parity enforced by test/_fixtures/project-resolver-scenarios.ts.
@@ -332,8 +491,10 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
   const seenToolCallIds = new Map<string, Set<string>>();
   const contextInjectedSessions = new Set<string>();
   const startContextCache = new Map<string, string>();
-  const lastSeenHeads = new Map<string, string>();
+  const pendingCommitChecks = new Map<string, Map<string, PendingCommitCheck>>();
+  const pendingCommitQueues = new Map<string, QueuedCommit[]>();
   const commitCheckChains = new Map<string, Promise<void>>();
+  let nextCommitCompletionOrder = 0;
 
   async function observe(
     sessionId: string,
@@ -350,36 +511,67 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
     });
   }
 
-  function seedSessionHead(sessionId: string): void {
-    const head = tryGit(sessionCwd, ["rev-parse", "HEAD"]);
-    if (head) lastSeenHeads.set(sessionId, head);
-    else lastSeenHeads.delete(sessionId);
-  }
-
-  async function linkCommitIfHeadChanged(sessionId: string): Promise<void> {
-    const head = tryGit(sessionCwd, ["rev-parse", "HEAD"]);
-    if (!head) return;
-
-    const previousHead = lastSeenHeads.get(sessionId);
-    if (!previousHead) {
-      lastSeenHeads.set(sessionId, head);
-      return;
+  function commitChecksFor(sessionId: string): Map<string, PendingCommitCheck> {
+    let checks = pendingCommitChecks.get(sessionId);
+    if (!checks) {
+      checks = new Map();
+      pendingCommitChecks.set(sessionId, checks);
     }
-    if (head === previousHead) return;
-
-    const metadata = collectGitCommitMetadata(sessionCwd, head);
-    // Metadata collection failed (transient git error): leave the cursor so the next
-    // tool completion retries rather than permanently skipping this commit.
-    if (!metadata) return;
-    // Only advance the cursor when the POST landed. A transient network/5xx failure
-    // leaves lastSeenHeads unchanged so the next tool completion retries the link.
-    const posted = await postOk("/session/commit", { ...metadata, sessionId });
-    if (posted) lastSeenHeads.set(sessionId, head);
+    return checks;
   }
 
-  function enqueueCommitCheck(sessionId: string): Promise<void> {
+  async function flushCommitQueue(sessionId: string): Promise<boolean> {
+    const queue = pendingCommitQueues.get(sessionId);
+    if (!queue) return true;
+    while (queue.length > 0) {
+      const commit = queue[0]!;
+      const metadata = collectGitCommitMetadata(commit.cwd, commit.sha, commit.branch);
+      if (!metadata) return false;
+      if (!isRefMovement(commit, metadata.message)) {
+        if (!await postOk("/session/commit", { ...metadata, sessionId })) return false;
+      }
+      queue.shift();
+    }
+    pendingCommitQueues.delete(sessionId);
+    return true;
+  }
+
+  async function linkPendingCommits(sessionId: string): Promise<void> {
+    if (!await flushCommitQueue(sessionId)) return;
+    const checks = pendingCommitChecks.get(sessionId);
+    if (!checks) return;
+    if ([...checks.values()].some((check) => !check.ready)) return;
+
+    const checksByCwd = new Map<string, Array<[string, PendingCommitCheck]>>();
+    for (const [callId, check] of checks) {
+      const cwdChecks = checksByCwd.get(check.cwd) ?? [];
+      cwdChecks.push([callId, check]);
+      checksByCwd.set(check.cwd, cwdChecks);
+    }
+
+    const groups: QueuedCommit[][] = [];
+    for (const [cwd, cwdChecks] of checksByCwd) {
+      const commits = collectCreatedCommits(cwd, cwdChecks.map(([, check]) => check));
+      if (commits === null) continue;
+      groups.push(commits);
+      for (const [callId] of cwdChecks) checks.delete(callId);
+    }
+    if (checks.size === 0) pendingCommitChecks.delete(sessionId);
+    const queue = mergeCommitGroups(groups);
+    if (queue.length === 0) return;
+    pendingCommitQueues.set(sessionId, queue);
+    await flushCommitQueue(sessionId);
+  }
+
+  function enqueueCommitCheck(sessionId: string, callId: string): Promise<void> {
+    const check = pendingCommitChecks.get(sessionId)?.get(callId);
+    if (!check) return Promise.resolve();
+    if (!check.ready) {
+      check.ready = true;
+      check.completionOrder = ++nextCommitCompletionOrder;
+    }
     const previous = commitCheckChains.get(sessionId) ?? Promise.resolve();
-    const next = previous.then(() => linkCommitIfHeadChanged(sessionId)).finally(() => {
+    const next = previous.then(() => linkPendingCommits(sessionId)).finally(() => {
       if (commitCheckChains.get(sessionId) === next) commitCheckChains.delete(sessionId);
     });
     commitCheckChains.set(sessionId, next);
@@ -449,7 +641,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         seenSubtaskIds.delete(sessionId);
         seenToolCallIds.delete(sessionId);
         contextInjectedSessions.delete(sessionId);
-        seedSessionHead(sessionId);
         const startResult: ContextResponse | null = await postJson("/session/start", {
           sessionId,
           title: info?.title ?? null,
@@ -503,7 +694,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
           stashedFiles.set(sid, new Set());
           contextInjectedSessions.delete(sid);
           if (!activeSessionId) activeSessionId = sid;
-          seedSessionHead(sid);
           const resumeResult: ContextResponse | null = await postJson("/session/start", {
             sessionId: sid,
             title: info?.title ?? null,
@@ -550,7 +740,8 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         seenSubtaskIds.delete(sid);
         seenToolCallIds.delete(sid);
         contextInjectedSessions.delete(sid);
-        lastSeenHeads.delete(sid);
+        pendingCommitChecks.delete(sid);
+        pendingCommitQueues.delete(sid);
         commitCheckChains.delete(sid);
       }
 
@@ -644,7 +835,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
                 ? state.attachments.map(a => a.filename || a.url)
                 : [],
             });
-            await enqueueCommitCheck(sid);
+            await enqueueCommitCheck(sid, callId);
           } else if (state.status === "error") {
             const callSet = toolCallSetFor(sid);
             if (callSet.has(callId)) return;
@@ -659,6 +850,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
               tool_output: safeSlice(sanitizeOutput(state.error), 8000),
               duration_ms: (startTime != null && endTime != null) ? endTime - startTime : null,
             });
+            await enqueueCommitCheck(sid, callId);
           }
           return;
         }
@@ -836,7 +1028,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
             name: event.properties.name,
             arguments: event.properties.arguments || "",
           });
-          await enqueueCommitCheck(sid);
         }
       }
 
@@ -1012,7 +1203,27 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         duration_ms: null,
         attachments: [],
       });
-      await enqueueCommitCheck(sid);
+      await enqueueCommitCheck(sid, callId);
+    },
+
+    "shell.env": async (input, output) => {
+      const sid = input.sessionID || activeSessionId;
+      const callId = input.callID;
+      if (!sid || !callId) return;
+      const checks = commitChecksFor(sid);
+      let check = checks.get(callId);
+      if (!check) {
+        const baseline = collectGitBaseline(input.cwd || sessionCwd);
+        check = {
+          marker: `agentmemory-${randomUUID()}`,
+          cwd: baseline.cwd,
+          knownRefTips: baseline.knownRefTips,
+          baselineAvailable: baseline.available,
+          ready: false,
+        };
+        checks.set(callId, check);
+      }
+      output.env.GIT_REFLOG_ACTION = check.marker;
     },
 
     // ── experimental.chat.system.transform ──
@@ -1113,7 +1324,8 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
       seenToolCallIds.clear();
       contextInjectedSessions.clear();
       startContextCache.clear();
-      lastSeenHeads.clear();
+      pendingCommitChecks.clear();
+      pendingCommitQueues.clear();
       commitCheckChains.clear();
       activeSessionId = null;
     },

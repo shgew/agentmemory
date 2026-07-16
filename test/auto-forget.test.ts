@@ -23,6 +23,19 @@ function mockKV() {
       store.get(scope)!.set(key, data);
       return data;
     },
+    update: async <T>(
+      scope: string,
+      key: string,
+      ops: Array<{ path: string; value?: unknown }>,
+    ): Promise<T> => {
+      const next = {
+        ...((store.get(scope)?.get(key) as Record<string, unknown>) ?? {}),
+      };
+      for (const op of ops) next[op.path] = op.value;
+      if (!store.has(scope)) store.set(scope, new Map());
+      store.get(scope)!.set(key, next);
+      return next as T;
+    },
     delete: async (scope: string, key: string): Promise<void> => {
       store.get(scope)?.delete(key);
     },
@@ -36,13 +49,20 @@ function mockKV() {
 function mockSdk() {
   const functions = new Map<string, Function>();
   return {
-    registerFunction: (idOrOpts: string | { id: string }, handler: Function) => {
+    registerFunction: (
+      idOrOpts: string | { id: string },
+      handler: Function,
+    ) => {
       const id = typeof idOrOpts === "string" ? idOrOpts : idOrOpts.id;
       functions.set(id, handler);
     },
     registerTrigger: () => {},
-    trigger: async (idOrInput: string | { function_id: string; payload: unknown }, data?: unknown) => {
-      const id = typeof idOrInput === "string" ? idOrInput : idOrInput.function_id;
+    trigger: async (
+      idOrInput: string | { function_id: string; payload: unknown },
+      data?: unknown,
+    ) => {
+      const id =
+        typeof idOrInput === "string" ? idOrInput : idOrInput.function_id;
       const payload = typeof idOrInput === "string" ? data : idOrInput.payload;
       const fn = functions.get(id);
       if (!fn) throw new Error(`No function: ${id}`);
@@ -161,7 +181,9 @@ describe("Auto-Forget Function", () => {
     });
     await kv.set("mem:memories", "mem_expired", expired);
 
-    const result = (await sdk.trigger("mem::auto-forget", { dryRun: true })) as {
+    const result = (await sdk.trigger("mem::auto-forget", {
+      dryRun: true,
+    })) as {
       ttlExpired: string[];
       dryRun: boolean;
     };
@@ -184,7 +206,10 @@ describe("Auto-Forget Function", () => {
     });
 
     it("removes TTL-expired memories from the BM25 index and flushes persistence", async () => {
-      const persistence = { scheduleSave: vi.fn(), save: vi.fn(async () => {}) };
+      const persistence = {
+        scheduleSave: vi.fn(),
+        save: vi.fn(async () => {}),
+      };
       setIndexPersistence(persistence);
 
       const expired = makeMemory({
@@ -199,6 +224,34 @@ describe("Auto-Forget Function", () => {
 
       expect(getSearchIndex().has("mem_expired")).toBe(false);
       expect(persistence.save).toHaveBeenCalled();
+    });
+
+    it("flushes persistence once for multiple expired memories", async () => {
+      const persistence = {
+        scheduleSave: vi.fn(),
+        save: vi.fn(async () => {}),
+      };
+      setIndexPersistence(persistence);
+      await kv.set(
+        "mem:memories",
+        "mem_expired_a",
+        makeMemory({
+          id: "mem_expired_a",
+          forgetAfter: "2020-01-01T00:00:00Z",
+        }),
+      );
+      await kv.set(
+        "mem:memories",
+        "mem_expired_b",
+        makeMemory({
+          id: "mem_expired_b",
+          forgetAfter: "2020-01-01T00:00:00Z",
+        }),
+      );
+
+      await sdk.trigger("mem::auto-forget", {});
+
+      expect(persistence.save).toHaveBeenCalledTimes(1);
     });
 
     it("removes evicted low-value observations from the BM25 index", async () => {
@@ -234,7 +287,10 @@ describe("Auto-Forget Function", () => {
     });
 
     it("does not flush persistence on dryRun", async () => {
-      const persistence = { scheduleSave: vi.fn(), save: vi.fn(async () => {}) };
+      const persistence = {
+        scheduleSave: vi.fn(),
+        save: vi.fn(async () => {}),
+      };
       setIndexPersistence(persistence);
 
       const expired = makeMemory({
@@ -255,11 +311,13 @@ describe("Auto-Forget Function", () => {
   it("does not flag non-similar memories as contradictions", async () => {
     const mem1 = makeMemory({
       id: "mem_1",
-      content: "We use TypeScript with strict mode enabled for all backend services",
+      content:
+        "We use TypeScript with strict mode enabled for all backend services",
     });
     const mem2 = makeMemory({
       id: "mem_2",
-      content: "The deployment pipeline runs integration tests before merging to main",
+      content:
+        "The deployment pipeline runs integration tests before merging to main",
     });
     await kv.set("mem:memories", "mem_1", mem1);
     await kv.set("mem:memories", "mem_2", mem2);

@@ -891,8 +891,13 @@ export function registerApiTriggers(
           if (!session) return;
           const shaSet = new Set<string>(session.commitShas ?? []);
           shaSet.add(sha);
-          session.commitShas = Array.from(shaSet);
-          await kv.set(KV.sessions, sessionId, session);
+          await kv.update<Session>(KV.sessions, sessionId, [
+            {
+              type: "set",
+              path: "commitShas",
+              value: Array.from(shaSet),
+            },
+          ]);
         });
       }
 

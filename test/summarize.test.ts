@@ -9,6 +9,7 @@ vi.mock("../src/state/schema.js", () => ({
     sessions: "sessions",
     summaries: "summaries",
     rawPayloads: "rawPayloads",
+    pendingCompression: (sessionId: string) => `pending:${sessionId}`,
     observations: (sessionId: string) => `obs:${sessionId}`,
     audit: "audit",
   },
@@ -520,6 +521,14 @@ describe("mem::summarize windowing", () => {
 });
 
 describe("mem::summarize pending compression drain", () => {
+  beforeEach(() => {
+    vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "true");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
   it("reuses pending-compression work completed by the consolidation event", async () => {
     const sdk = mockSdk();
     const kv = mockKV();
@@ -575,6 +584,10 @@ describe("mem::summarize pending compression drain", () => {
     };
     await kv.set("sessions", sessionId, session);
     await kv.set("rawPayloads", raw.id, raw);
+    await kv.set(`pending:${sessionId}`, raw.id, {
+      id: raw.id,
+      sessionId,
+    });
 
     let shouldFail = true;
     let compressCalls = 0;

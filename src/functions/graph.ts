@@ -74,14 +74,16 @@ export function getGraphChunkSize(): number {
   const raw = getEnvVar("GRAPH_CHUNK_SIZE");
   if (!raw) return GRAPH_CHUNK_SIZE_DEFAULT;
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : GRAPH_CHUNK_SIZE_DEFAULT;
+  return Number.isSafeInteger(n) && n > 0 ? n : GRAPH_CHUNK_SIZE_DEFAULT;
 }
 
 export function getGraphChunkConcurrency(): number {
   const raw = getEnvVar("GRAPH_CHUNK_CONCURRENCY");
   if (!raw) return GRAPH_CHUNK_CONCURRENCY_DEFAULT;
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : GRAPH_CHUNK_CONCURRENCY_DEFAULT;
+  return Number.isSafeInteger(n) && n > 0
+    ? n
+    : GRAPH_CHUNK_CONCURRENCY_DEFAULT;
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {

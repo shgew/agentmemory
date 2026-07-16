@@ -5,7 +5,14 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerExportImportFunction } from "../src/functions/export-import.js";
-import { getSearchIndex } from "../src/functions/search.js";
+import { registerCompressFunction } from "../src/functions/compress.js";
+import { registerObserveFunction } from "../src/functions/observe.js";
+import {
+  deleteImageBackedRecord,
+  withObservationSessionOwnerLock,
+} from "../src/functions/image-owner.js";
+import { getSearchIndex, rebuildIndex } from "../src/functions/search.js";
+import { KV } from "../src/state/schema.js";
 import type {
   Session,
   CompressedObservation,
@@ -14,7 +21,37 @@ import type {
   ExportData,
   RawObservation,
   GraphNode,
+  MemoryProvider,
 } from "../src/types.js";
+
+const validCompression = `<type>other</type>
+<title>Stale compression</title>
+<facts><fact>Compressed before import</fact></facts>
+<narrative>Stale compression completed.</narrative>
+<concepts><concept>import</concept></concepts>
+<files></files>
+<importance>5</importance>`;
+
+function blockingCompressionProvider() {
+  let release = () => {};
+  let markStarted = () => {};
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const provider: MemoryProvider = {
+    name: "test",
+    compress: async () => {
+      markStarted();
+      await blocked;
+      return validCompression;
+    },
+    summarize: async () => "",
+  };
+  return { provider, started, release: () => release() };
+}
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -40,13 +77,20 @@ function mockKV() {
 function mockSdk() {
   const functions = new Map<string, Function>();
   return {
-    registerFunction: (idOrOpts: string | { id: string }, handler: Function) => {
+    registerFunction: (
+      idOrOpts: string | { id: string },
+      handler: Function,
+    ) => {
       const id = typeof idOrOpts === "string" ? idOrOpts : idOrOpts.id;
       functions.set(id, handler);
     },
     registerTrigger: () => {},
-    trigger: async (idOrInput: string | { function_id: string; payload: unknown }, data?: unknown) => {
-      const id = typeof idOrInput === "string" ? idOrInput : idOrInput.function_id;
+    trigger: async (
+      idOrInput: string | { function_id: string; payload: unknown },
+      data?: unknown,
+    ) => {
+      const id =
+        typeof idOrInput === "string" ? idOrInput : idOrInput.function_id;
       const payload = typeof idOrInput === "string" ? data : idOrInput.payload;
       const fn = functions.get(id);
       if (!fn) throw new Error(`No function: ${id}`);
@@ -336,6 +380,294 @@ describe("Export/Import Functions", () => {
     expect(reExported.rawPayloads).toEqual(exported.rawPayloads);
   });
 
+  it("round-trips access logs for every exported owner type", async () => {
+    const semantic = { id: "sem_1", fact: "Semantic owner" };
+    const procedural = { id: "proc_1", procedure: "Procedural owner" };
+    const lesson = { id: "lesson_1", content: "Lesson owner" };
+    await kv.set(KV.semantic, semantic.id, semantic);
+    await kv.set(KV.procedural, procedural.id, procedural);
+    await kv.set(KV.lessons, lesson.id, lesson);
+    const ownerIds = [
+      testObs.id,
+      testMemory.id,
+      semantic.id,
+      procedural.id,
+      lesson.id,
+    ];
+    for (const memoryId of [...ownerIds, "orphan_1"]) {
+      await kv.set(KV.accessLog, memoryId, {
+        memoryId,
+        count: 2,
+        lastAt: "2026-07-16T20:00:00.000Z",
+        recent: [1, 2],
+      });
+    }
+
+    const exported = (await sdk.trigger("mem::export", {})) as ExportData;
+
+    expect(exported.accessLogs?.map((log) => log.memoryId).sort()).toEqual(
+      [...ownerIds].sort(),
+    );
+
+    const freshKv = mockKV();
+    const freshSdk = mockSdk();
+    registerExportImportFunction(freshSdk as never, freshKv as never);
+    await freshSdk.trigger("mem::import", {
+      exportData: exported,
+      strategy: "merge",
+    });
+
+    for (const memoryId of ownerIds) {
+      expect(await freshKv.get(KV.accessLog, memoryId)).toMatchObject({
+        memoryId,
+        count: 2,
+      });
+    }
+    expect(await freshKv.get(KV.accessLog, "orphan_1")).toBeNull();
+  });
+
+  it("rebuilds pending compression entries for incomplete imported raw payloads", async () => {
+    const sessionId = "ses_pending_import";
+    const raw = {
+      ...testRawPayload,
+      id: "obs_pending_import",
+      sessionId,
+    };
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [{ ...testSession, id: sessionId }],
+      observations: { [sessionId]: [] },
+      rawPayloads: [raw],
+      memories: [],
+      summaries: [],
+    };
+
+    const result = await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "merge",
+    });
+
+    expect(result).toMatchObject({ success: true });
+    expect(await kv.get(KV.pendingCompression(sessionId), raw.id)).toEqual({
+      id: raw.id,
+      sessionId,
+    });
+  });
+
+  it("does not leave pending entries for imported compressed observations", async () => {
+    const sessionId = "ses_complete_import";
+    const raw = {
+      ...testRawPayload,
+      id: "obs_complete_import",
+      sessionId,
+    };
+    const observation = {
+      ...testObs,
+      id: raw.id,
+      sessionId,
+    };
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [{ ...testSession, id: sessionId }],
+      observations: { [sessionId]: [observation] },
+      rawPayloads: [raw],
+      memories: [],
+      summaries: [],
+    };
+
+    const result = await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "merge",
+    });
+
+    expect(result).toMatchObject({ success: true });
+    expect(await kv.list(KV.pendingCompression(sessionId))).toHaveLength(0);
+  });
+
+  it("indexes an existing incomplete raw payload under skip strategy", async () => {
+    const sessionId = "ses_existing_pending";
+    const raw = {
+      ...testRawPayload,
+      id: "obs_existing_pending",
+      sessionId,
+    };
+    await kv.set(KV.sessions, sessionId, { ...testSession, id: sessionId });
+    await kv.set(KV.rawPayloads, raw.id, raw);
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [{ ...testSession, id: sessionId }],
+      observations: { [sessionId]: [] },
+      rawPayloads: [raw],
+      memories: [],
+      summaries: [],
+    };
+
+    const result = await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "skip",
+    });
+
+    expect(result).toMatchObject({ success: true });
+    expect(await kv.get(KV.pendingCompression(sessionId), raw.id)).toEqual({
+      id: raw.id,
+      sessionId,
+    });
+  });
+
+  it("rejects a raw payload whose session is unavailable", async () => {
+    const raw = {
+      ...testRawPayload,
+      id: "obs_missing_session",
+      sessionId: "ses_missing",
+    };
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [],
+      observations: {},
+      rawPayloads: [raw],
+      memories: [],
+      summaries: [],
+    };
+
+    const result = await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "merge",
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      error: "rawPayloads references unavailable session ses_missing",
+    });
+    expect(await kv.get(KV.rawPayloads, raw.id)).toBeNull();
+    expect(await kv.list(KV.pendingCompression(raw.sessionId))).toHaveLength(0);
+  });
+
+  it.each(["merge", "skip"] as const)(
+    "%s accepts an observation bucket for an existing session",
+    async (strategy) => {
+      const observation = {
+        ...testObs,
+        id: `obs_existing_${strategy}`,
+      };
+      const exportData: ExportData = {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [],
+        observations: { ses_1: [observation] },
+        memories: [],
+        summaries: [],
+      };
+
+      const result = await sdk.trigger("mem::import", {
+        exportData,
+        strategy,
+      });
+
+      expect(result).toMatchObject({ success: true });
+      expect(await kv.get(KV.observations("ses_1"), observation.id)).toEqual(
+        observation,
+      );
+    },
+  );
+
+  it("revalidates an existing session after a concurrent full-session writer", async () => {
+    let releaseWriter = () => {};
+    const writerBlocked = new Promise<void>((resolve) => {
+      releaseWriter = resolve;
+    });
+    let markWriterStarted = () => {};
+    const writerStarted = new Promise<void>((resolve) => {
+      markWriterStarted = resolve;
+    });
+    const deletingSession = withObservationSessionOwnerLock(
+      testSession.id,
+      async () => {
+        markWriterStarted();
+        await writerBlocked;
+        await kv.delete(KV.sessions, testSession.id);
+      },
+    );
+    await writerStarted;
+    const importedObservation = { ...testObs, id: "obs_after_delete" };
+    const importing = sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [],
+        observations: { [testSession.id]: [importedObservation] },
+        memories: [],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "merge",
+    });
+
+    releaseWriter();
+    await deletingSession;
+    const result = await importing;
+
+    expect(result).toMatchObject({
+      success: false,
+      error: `observation bucket references unavailable session ${testSession.id}`,
+    });
+    expect(
+      await kv.get(KV.observations(testSession.id), importedObservation.id),
+    ).toBeNull();
+  });
+
+  it.each(["merge", "skip"] as const)(
+    "%s rejects an observation bucket whose session is unavailable",
+    async (strategy) => {
+      const sessionId = "ses_missing";
+      const exportData: ExportData = {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [],
+        observations: {
+          [sessionId]: [{ ...testObs, id: "obs_missing", sessionId }],
+        },
+        memories: [],
+        summaries: [],
+      };
+
+      const result = await sdk.trigger("mem::import", {
+        exportData,
+        strategy,
+      });
+
+      expect(result).toMatchObject({
+        success: false,
+        error: `observation bucket references unavailable session ${sessionId}`,
+      });
+      expect(await kv.list(KV.observations(sessionId))).toHaveLength(0);
+    },
+  );
+
+  it("replace rejects an observation bucket for a session omitted from the import", async () => {
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [],
+      observations: { ses_1: [testObs] },
+      memories: [],
+      summaries: [],
+    };
+
+    const result = await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "replace",
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      error: "observation bucket references unavailable session ses_1",
+    });
+    expect(await kv.get(KV.sessions, "ses_1")).toEqual(testSession);
+  });
+
   it("import rejects unsupported version", async () => {
     const exportData = {
       version: "1.0.0",
@@ -429,6 +761,242 @@ describe("Export/Import Functions", () => {
     expect(await kv.get("mem:sessions", "ses_1")).toEqual(testSession);
   });
 
+  it("rejects duplicate observation ids across session buckets", async () => {
+    const secondSession = { ...testSession, id: "ses_2" };
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [testSession, secondSession],
+      observations: {
+        ses_1: [testObs],
+        ses_2: [{ ...testObs, sessionId: "ses_2" }],
+      },
+      memories: [],
+      summaries: [],
+    };
+
+    const result = await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "merge",
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      error: `duplicate observation id ${testObs.id}`,
+    });
+  });
+
+  it("rejects raw and compressed owners with conflicting sessions", async () => {
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [testSession, { ...testSession, id: "ses_2" }],
+      observations: { ses_1: [testObs] },
+      rawPayloads: [{ ...testRawPayload, sessionId: "ses_2" }],
+      memories: [],
+      summaries: [],
+    };
+
+    const result = await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "merge",
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      error: `observation ${testObs.id} has conflicting session ids`,
+    });
+  });
+
+  it.each(["merge", "skip"] as const)(
+    "%s rejects a compressed observation already owned by another session",
+    async (strategy) => {
+      const secondSession = { ...testSession, id: "ses_2" };
+      await kv.delete(KV.rawPayloads, testObs.id);
+
+      const result = await sdk.trigger("mem::import", {
+        exportData: {
+          version: "0.9.27",
+          exportedAt: new Date().toISOString(),
+          sessions: [secondSession],
+          observations: {
+            [secondSession.id]: [{ ...testObs, sessionId: secondSession.id }],
+          },
+          memories: [],
+          summaries: [],
+        } satisfies ExportData,
+        strategy,
+      });
+
+      expect(result).toMatchObject({
+        success: false,
+        error: `observation ${testObs.id} already belongs to session ${testSession.id}`,
+      });
+      expect(
+        await kv.get(KV.observations(secondSession.id), testObs.id),
+      ).toBeNull();
+    },
+  );
+
+  it.each(["merge", "skip"] as const)(
+    "%s rejects a raw observation already owned by another session",
+    async (strategy) => {
+      const secondSession = { ...testSession, id: "ses_2" };
+      await kv.delete(KV.observations(testSession.id), testObs.id);
+
+      const result = await sdk.trigger("mem::import", {
+        exportData: {
+          version: "0.9.27",
+          exportedAt: new Date().toISOString(),
+          sessions: [secondSession],
+          observations: {},
+          rawPayloads: [{ ...testRawPayload, sessionId: secondSession.id }],
+          memories: [],
+          summaries: [],
+        } satisfies ExportData,
+        strategy,
+      });
+
+      expect(result).toMatchObject({
+        success: false,
+        error: `observation ${testObs.id} already belongs to session ${testSession.id}`,
+      });
+      expect(await kv.get(KV.rawPayloads, testObs.id)).toEqual(testRawPayload);
+    },
+  );
+
+  it("does not let in-flight compression resurrect observations after replace", async () => {
+    const { provider, started, release } = blockingCompressionProvider();
+    registerCompressFunction(sdk as never, kv as never, provider);
+    const compressing = sdk.trigger("mem::compress", {
+      observationId: testRawPayload.id,
+      sessionId: testRawPayload.sessionId,
+      raw: testRawPayload,
+      requireStoredRaw: true,
+    });
+    await started;
+
+    const importing = sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [],
+        observations: {},
+        memories: [],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "replace",
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    release();
+    await Promise.all([compressing, importing]);
+
+    expect(await kv.get(KV.rawPayloads, testRawPayload.id)).toBeNull();
+    expect(
+      await kv.get(KV.observations(testSession.id), testObs.id),
+    ).toBeNull();
+  });
+
+  it("does not let in-flight compression overwrite imported observation owners", async () => {
+    const { provider, started, release } = blockingCompressionProvider();
+    registerCompressFunction(sdk as never, kv as never, provider);
+    const importedObservation = {
+      ...testObs,
+      title: "Imported observation",
+      narrative: "Imported observation wins.",
+    };
+    const importedRaw = {
+      ...testRawPayload,
+      hookType: "prompt_submit",
+    };
+    const compressing = sdk.trigger("mem::compress", {
+      observationId: testRawPayload.id,
+      sessionId: testRawPayload.sessionId,
+      raw: testRawPayload,
+      requireStoredRaw: true,
+    });
+    await started;
+
+    const importing = sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [testSession],
+        observations: { [testSession.id]: [importedObservation] },
+        rawPayloads: [importedRaw],
+        memories: [],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "merge",
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    release();
+    await Promise.all([compressing, importing]);
+
+    expect(await kv.get(KV.observations(testSession.id), testObs.id)).toEqual(
+      importedObservation,
+    );
+    expect(await kv.get(KV.rawPayloads, testRawPayload.id)).toEqual(
+      importedRaw,
+    );
+  });
+
+  it("does not let an in-flight non-image observation survive replace", async () => {
+    await kv.delete(KV.sessions, testSession.id);
+    await kv.delete(KV.rawPayloads, testRawPayload.id);
+    await kv.delete(KV.observations(testSession.id), testObs.id);
+    registerObserveFunction(sdk as never, kv as never);
+    const setRecord = kv.set;
+    let releaseSyntheticWrite = () => {};
+    const syntheticWriteBlocked = new Promise<void>((resolve) => {
+      releaseSyntheticWrite = resolve;
+    });
+    let markSyntheticWriteStarted = () => {};
+    const syntheticWriteStarted = new Promise<void>((resolve) => {
+      markSyntheticWriteStarted = resolve;
+    });
+    let blockSyntheticWrite = true;
+    vi.spyOn(kv, "set").mockImplementation(async (scope, key, value) => {
+      if (blockSyntheticWrite && scope === KV.observations(testSession.id)) {
+        blockSyntheticWrite = false;
+        markSyntheticWriteStarted();
+        await syntheticWriteBlocked;
+      }
+      return setRecord(scope, key, value);
+    });
+    const observing = sdk.trigger("mem::observe", {
+      sessionId: testSession.id,
+      project: testSession.project,
+      cwd: testSession.cwd,
+      hookType: "prompt_submit",
+      timestamp: "2026-07-16T20:00:00.000Z",
+      data: { prompt: "Capture while import replaces state" },
+    }) as Promise<{ observationId: string }>;
+    await syntheticWriteStarted;
+
+    const importing = sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [],
+        observations: {},
+        memories: [],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "replace",
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    releaseSyntheticWrite();
+    const [{ observationId }] = await Promise.all([observing, importing]);
+
+    expect(await kv.get(KV.sessions, testSession.id)).toBeNull();
+    expect(await kv.get(KV.rawPayloads, observationId)).toBeNull();
+    expect(
+      await kv.get(KV.observations(testSession.id), observationId),
+    ).toBeNull();
+    expect(getSearchIndex().has(observationId)).toBe(false);
+  });
+
   it("rebuilds image reference counts without double-counting one observation", async () => {
     const imagePath = "/managed/image.png";
     const exportData: ExportData = {
@@ -459,6 +1027,9 @@ describe("Export/Import Functions", () => {
       imageRef: "/managed/old.png",
     });
     await kv.set("mem:image-refs", "/managed/old.png", 1);
+    await kv.set(KV.imageEmbeddings, "/managed/old.png", {
+      embedding: [1, 2, 3],
+    });
     const exportData: ExportData = {
       version: "0.9.27",
       exportedAt: new Date().toISOString(),
@@ -475,7 +1046,263 @@ describe("Export/Import Functions", () => {
 
     expect(result.success).toBe(true);
     expect(await kv.get("mem:image-refs", "/managed/old.png")).toBeNull();
+    expect(await kv.get(KV.imageEmbeddings, "/managed/old.png")).toBeNull();
     expect(await kv.get("mem:image-refs", "/managed/new.png")).toBe(1);
+  });
+
+  it("holds image owner deletion until reference rebuild completes", async () => {
+    const imageRef = "/managed/import-barrier.png";
+    await kv.set(KV.memories, "mem_1", { ...testMemory, imageRef });
+    await kv.set(KV.imageRefs, imageRef, 1);
+    const setRecord = kv.set;
+    let blockRebuild = true;
+    let releaseRebuild: () => void = () => {};
+    const rebuildBlocked = new Promise<void>((resolve) => {
+      releaseRebuild = resolve;
+    });
+    let markRebuildStarted: () => void = () => {};
+    const rebuildStarted = new Promise<void>((resolve) => {
+      markRebuildStarted = resolve;
+    });
+    vi.spyOn(kv, "set").mockImplementation(async (scope, key, value) => {
+      if (blockRebuild && scope === KV.imageRefs && key === imageRef) {
+        blockRebuild = false;
+        markRebuildStarted();
+        await rebuildBlocked;
+      }
+      return setRecord(scope, key, value);
+    });
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [],
+      observations: {},
+      memories: [],
+      summaries: [],
+    };
+
+    const importing = sdk.trigger("mem::import", {
+      exportData,
+      strategy: "merge",
+    });
+    await rebuildStarted;
+    const deleting = deleteImageBackedRecord(
+      sdk as never,
+      kv as never,
+      KV.memories,
+      "mem_1",
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(await kv.get(KV.memories, "mem_1")).not.toBeNull();
+
+    releaseRebuild();
+    await Promise.all([importing, deleting]);
+  });
+
+  it("releases the image ownership barrier before search rebuild", async () => {
+    const imageRef = "/managed/search-rebuild.png";
+    await kv.set(KV.memories, "mem_1", { ...testMemory, imageRef });
+    await kv.set(KV.imageRefs, imageRef, 1);
+    const setRecord = kv.set;
+    const listRecord = kv.list;
+    let refsRebuilt = false;
+    let blockSearchRebuild = true;
+    let releaseSearchRebuild: () => void = () => {};
+    const searchRebuildBlocked = new Promise<void>((resolve) => {
+      releaseSearchRebuild = resolve;
+    });
+    let markSearchRebuildStarted: () => void = () => {};
+    const searchRebuildStarted = new Promise<void>((resolve) => {
+      markSearchRebuildStarted = resolve;
+    });
+    vi.spyOn(kv, "set").mockImplementation(async (scope, key, value) => {
+      const result = await setRecord(scope, key, value);
+      if (scope === KV.imageRefs && key === imageRef) refsRebuilt = true;
+      return result;
+    });
+    vi.spyOn(kv, "list").mockImplementation(async (scope) => {
+      if (blockSearchRebuild && refsRebuilt && scope === KV.sessions) {
+        blockSearchRebuild = false;
+        markSearchRebuildStarted();
+        await searchRebuildBlocked;
+      }
+      return listRecord(scope);
+    });
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [],
+      observations: {},
+      memories: [],
+      summaries: [],
+    };
+
+    const importing = sdk.trigger("mem::import", {
+      exportData,
+      strategy: "merge",
+    });
+    await searchRebuildStarted;
+    const deleting = deleteImageBackedRecord(
+      sdk as never,
+      kv as never,
+      KV.memories,
+      "mem_1",
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(await kv.get(KV.memories, "mem_1")).toBeNull();
+
+    releaseSearchRebuild();
+    await Promise.all([importing, deleting]);
+  });
+
+  it("serializes imports through search rebuild and persistence", async () => {
+    const imageRef = "/managed/serialized-import.png";
+    const setRecord = kv.set;
+    const listRecord = kv.list;
+    let refsRebuilt = false;
+    let releaseSearchRebuild = () => {};
+    const searchRebuildBlocked = new Promise<void>((resolve) => {
+      releaseSearchRebuild = resolve;
+    });
+    let markSearchRebuildStarted = () => {};
+    const searchRebuildStarted = new Promise<void>((resolve) => {
+      markSearchRebuildStarted = resolve;
+    });
+    vi.spyOn(kv, "set").mockImplementation(async (scope, key, value) => {
+      const result = await setRecord(scope, key, value);
+      if (scope === KV.imageRefs && key === imageRef) refsRebuilt = true;
+      return result;
+    });
+    vi.spyOn(kv, "list").mockImplementation(async (scope) => {
+      if (refsRebuilt && scope === KV.sessions) {
+        refsRebuilt = false;
+        markSearchRebuildStarted();
+        await searchRebuildBlocked;
+      }
+      return listRecord(scope);
+    });
+    const firstSession = { ...testSession, id: "ses_import_first" };
+    const secondSession = { ...testSession, id: "ses_import_second" };
+    const firstImport = sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [firstSession],
+        observations: {},
+        memories: [{ ...testMemory, id: "mem_import_first", imageRef }],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "merge",
+    });
+    await searchRebuildStarted;
+
+    const secondImport = sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [secondSession],
+        observations: {},
+        memories: [],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "merge",
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const secondSessionBeforeRelease = await kv.get(
+      KV.sessions,
+      secondSession.id,
+    );
+    releaseSearchRebuild();
+    await Promise.all([firstImport, secondImport]);
+    expect(secondSessionBeforeRelease).toBeNull();
+    expect(await kv.get(KV.sessions, secondSession.id)).toEqual(secondSession);
+  });
+
+  it("waits for active index maintenance before mutating the corpus", async () => {
+    const listRecord = kv.list;
+    let blockMemoryList = true;
+    let releaseMaintenance = () => {};
+    const maintenanceBlocked = new Promise<void>((resolve) => {
+      releaseMaintenance = resolve;
+    });
+    let markMaintenanceStarted = () => {};
+    const maintenanceStarted = new Promise<void>((resolve) => {
+      markMaintenanceStarted = resolve;
+    });
+    vi.spyOn(kv, "list").mockImplementation(async (scope) => {
+      if (blockMemoryList && scope === KV.memories) {
+        blockMemoryList = false;
+        markMaintenanceStarted();
+        await maintenanceBlocked;
+      }
+      return listRecord(scope);
+    });
+    const maintenance = rebuildIndex(kv as never);
+    await maintenanceStarted;
+    const importedSession = { ...testSession, id: "ses_after_maintenance" };
+    const importing = sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [importedSession],
+        observations: {},
+        memories: [],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "merge",
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(await kv.get(KV.sessions, importedSession.id)).toBeNull();
+
+    releaseMaintenance();
+    await Promise.all([maintenance, importing]);
+    expect(await kv.get(KV.sessions, importedSession.id)).toEqual(
+      importedSession,
+    );
+  });
+
+  it("keeps a failed release journal and aborts import before writes", async () => {
+    const imageRef = "/managed/pending-release.png";
+    const releaseId = `record:${KV.memories}:mem_deleted`;
+    await kv.set(KV.imageReleases, releaseId, {
+      id: releaseId,
+      refs: [imageRef],
+      kind: "record",
+      scope: KV.memories,
+      recordId: "mem_deleted",
+      owner: { ...testMemory, id: "mem_deleted", imageRef },
+    });
+    const setRecord = kv.set;
+    vi.spyOn(kv, "set").mockImplementation(async (scope, key, value) => {
+      if (scope === KV.imageRefs && key === imageRef) {
+        throw new Error("ref state unavailable");
+      }
+      return setRecord(scope, key, value);
+    });
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [{ ...testSession, id: "ses_new" }],
+      observations: {},
+      memories: [],
+      summaries: [],
+    };
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "merge",
+    })) as { success: boolean; error: string };
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe(
+      "pending image releases must complete before import",
+    );
+    expect(await kv.get(KV.imageReleases, releaseId)).not.toBeNull();
+    expect(await kv.get(KV.sessions, "ses_new")).toBeNull();
   });
 
   it("rebuilds graph snapshot and lookup indexes after import", async () => {

@@ -4,7 +4,7 @@ import { KV, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { safeAudit } from "./audit.js";
-import { recordAccessBatch } from "./access-tracker.js";
+import { recordOwnedAccessBatch } from "./access-tracker.js";
 import { logger } from "../logger.js";
 import { getRelatedLessonResult } from "./lesson-corrections.js";
 
@@ -38,7 +38,8 @@ function computeConfidence(
 }
 
 export function registerRelationsFunction(sdk: ISdk, kv: StateKV): void {
-  sdk.registerFunction("mem::relate", 
+  sdk.registerFunction(
+    "mem::relate",
     async (data: {
       sourceId: string;
       targetId: string;
@@ -127,13 +128,13 @@ export function registerRelationsFunction(sdk: ISdk, kv: StateKV): void {
     },
   );
 
-  sdk.registerFunction("mem::evolve", 
+  sdk.registerFunction(
+    "mem::evolve",
     async (data: {
       memoryId: string;
       newContent: string;
       newTitle?: string;
     }) => {
-
       const existing = await kv.get<Memory>(KV.memories, data.memoryId);
       if (!existing) {
         return { success: false, error: "memory not found" };
@@ -193,7 +194,8 @@ export function registerRelationsFunction(sdk: ISdk, kv: StateKV): void {
     },
   );
 
-  sdk.registerFunction("mem::get-related", 
+  sdk.registerFunction(
+    "mem::get-related",
     async (data: {
       memoryId: string;
       maxHops?: number;
@@ -205,8 +207,22 @@ export function registerRelationsFunction(sdk: ISdk, kv: StateKV): void {
       const minConfidence = Number.isFinite(rawMinConf)
         ? Math.max(0, Math.min(1, rawMinConf))
         : 0;
-      const lessonResult = await getRelatedLessonResult(kv, data.memoryId, maxHops, minConfidence);
-      if (lessonResult) return lessonResult;
+      const lessonResult = await getRelatedLessonResult(
+        kv,
+        data.memoryId,
+        maxHops,
+        minConfidence,
+      );
+      if (lessonResult) {
+        void recordOwnedAccessBatch(
+          kv,
+          lessonResult.results.map((result) => ({
+            id: result.lesson.id,
+            scope: "lesson" as const,
+          })),
+        );
+        return lessonResult;
+      }
 
       const allRelations = await kv
         .list<MemoryRelation>(KV.relations)
@@ -266,9 +282,12 @@ export function registerRelationsFunction(sdk: ISdk, kv: StateKV): void {
 
       result.sort((a, b) => b.confidence - a.confidence);
 
-      void recordAccessBatch(
+      void recordOwnedAccessBatch(
         kv,
-        result.map((r) => r.memory.id),
+        result.map((r) => ({
+          id: r.memory.id,
+          scope: "memory" as const,
+        })),
       );
 
       logger.info("Related memories retrieved", {

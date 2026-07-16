@@ -69,6 +69,7 @@ function isValidShardDescriptor(
 export class IndexPersistence {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private lastFailureLogAt = 0;
+  private saveQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private kv: StateKV,
@@ -89,18 +90,36 @@ export class IndexPersistence {
   }
 
   async save(): Promise<void> {
+    await this.enqueueSave(false);
+  }
+
+  async saveStrict(): Promise<void> {
+    await this.enqueueSave(true);
+  }
+
+  private async enqueueSave(reportFailure: boolean): Promise<void> {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    try {
-      await this.saveBm25Index(this.bm25.serialize());
-      if (this.vector) {
-        await this.saveVectorIndex(this.vector.serialize());
+    const bm25 = this.bm25.serialize();
+    const vector = this.vector?.serialize();
+    const queued = this.saveQueue.then(async () => {
+      try {
+        await this.saveBm25Index(bm25);
+        if (vector !== undefined) {
+          await this.saveVectorIndex(vector);
+        }
+      } catch (err) {
+        this.logFailure(err);
+        if (reportFailure) throw err;
       }
-    } catch (err) {
-      this.logFailure(err);
-    }
+    });
+    this.saveQueue = queued.then(
+      () => undefined,
+      () => undefined,
+    );
+    await queued;
   }
 
   async load(): Promise<{

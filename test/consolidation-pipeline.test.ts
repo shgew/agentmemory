@@ -212,6 +212,73 @@ sdk = mockSdk();
     expect(stored[0].confidence).toBe(0.9);
   });
 
+  it.each([
+    ["empty", ""],
+    ["malformed", '<facts><fact confidence="0.9">Incomplete</facts>'],
+    ["empty fact", '<facts><fact confidence="0.9"> </fact></facts>'],
+    ["empty confidence", '<facts><fact confidence=" ">Fact</fact></facts>'],
+    ["unexpected wrapper", "prefix<facts></facts>suffix"],
+  ])("retries unchanged summaries after %s semantic output", async (_label, output) => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi
+        .fn()
+        .mockResolvedValueOnce(output)
+        .mockResolvedValueOnce(
+          '<facts><fact confidence="0.9">Recovered fact</fact></facts>',
+        ),
+    };
+    registerConsolidationPipelineFunction(
+      sdk as never,
+      kv as never,
+      provider as never,
+    );
+    for (let index = 0; index < 5; index++) {
+      await kv.set("mem:summaries", `ses_${index}`, makeSummary(index));
+    }
+
+    const first = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: { semantic: { error?: string } } };
+    expect(first.results.semantic.error).toBeDefined();
+    expect(
+      await kv.get("mem:config", "semantic:last-input:global"),
+    ).toBeNull();
+
+    await sdk.trigger("mem::consolidate-pipeline", { tier: "semantic" });
+
+    expect(provider.summarize).toHaveBeenCalledTimes(2);
+    expect(await kv.list<SemanticMemory>("mem:semantic")).toHaveLength(1);
+  });
+
+  it("watermarks a valid empty semantic envelope", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue("<facts></facts>"),
+    };
+    registerConsolidationPipelineFunction(
+      sdk as never,
+      kv as never,
+      provider as never,
+    );
+    for (let index = 0; index < 5; index++) {
+      await kv.set("mem:summaries", `ses_${index}`, makeSummary(index));
+    }
+
+    const first = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: { semantic: { newFacts: number } } };
+    const second = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { results: { semantic: { skipped?: boolean } } };
+
+    expect(first.results.semantic.newFacts).toBe(0);
+    expect(second.results.semantic.skipped).toBe(true);
+    expect(provider.summarize).toHaveBeenCalledOnce();
+  });
+
   it("serializes concurrent consolidation writes", async () => {
     const releases: Array<() => void> = [];
     const provider = {

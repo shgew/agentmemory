@@ -7,7 +7,8 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 vi.mock("../src/functions/search.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/functions/search.js")>();
+  const actual =
+    await importOriginal<typeof import("../src/functions/search.js")>();
   const remove = vi.fn();
   return {
     ...actual,
@@ -39,6 +40,19 @@ function mockKV(store: Store) {
       if (!store.has(scope)) store.set(scope, new Map());
       store.get(scope)!.set(key, data);
       return data;
+    },
+    update: async <T>(
+      scope: string,
+      key: string,
+      ops: Array<{ path: string; value?: unknown }>,
+    ): Promise<T> => {
+      const next = {
+        ...((store.get(scope)?.get(key) as Record<string, unknown>) ?? {}),
+      };
+      for (const op of ops) next[op.path] = op.value;
+      if (!store.has(scope)) store.set(scope, new Map());
+      store.get(scope)!.set(key, next);
+      return next as T;
     },
     delete: async (scope: string, key: string): Promise<void> => {
       store.get(scope)?.delete(key);
@@ -159,5 +173,44 @@ describe("mem::evict keeps the search index in sync", () => {
     expect(removeMock()).toHaveBeenCalledWith("mem_expired");
     expect(vi.mocked(vectorIndexRemove)).toHaveBeenCalledWith("mem_expired");
     expect(vi.mocked(flushIndexSave)).toHaveBeenCalled();
+  });
+
+  it("flushes once for multiple evicted memories", async () => {
+    const first: Memory = {
+      id: "mem_expired_a",
+      createdAt: daysAgo(10),
+      updatedAt: daysAgo(10),
+      type: "fact",
+      title: "expired fact a",
+      content: "old fact a",
+      concepts: [],
+      files: [],
+      sessionIds: [],
+      strength: 1,
+      version: 1,
+      isLatest: true,
+      forgetAfter: daysAgo(1),
+    };
+    const second = { ...first, id: "mem_expired_b", title: "expired fact b" };
+    const store: Store = new Map([
+      [KV.sessions, new Map()],
+      [KV.summaries, new Map()],
+      [KV.config, new Map()],
+      [KV.audit, new Map()],
+      [
+        KV.memories,
+        new Map<string, unknown>([
+          [first.id, first],
+          [second.id, second],
+        ]),
+      ],
+    ]);
+    const kv = mockKV(store);
+    const { sdk } = mockSdk();
+    registerEvictFunction(sdk as never, kv as never);
+
+    await sdk.trigger({ function_id: "mem::evict", payload: {} });
+
+    expect(vi.mocked(flushIndexSave)).toHaveBeenCalledTimes(1);
   });
 });

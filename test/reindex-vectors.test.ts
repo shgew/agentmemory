@@ -10,6 +10,7 @@ import {
   setVectorIndex,
   setEmbeddingProvider,
   getVectorIndex,
+  rebuildIndex,
   vectorIndexAddGuarded,
   vectorIndexRemove,
 } from "../src/functions/search.js";
@@ -164,5 +165,47 @@ describe("reindexVectors", () => {
     const serialized = getVectorIndex()!.serialize();
     expect(serialized).toContain('"late"');
     expect(serialized).not.toContain('"obs_1"');
+  });
+
+  it("queues a full index rebuild behind vector reindexing", async () => {
+    const kv = mockKV();
+    await seedCorpus(kv);
+    setVectorIndex(new VectorIndex());
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let releaseReindex!: () => void;
+    const canFinish = new Promise<void>((resolve) => {
+      releaseReindex = resolve;
+    });
+    let blockFirstBatch = true;
+    setEmbeddingProvider({
+      ...fourDimProvider,
+      embedBatch: async (texts) => {
+        if (blockFirstBatch) {
+          blockFirstBatch = false;
+          markStarted();
+          await canFinish;
+        }
+        return texts.map(() => new Float32Array([0.1, 0.2, 0.3, 0.4]));
+      },
+    });
+
+    const reindexing = reindexVectors(kv as never);
+    await started;
+    const rebuilding = rebuildIndex(kv as never, { strict: true });
+    let rebuildSettled = false;
+    void rebuilding.finally(() => {
+      rebuildSettled = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(rebuildSettled).toBe(false);
+    releaseReindex();
+    await expect(Promise.all([reindexing, rebuilding])).resolves.toEqual([
+      expect.objectContaining({ success: true }),
+      2,
+    ]);
   });
 });

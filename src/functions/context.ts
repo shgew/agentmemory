@@ -1,13 +1,20 @@
 import type { ISdk } from "iii-sdk";
 import type {
-  ContextBlock, Session,
-  ProjectProfile, MemorySlot, Lesson,
+  ContextBlock,
+  Session,
+  ProjectProfile,
+  MemorySlot,
+  Lesson,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
-import { recordAccessBatch } from "./access-tracker.js";
+import { recordOwnedAccessBatch, type AccessTarget } from "./access-tracker.js";
 import { logger } from "../logger.js";
-import { isSlotsEnabled, listPinnedSlots, renderPinnedContext } from "./slots.js";
+import {
+  isSlotsEnabled,
+  listPinnedSlots,
+  renderPinnedContext,
+} from "./slots.js";
 import { filterSupersededLessons } from "./lesson-state.js";
 import { buildSessionContextBlocks } from "./session-context.js";
 
@@ -28,7 +35,8 @@ export function registerContextFunction(
   kv: StateKV,
   tokenBudget: number,
 ): void {
-  sdk.registerFunction("mem::context", 
+  sdk.registerFunction(
+    "mem::context",
     async (data: { sessionId: string; project: string; budget?: number }) => {
       const budget = data.budget || tokenBudget;
       const blocks: ContextBlock[] = [];
@@ -45,9 +53,7 @@ export function registerContextFunction(
         isSlotsEnabled()
           ? listPinnedSlots(kv, project).catch(() => [] as MemorySlot[])
           : Promise.resolve([] as MemorySlot[]),
-        kv
-          .get<ProjectProfile>(KV.profiles, project)
-          .catch(() => null),
+        kv.get<ProjectProfile>(KV.profiles, project).catch(() => null),
         kv.list<Lesson>(KV.lessons).catch(() => [] as Lesson[]),
       ]);
 
@@ -153,7 +159,9 @@ export function registerContextFunction(
           }
           included = chosen;
           lessonsContent =
-            chosen.length > 0 ? `${lessonHeader}\n${chosenLines.join("\n")}` : "";
+            chosen.length > 0
+              ? `${lessonHeader}\n${chosenLines.join("\n")}`
+              : "";
         }
 
         if (included.length > 0 && lessonsContent) {
@@ -168,6 +176,7 @@ export function registerContextFunction(
             recency: mostRecent,
             priority: 1,
             sourceIds: included.map((l) => l.id),
+            sourceScope: "lesson",
           });
         }
       }
@@ -185,7 +194,7 @@ export function registerContextFunction(
 
       let usedTokens = 0;
       const selected: string[] = [];
-      const accessedIds: string[] = [];
+      const accessTargets: AccessTarget[] = [];
       usedTokens += wrapperTokens;
 
       for (const block of blocks) {
@@ -193,12 +202,30 @@ export function registerContextFunction(
         selected.push(block.content);
         usedTokens += block.tokens;
         if (block.sourceIds && block.sourceIds.length > 0) {
-          accessedIds.push(...block.sourceIds);
+          if (block.sourceScope === "lesson") {
+            accessTargets.push(
+              ...block.sourceIds.map((id) => ({
+                id,
+                scope: "lesson" as const,
+              })),
+            );
+          } else if (
+            block.sourceScope === "observation" &&
+            block.sourceSessionId
+          ) {
+            accessTargets.push(
+              ...block.sourceIds.map((id) => ({
+                id,
+                scope: "observation" as const,
+                sessionId: block.sourceSessionId!,
+              })),
+            );
+          }
         }
       }
 
-      if (accessedIds.length > 0) {
-        void recordAccessBatch(kv, accessedIds);
+      if (accessTargets.length > 0) {
+        void recordOwnedAccessBatch(kv, accessTargets);
       }
 
       if (selected.length === 0) {

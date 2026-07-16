@@ -13,7 +13,7 @@ vi.mock("../src/functions/audit.js", () => ({
 }));
 
 vi.mock("../src/functions/access-tracker.js", () => ({
-  recordAccessBatch: vi.fn(),
+  recordOwnedAccessBatch: vi.fn(),
   deleteAccessLog: vi.fn(),
 }));
 
@@ -24,7 +24,12 @@ vi.mock("../src/config.js", () => ({
 }));
 
 import { registerRememberFunction } from "../src/functions/remember.js";
-import { registerSearchFunction, getSearchIndex, setIndexPersistence } from "../src/functions/search.js";
+import {
+  registerSearchFunction,
+  getSearchIndex,
+  rebuildIndex,
+  setIndexPersistence,
+} from "../src/functions/search.js";
 import { registerEnrichFunction } from "../src/functions/enrich.js";
 import { KV } from "../src/state/schema.js";
 import type { Session } from "../src/types.js";
@@ -61,8 +66,12 @@ function makeMockSdk() {
       idOrInput: string | { function_id: string; payload: unknown },
       data?: unknown,
     ) => {
-      const id = typeof idOrInput === "string" ? idOrInput : idOrInput.function_id;
-      const payload = typeof idOrInput === "string" ? data : (idOrInput as { payload: unknown }).payload;
+      const id =
+        typeof idOrInput === "string" ? idOrInput : idOrInput.function_id;
+      const payload =
+        typeof idOrInput === "string"
+          ? data
+          : (idOrInput as { payload: unknown }).payload;
       if (triggerOverrides.has(id)) return triggerOverrides.get(id)!(payload);
       const fn = functions.get(id);
       if (!fn) throw new Error(`No function registered: ${id}`);
@@ -122,17 +131,18 @@ describe("cross-project isolation — end-to-end", () => {
 
   it("bug memory scoped to api does not appear in enrich context for web project", async () => {
     await sdk.trigger("mem::remember", {
-      content: "express-jwt throws 401 when Authorization header has extra whitespace. Call .trim() before passing to middleware.",
+      content:
+        "express-jwt throws 401 when Authorization header has extra whitespace. Call .trim() before passing to middleware.",
       type: "bug",
       files: ["src/middleware/auth.ts"],
       project: "api",
     });
 
-    const result = await sdk.trigger("mem::enrich", {
+    const result = (await sdk.trigger("mem::enrich", {
       sessionId: "sess-web",
       files: ["src/middleware/auth.ts"],
       project: "web",
-    }) as { context: string };
+    })) as { context: string };
 
     expect(result.context).not.toContain("agentmemory-past-errors");
     expect(result.context).not.toContain("express-jwt");
@@ -140,17 +150,18 @@ describe("cross-project isolation — end-to-end", () => {
 
   it("bug memory scoped to api appears in enrich context for api project", async () => {
     await sdk.trigger("mem::remember", {
-      content: "express-jwt throws 401 when Authorization header has extra whitespace. Call .trim() before passing to middleware.",
+      content:
+        "express-jwt throws 401 when Authorization header has extra whitespace. Call .trim() before passing to middleware.",
       type: "bug",
       files: ["src/middleware/auth.ts"],
       project: "api",
     });
 
-    const result = await sdk.trigger("mem::enrich", {
+    const result = (await sdk.trigger("mem::enrich", {
       sessionId: "sess-api",
       files: ["src/middleware/auth.ts"],
       project: "api",
-    }) as { context: string };
+    })) as { context: string };
 
     expect(result.context).toContain("agentmemory-past-errors");
     expect(result.context).toContain("express-jwt");
@@ -158,7 +169,8 @@ describe("cross-project isolation — end-to-end", () => {
 
   it("bug memory scoped to api is excluded from search results for web project", async () => {
     await sdk.trigger("mem::remember", {
-      content: "express-jwt throws 401 when Authorization header has extra whitespace",
+      content:
+        "express-jwt throws 401 when Authorization header has extra whitespace",
       type: "bug",
       files: ["src/middleware/auth.ts"],
       project: "api",
@@ -166,11 +178,14 @@ describe("cross-project isolation — end-to-end", () => {
 
     // Force index rebuild so the freshly saved memory is indexed.
     getSearchIndex().clear();
+    await rebuildIndex(kv as never);
 
-    const result = await sdk.trigger("mem::search", {
+    const result = (await sdk.trigger("mem::search", {
       query: "express-jwt whitespace",
       project: "web",
-    }) as { results: Array<{ observation: { title: string; narrative?: string } }> };
+    })) as {
+      results: Array<{ observation: { title: string; narrative?: string } }>;
+    };
 
     const titles = result.results.map((r) => r.observation.title);
     expect(titles.join(" ")).not.toContain("express-jwt");
@@ -178,7 +193,8 @@ describe("cross-project isolation — end-to-end", () => {
 
   it("bug memory scoped to api is included in search results for api project", async () => {
     await sdk.trigger("mem::remember", {
-      content: "express-jwt throws 401 when Authorization header has extra whitespace",
+      content:
+        "express-jwt throws 401 when Authorization header has extra whitespace",
       type: "bug",
       files: ["src/middleware/auth.ts"],
       project: "api",
@@ -186,11 +202,14 @@ describe("cross-project isolation — end-to-end", () => {
 
     // Force index rebuild so the freshly saved memory is indexed.
     getSearchIndex().clear();
+    await rebuildIndex(kv as never);
 
-    const result = await sdk.trigger("mem::search", {
+    const result = (await sdk.trigger("mem::search", {
       query: "express-jwt whitespace",
       project: "api",
-    }) as { results: Array<{ observation: { title: string; narrative?: string } }> };
+    })) as {
+      results: Array<{ observation: { title: string; narrative?: string } }>;
+    };
 
     const combined = result.results
       .map((r) => `${r.observation.title} ${r.observation.narrative ?? ""}`)
@@ -212,20 +231,20 @@ describe("cross-project isolation — end-to-end", () => {
       project: "web",
     });
 
-    const apiEnrich = await sdk.trigger("mem::enrich", {
+    const apiEnrich = (await sdk.trigger("mem::enrich", {
       sessionId: "sess-api",
       files: ["src/middleware/auth.ts"],
       project: "api",
-    }) as { context: string };
+    })) as { context: string };
 
     expect(apiEnrich.context).toContain("express-jwt");
     expect(apiEnrich.context).not.toContain("nextauth");
 
-    const webEnrich = await sdk.trigger("mem::enrich", {
+    const webEnrich = (await sdk.trigger("mem::enrich", {
       sessionId: "sess-web",
       files: ["src/middleware/auth.ts"],
       project: "web",
-    }) as { context: string };
+    })) as { context: string };
 
     expect(webEnrich.context).toContain("nextauth");
     expect(webEnrich.context).not.toContain("express-jwt");
@@ -239,24 +258,25 @@ describe("cross-project isolation — end-to-end", () => {
       // no project — legacy / unscoped
     });
 
-    const apiResult = await sdk.trigger("mem::enrich", {
+    const apiResult = (await sdk.trigger("mem::enrich", {
       sessionId: "sess-api",
       files: ["src/middleware/auth.ts"],
       project: "api",
-    }) as { context: string };
+    })) as { context: string };
 
-    const webResult = await sdk.trigger("mem::enrich", {
+    const webResult = (await sdk.trigger("mem::enrich", {
       sessionId: "sess-web",
       files: ["src/middleware/auth.ts"],
       project: "web",
-    }) as { context: string };
+    })) as { context: string };
 
     expect(apiResult.context).toContain("generic auth middleware");
     expect(webResult.context).toContain("generic auth middleware");
   });
 
   it("memories from different projects do not supersede each other via Jaccard dedup", async () => {
-    const sharedContent = "jwt token must be trimmed before validation in the middleware layer";
+    const sharedContent =
+      "jwt token must be trimmed before validation in the middleware layer";
 
     await sdk.trigger("mem::remember", {
       content: sharedContent,
@@ -266,15 +286,18 @@ describe("cross-project isolation — end-to-end", () => {
     });
 
     // Save nearly identical content under a different project.
-    const result = await sdk.trigger("mem::remember", {
+    const result = (await sdk.trigger("mem::remember", {
       content: sharedContent,
       type: "bug",
       files: ["src/middleware/auth.ts"],
       project: "web",
-    }) as { memory: { id: string; project: string } };
+    })) as { memory: { id: string; project: string } };
 
     // Both memories must survive as independent latest entries.
-    const memories = await kv.list(KV.memories) as Array<{ isLatest: boolean; project: string }>;
+    const memories = (await kv.list(KV.memories)) as Array<{
+      isLatest: boolean;
+      project: string;
+    }>;
     const latestByProject = memories.filter((m) => m.isLatest);
     const projects = latestByProject.map((m) => m.project);
 

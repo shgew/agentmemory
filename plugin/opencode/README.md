@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/MCP-53_tools-1f6feb?style=flat-square" alt="53 MCP tools" />
-  <img src="https://img.shields.io/badge/Plugin-40_capture_paths-1f6feb?style=flat-square" alt="40 capture paths" />
+  <img src="https://img.shields.io/badge/Plugin-41_capture_paths-1f6feb?style=flat-square" alt="41 capture paths" />
   <img src="https://img.shields.io/badge/Skills-16-1f6feb?style=flat-square" alt="16 skills" />
   <img src="https://img.shields.io/badge/R@5-95.2%25-00875f?style=flat-square" alt="95.2% R@5" />
 </p>
@@ -129,6 +129,9 @@ OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not req
 | Command (pre-execute) | `command.execute.before` | POST /observe |
 | Command (executed) | `command.executed` | POST /observe |
 | Git branch switch | `vcs.branch.updated` | POST /observe (current branch) |
+| Git commit attribution | `shell.env` + completed tool | POST /session/commit for each commit created by that tool |
+
+`shell.env` assigns a unique `GIT_REFLOG_ACTION` to each shell tool call. After the tool finishes, the plugin reads only matching HEAD reflog entries, ignores checkout, reset, pull fast-forward, and rebase movement entries, then posts created commits oldest first. A commit remains attributable when a later command in the same shell call fails. Failed posts retain the unposted commits for the next completed shell tool.
 
 ### Code health
 
@@ -216,7 +219,7 @@ When `OPENCODE_AGENTMEMORY_DEBUG=1` the plugin fires a single `GET /agentmemory/
 
 ### Dispose cleanup
 
-The `dispose` hook fires when OpenCode unloads the plugin (hot reload, host shutdown). It fires a fire-and-forget POST `/session/checkpoint` for the active session if any, then clears every module-level map (`stashedFiles`, `seenSubtaskIds`, `seenToolCallIds`, `contextInjectedSessions`, `startContextCache`, `lastSeenHeads`, `commitCheckChains`) and resets `activeSessionId` so a re-instantiated plugin starts clean.
+The `dispose` hook fires when OpenCode unloads the plugin (hot reload, host shutdown). It fires a fire-and-forget POST `/session/checkpoint` for the active session if any, then clears every module-level map (`stashedFiles`, `seenSubtaskIds`, `seenToolCallIds`, `contextInjectedSessions`, `startContextCache`, `pendingCommitChecks`, `pendingCommitQueues`, `commitCheckChains`) and resets `activeSessionId` so a re-instantiated plugin starts clean.
 
 Explicit deletion calls `/session/end`. If a session is closed without deletion in the OpenCode UI, the server-side `session-sweep` cron handles late finalization. Corpus-wide crystallization and consolidation run only through their configured server schedules or explicit API calls.
 
@@ -305,5 +308,5 @@ Agentmemory usage instructions are injected into the system prompt on the first 
 | `experimental.session.compacting` | Still experimental upstream. The plugin handles it - if the Go binary wires the dispatch it takes effect automatically. |
 | `SubagentStop` / `task.completed` / `subtask.completed` | OpenCode's `SubtaskPart` type still has no completion / result fields ([packages/core SubtaskPart](https://github.com/anomalyco/opencode/blob/main/packages/core/src/v1/session.ts)). Closest signal is `session.status` (idle), already covered. |
 | Claude `MEMORY.md` bridge | OpenCode-specific - OpenCode uses its own `AGENTS.md` mechanism, not Claude's `MEMORY.md`. |
-| `shell.env`, `chat.headers`, `tool.definition`, `experimental.text.complete`, `experimental.provider.small_model` typed hooks | Lower-signal hooks; not wired. Open an issue if a use case appears. |
+| `chat.headers`, `tool.definition`, `experimental.text.complete`, `experimental.provider.small_model` typed hooks | Lower-signal hooks; not wired. Open an issue if a use case appears. |
 | `installation.*` (apart from `installation.update-available`), `lsp.updated`, `pty.updated`, `pty.deleted`, `tui.*` bus events | Lower-signal bus events; not wired. Open an issue if a use case appears. (Code-health-shaped `lsp.client.diagnostics`, interactive `question.*` / `question.v2.*`, `mcp.tools.changed`, `mcp.browser.open.failed`, `installation.update-available`, and `pty.created` / `pty.exited` ARE wired - see tables above.) |

@@ -195,17 +195,42 @@ export function registerConsolidationPipelineFunction(
                 prompt,
               );
 
+              const factsEnvelope = response.match(
+                /^\s*<facts>([\s\S]*?)<\/facts>\s*$/,
+              );
+              if (!factsEnvelope) {
+                throw new Error("semantic response missing facts envelope");
+              }
               const factRegex =
                 /<fact\s+confidence="([^"]+)">([^<]+)<\/fact>/g;
               let match;
+              const parsedFacts: Array<{ fact: string; confidence: number }> =
+                [];
+
+              while ((match = factRegex.exec(factsEnvelope[1])) !== null) {
+                const confidenceText = match[1].trim();
+                const fact = match[2].trim();
+                if (!confidenceText || !fact) {
+                  throw new Error("semantic response has malformed facts");
+                }
+                const confidence = Number(confidenceText);
+                if (
+                  !Number.isFinite(confidence) ||
+                  confidence < 0 ||
+                  confidence > 1
+                ) {
+                  throw new Error("semantic response has invalid confidence");
+                }
+                parsedFacts.push({ fact, confidence });
+              }
+              factRegex.lastIndex = 0;
+              if (factsEnvelope[1].replace(factRegex, "").trim()) {
+                throw new Error("semantic response has malformed facts");
+              }
+
               let newFacts = 0;
               const now = new Date().toISOString();
-
-              while ((match = factRegex.exec(response)) !== null) {
-                const parsedConf = parseFloat(match[1]);
-                const confidence = Number.isNaN(parsedConf) ? 0.5 : parsedConf;
-                const fact = match[2].trim();
-
+              for (const { fact, confidence } of parsedFacts) {
                 const existing = existingSemantic.find(
                   (s) => s.fact.toLowerCase() === fact.toLowerCase(),
                 );

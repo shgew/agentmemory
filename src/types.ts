@@ -15,6 +15,7 @@ export interface Session {
   summary?: string;
   commitShas?: string[];
   agentId?: string;
+  appliedObservationDeletionIds?: string[];
 }
 
 export interface CommitLink {
@@ -44,6 +45,28 @@ export interface RawObservation {
   modality?: "text" | "image" | "mixed";
   imageData?: string;
   agentId?: string;
+}
+
+export interface PendingCompressionEntry {
+  id: string;
+  sessionId: string;
+}
+
+export interface PendingImageRelease {
+  id: string;
+  refs: string[];
+  finalizeRefs?: string[];
+  kind: "record" | "observation";
+  scope?: string;
+  recordId?: string;
+  sessionId?: string;
+  observationId?: string;
+  owner?: unknown;
+  observation?: unknown;
+  raw?: RawObservation;
+  observationCountAdjusted?: boolean;
+  observationCountFinalized?: boolean;
+  derivedCleanupComplete?: boolean;
 }
 
 export interface CompressedObservation {
@@ -152,13 +175,24 @@ export interface ProviderConfig {
   baseURL?: string;
 }
 
-export type ProviderType = "agent-sdk" | "anthropic" | "gemini" | "openrouter" | "minimax" | "openai" | "noop";
+export type ProviderType =
+  | "agent-sdk"
+  | "anthropic"
+  | "gemini"
+  | "openrouter"
+  | "minimax"
+  | "openai"
+  | "noop";
 
 export interface MemoryProvider {
   name: string;
   compress(systemPrompt: string, userPrompt: string): Promise<string>;
   summarize(systemPrompt: string, userPrompt: string): Promise<string>;
-  describeImage?(imageData: string, mimeType: string, prompt: string): Promise<string>;
+  describeImage?(
+    imageData: string,
+    mimeType: string,
+    prompt: string,
+  ): Promise<string>;
 }
 
 export interface AgentMemoryConfig {
@@ -187,6 +221,8 @@ export interface ContextBlock {
   // same priority fall back to recency. Defaults to 0 when unset.
   priority?: number;
   sourceIds?: string[];
+  sourceScope?: "lesson" | "observation";
+  sourceSessionId?: string;
 }
 
 export interface EvalResult {
@@ -264,6 +300,7 @@ export interface MemoryRelation {
 
 export interface HybridSearchResult {
   observation: CompressedObservation;
+  ownerScope?: "memory" | "observation";
   bm25Score: number;
   vectorScore: number;
   graphScore: number;
@@ -318,7 +355,62 @@ export interface ExportPagination {
 }
 
 export interface ExportData {
-  version: "0.3.0" | "0.4.0" | "0.5.0" | "0.6.0" | "0.6.1" | "0.7.0" | "0.7.2" | "0.7.3" | "0.7.4" | "0.7.5" | "0.7.6" | "0.7.7" | "0.7.9" | "0.8.0" | "0.8.1" | "0.8.2" | "0.8.3" | "0.8.4" | "0.8.5" | "0.8.6" | "0.8.7" | "0.8.8" | "0.8.9" | "0.8.10" | "0.8.11" | "0.8.12" | "0.8.13" | "0.9.0" | "0.9.1" | "0.9.2" | "0.9.3" | "0.9.4" | "0.9.5" | "0.9.6" | "0.9.7" | "0.9.8" | "0.9.9" | "0.9.10" | "0.9.11" | "0.9.12" | "0.9.13" | "0.9.14" | "0.9.15" | "0.9.16" | "0.9.17" | "0.9.18" | "0.9.19" | "0.9.20" | "0.9.21" | "0.9.22" | "0.9.23" | "0.9.24" | "0.9.25" | "0.9.26" | "0.9.27";
+  version:
+    | "0.3.0"
+    | "0.4.0"
+    | "0.5.0"
+    | "0.6.0"
+    | "0.6.1"
+    | "0.7.0"
+    | "0.7.2"
+    | "0.7.3"
+    | "0.7.4"
+    | "0.7.5"
+    | "0.7.6"
+    | "0.7.7"
+    | "0.7.9"
+    | "0.8.0"
+    | "0.8.1"
+    | "0.8.2"
+    | "0.8.3"
+    | "0.8.4"
+    | "0.8.5"
+    | "0.8.6"
+    | "0.8.7"
+    | "0.8.8"
+    | "0.8.9"
+    | "0.8.10"
+    | "0.8.11"
+    | "0.8.12"
+    | "0.8.13"
+    | "0.9.0"
+    | "0.9.1"
+    | "0.9.2"
+    | "0.9.3"
+    | "0.9.4"
+    | "0.9.5"
+    | "0.9.6"
+    | "0.9.7"
+    | "0.9.8"
+    | "0.9.9"
+    | "0.9.10"
+    | "0.9.11"
+    | "0.9.12"
+    | "0.9.13"
+    | "0.9.14"
+    | "0.9.15"
+    | "0.9.16"
+    | "0.9.17"
+    | "0.9.18"
+    | "0.9.19"
+    | "0.9.20"
+    | "0.9.21"
+    | "0.9.22"
+    | "0.9.23"
+    | "0.9.24"
+    | "0.9.25"
+    | "0.9.26"
+    | "0.9.27";
   exportedAt: string;
   sessions: Session[];
   observations: Record<string, CompressedObservation[]>;
@@ -533,10 +625,7 @@ export interface GraphTombstone {
 }
 
 export type ConsolidationTier =
-  | "working"
-  | "episodic"
-  | "semantic"
-  | "procedural";
+  "working" | "episodic" | "semantic" | "procedural";
 
 export interface SemanticMemory {
   id: string;
@@ -713,11 +802,7 @@ export interface Action {
 }
 
 export type ActionEdgeType =
-  | "requires"
-  | "unlocks"
-  | "spawned_by"
-  | "gated_by"
-  | "conflicts_with";
+  "requires" | "unlocks" | "spawned_by" | "gated_by" | "conflicts_with";
 
 export interface ActionEdge {
   id: string;
@@ -904,7 +989,6 @@ export interface MeshPeer {
   sharedScopes: string[];
   syncFilter?: { project?: string };
 }
-
 
 export interface EnrichedChunk {
   id: string;

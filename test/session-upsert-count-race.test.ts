@@ -1,8 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { withKeyedLock } from "../src/state/keyed-mutex.js";
 import { KV } from "../src/state/schema.js";
 import { upsertSession } from "../src/functions/session-upsert.js";
+import { withObservationSessionOwnerLock } from "../src/functions/image-owner.js";
 import type { Session } from "../src/types.js";
 
 type UpdateOp = { type: string; path: string; value?: unknown };
@@ -76,18 +76,13 @@ describe("upsertSession observation-count race", () => {
 
   it("never regresses observationCount when a concurrent observe holds the obs: lock", async () => {
     const id = "race-session";
-    // Count has drifted below the stored observations (one already on disk).
     kv.seed(KV.sessions, id, session({ id, observationCount: 0 }));
     kv.seed(KV.observations(id), "obs-1", { id: "obs-1" });
 
     const observeEntered = deferred();
     const release = deferred();
 
-    // Simulated concurrent observe: takes the SAME obs: lock upsertSession uses
-    // for the count repair, performs a read-modify-write increment, appends a
-    // new observation, and holds the lock until released. This is exactly
-    // observe.ts's critical section (obs: lock, no session: lock).
-    const concurrentObserve = withKeyedLock(`obs:${id}`, async () => {
+    const concurrentObserve = withObservationSessionOwnerLock(id, async () => {
       observeEntered.resolve();
       await release.promise;
       const current = await kv.get<Session>(KV.sessions, id);
@@ -101,11 +96,8 @@ describe("upsertSession observation-count race", () => {
       ]);
     });
 
-    // observe now holds obs:. upsertSession will pass its session: phase and
-    // then block acquiring obs: until observe releases.
     await observeEntered.promise;
     const resume = upsertSession(kv, { sessionId: id, project: "project", cwd: "/repo" });
-    // Give upsert a chance to reach (and queue behind) the obs: lock.
     await Promise.resolve();
     await Promise.resolve();
 
@@ -113,10 +105,6 @@ describe("upsertSession observation-count race", () => {
     await concurrentObserve;
     const result = await resume;
 
-    // observe committed count=1 and there are now 2 observations on disk. The
-    // repair runs strictly AFTER observe (serialized by obs:), re-reads count=1,
-    // sees 2 observations, and grows to 2. It must never clobber observe's write
-    // back down to a stale value.
     const stored = await kv.get<Session>(KV.sessions, id);
     expect(stored?.observationCount).toBe(2);
     expect(result.session.observationCount).toBe(2);
@@ -136,7 +124,6 @@ describe("upsertSession observation-count race", () => {
 
     expect(result.session.observationCount).toBe(2);
     expect((await kv.get<Session>(KV.sessions, id))?.observationCount).toBe(2);
-    // No count op should have been written: stored (2) is not < actual (2).
     const countWrites = kv.updateCalls.filter((c) =>
       c.ops.some((op) => op.path === "observationCount"),
     );

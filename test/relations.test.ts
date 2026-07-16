@@ -248,6 +248,9 @@ describe("Relations Functions", () => {
         { id: "lsn_v2", hop: 1, direction: "correctedBy" },
         { id: "lsn_v3", hop: 2, direction: "correctedBy" },
       ]);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(await kv.get("mem:access", "lsn_v2")).toMatchObject({ count: 1 });
+      expect(await kv.get("mem:access", "lsn_v3")).toMatchObject({ count: 1 });
     });
 
     it("traces a correcting lesson back to obsolete advice", async () => {

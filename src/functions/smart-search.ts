@@ -11,7 +11,7 @@ import type {
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import { recordAccessBatch } from "./access-tracker.js";
+import { recordOwnedAccessBatch } from "./access-tracker.js";
 import {
   getAgentId,
   isAgentScopeIsolated,
@@ -91,10 +91,7 @@ export function getExpandStats(): {
   const total = expandStats.expandCallsWithSession;
   return {
     ...expandStats,
-    rate:
-      total > 0
-        ? expandStats.resultsExpandedFromPriorSearch / total
-        : 0,
+    rate: total > 0 ? expandStats.resultsExpandedFromPriorSearch / total : 0,
   };
 }
 
@@ -116,7 +113,8 @@ export function registerSmartSearchFunction(
     timings?: HybridSearchTimings,
   ) => Promise<HybridSearchResult[]>,
 ): void {
-  sdk.registerFunction("mem::smart-search",
+  sdk.registerFunction(
+    "mem::smart-search",
     async (data: {
       query?: string;
       expandIds?: Array<string | { obsId: string; sessionId: string }>;
@@ -136,7 +134,6 @@ export function registerSmartSearchFunction(
       source?: string;
       includeTimings?: boolean;
     }) => {
-
       // Compute the agent filter once, up front. Both the expandIds
       // branch and the hybrid-search branch consult it — otherwise
       // expandIds becomes a cross-agent leak (#554 follow-up).
@@ -154,17 +151,12 @@ export function registerSmartSearchFunction(
       const envAgentId = isolated ? getAgentId() : undefined;
       const filterAgentId = wildcardAgent
         ? undefined
-        : explicitAgentId ?? envAgentId;
+        : (explicitAgentId ?? envAgentId);
       const projectFilter =
         typeof data.project === "string" && data.project.trim().length > 0
           ? data.project.trim()
           : undefined;
-      if (
-        isolated &&
-        !wildcardAgent &&
-        !explicitAgentId &&
-        !envAgentId
-      ) {
+      if (isolated && !wildcardAgent && !explicitAgentId && !envAgentId) {
         throw new Error(
           "mem::smart-search: AGENTMEMORY_AGENT_SCOPE=isolated is set but " +
             "no agent id is available (env AGENT_ID unset and no explicit " +
@@ -175,13 +167,26 @@ export function registerSmartSearchFunction(
 
       if (data.expandIds && data.expandIds.length > 0) {
         const raw = data.expandIds.slice(0, 20);
-        const items = raw.map((entry) => {
-          if (typeof entry === "string") return { obsId: entry, sessionId: undefined as string | undefined };
-          if (entry && typeof entry === "object" && typeof (entry as any).obsId === "string") {
-            return { obsId: (entry as any).obsId, sessionId: (entry as any).sessionId as string | undefined };
-          }
-          return null;
-        }).filter((item): item is NonNullable<typeof item> => item !== null);
+        const items = raw
+          .map((entry) => {
+            if (typeof entry === "string")
+              return {
+                obsId: entry,
+                sessionId: undefined as string | undefined,
+              };
+            if (
+              entry &&
+              typeof entry === "object" &&
+              typeof (entry as any).obsId === "string"
+            ) {
+              return {
+                obsId: (entry as any).obsId,
+                sessionId: (entry as any).sessionId as string | undefined,
+              };
+            }
+            return null;
+          })
+          .filter((item): item is NonNullable<typeof item> => item !== null);
 
         const expanded: Array<{
           obsId: string;
@@ -192,7 +197,9 @@ export function registerSmartSearchFunction(
         const results = await Promise.all(
           items.map(({ obsId, sessionId }) =>
             findObservation(kv, obsId, sessionId).then((obs) =>
-              obs ? { obsId, sessionId: obs.sessionId, observation: obs } : null,
+              obs
+                ? { obsId, sessionId: obs.sessionId, observation: obs }
+                : null,
             ),
           ),
         );
@@ -213,9 +220,13 @@ export function registerSmartSearchFunction(
             )
           : agentScoped;
 
-        void recordAccessBatch(
+        void recordOwnedAccessBatch(
           kv,
-          scoped.map((e) => e.observation.id),
+          scoped.map((entry) => ({
+            id: entry.observation.id,
+            scope: "observation" as const,
+            sessionId: entry.sessionId,
+          })),
         );
 
         // Telemetry stays off the response path and cannot block expansion.
@@ -228,22 +239,13 @@ export function registerSmartSearchFunction(
           const expandedObsIds = scoped.map((entry) => entry.obsId);
           const detection = withKeyedLock(
             `recent-searches:${sessionIdForExpand}`,
-            () =>
-              detectExpandOutcome(
-                kv,
-                sessionIdForExpand,
-                expandedObsIds,
-              ),
+            () => detectExpandOutcome(kv, sessionIdForExpand, expandedObsIds),
           )
             .catch((err) => {
-              logger.warn(
-                "Smart search expand-outcome telemetry failed",
-                {
-                  sessionId: sessionIdForExpand,
-                  error:
-                    err instanceof Error ? err.message : String(err),
-                },
-              );
+              logger.warn("Smart search expand-outcome telemetry failed", {
+                sessionId: sessionIdForExpand,
+                error: err instanceof Error ? err.message : String(err),
+              });
             })
             .finally(() => {
               pendingFollowups.delete(detection);
@@ -301,7 +303,8 @@ export function registerSmartSearchFunction(
               return await recallLessons(sdk, query, lessonLimit, data.project);
             } finally {
               if (timings) {
-                timings.lessonSearchMs = performance.now() - lessonSearchStartedAt;
+                timings.lessonSearchMs =
+                  performance.now() - lessonSearchStartedAt;
               }
             }
           })()
@@ -342,9 +345,20 @@ export function registerSmartSearchFunction(
         timestamp: r.observation.timestamp,
       }));
 
-      void recordAccessBatch(
+      void recordOwnedAccessBatch(
         kv,
-        compact.map((r) => r.obsId),
+        filteredHybrid.map((result) =>
+          result.ownerScope === "memory"
+            ? {
+                id: result.observation.id,
+                scope: "memory" as const,
+              }
+            : {
+                id: result.observation.id,
+                scope: "observation" as const,
+                sessionId: result.sessionId,
+              },
+        ),
       );
 
       // #771: followup-rate diagnostic. Only fires for agent-initiated
@@ -498,9 +512,12 @@ async function recallLessons(
       tags: l.tags ?? [],
     }));
   } catch (err) {
-    logger.warn("Smart search: mem::lesson-recall failed; returning empty lesson list", {
-      error: err instanceof Error ? err.message : String(err),
-    });
+    logger.warn(
+      "Smart search: mem::lesson-recall failed; returning empty lesson list",
+      {
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
     return [];
   }
 }
@@ -514,7 +531,12 @@ async function detectFollowup(
   const now = Date.now();
   const windowMs = Math.max(1, getFollowupWindowSeconds()) * 1000;
   const currentIds = compact.map((r) => r.obsId);
-  const current: RecentSearch = { sessionId, query, resultIds: currentIds, at: now };
+  const current: RecentSearch = {
+    sessionId,
+    query,
+    resultIds: currentIds,
+    at: now,
+  };
 
   const prior = await kv
     .get<RecentSearch>(KV.recentSearches, sessionId)
@@ -592,7 +614,9 @@ async function findObservation(
     const batch = sessions.slice(i, i + 5);
     const results = await Promise.all(
       batch.map((s) =>
-        kv.get<CompressedObservation>(KV.observations(s.id), obsId).catch(() => null),
+        kv
+          .get<CompressedObservation>(KV.observations(s.id), obsId)
+          .catch(() => null),
       ),
     );
     const found = results.find((r) => r !== null);

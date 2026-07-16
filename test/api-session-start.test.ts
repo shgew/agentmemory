@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -134,10 +134,15 @@ describe("api::session::start", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.stubEnv("AGENT_ID", "");
     sdk = mockSdk();
     kv = mockKV();
     registerApiTriggers(sdk as never, kv as never);
     start = sdk.getFunction("api::session::start");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   it("creates a new active session with zero observations", async () => {

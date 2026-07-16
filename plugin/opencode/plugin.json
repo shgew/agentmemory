@@ -1,7 +1,7 @@
 {
   "name": "agentmemory-capture",
   "version": "0.9.27",
-  "description": "OpenCode plugin for agentmemory - 40 capture paths: 31 narrowed bus-event branches, 7 awaited hooks, the event dispatcher, and dispose. Captures session lifecycle, completed assistant text, prompts, tool results, diffs, permissions, tasks, commands, diagnostics, questions, MCP events, PTY events, and commit links. Injects session and file context, reopens resumed sessions, bounds payloads, and leaves corpus-wide maintenance to configured server schedules. Ships 16 skills and installs with `agentmemory connect opencode --with-plugin`.",
+  "description": "OpenCode plugin for agentmemory - 41 capture paths: 31 narrowed bus-event branches, 8 awaited hooks, the event dispatcher, and dispose. Captures session lifecycle, completed assistant text, prompts, tool results, diffs, permissions, tasks, commands, diagnostics, questions, MCP events, PTY events, and per-tool commit links. Injects session and file context, reopens resumed sessions, bounds payloads, and leaves corpus-wide maintenance to configured server schedules. Ships 16 skills and installs with `agentmemory connect opencode --with-plugin`.",
   "author": {
     "name": "Rohit Ghumare",
     "url": "https://github.com/rohitg00"

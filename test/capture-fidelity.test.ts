@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { KV } from "../src/state/schema.js";
 import type { MemoryProvider, RawObservation } from "../src/types.js";
 import {
   mockKV,
@@ -193,6 +194,45 @@ describe("capture fidelity characterization", () => {
       "src/functions/compress.ts",
       "src/functions/observe.ts",
     ]);
+  });
+
+  it("does not compress a retained payload after its raw owner was deleted", async () => {
+    const { registerCompressFunction } = await import(
+      "../src/functions/compress.js"
+    );
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const compress = vi.fn().mockResolvedValue(`<type>conversation</type>
+<title>Deleted observation</title>
+<facts></facts>
+<narrative>Deleted observation</narrative>
+<concepts></concepts>
+<files></files>
+<importance>5</importance>`);
+    const provider: MemoryProvider = {
+      name: "test",
+      compress,
+      summarize: async () => "",
+    };
+    registerCompressFunction(sdk as never, kv as never, provider);
+    const raw: RawObservation = {
+      id: "obs_deleted",
+      sessionId: "ses_deleted",
+      timestamp: "2026-07-16T10:00:00.000Z",
+      hookType: "prompt_submit",
+      raw: {},
+    };
+
+    const result = await sdk.trigger("mem::compress", {
+      observationId: raw.id,
+      sessionId: raw.sessionId,
+      raw,
+      requireStoredRaw: true,
+    });
+
+    expect(result).toMatchObject({ success: true, noOp: true });
+    expect(compress).not.toHaveBeenCalled();
+    expect(await kv.get(KV.observations(raw.sessionId), raw.id)).toBeNull();
   });
 
   it("bounds recursive file extraction and tolerates cyclic input", async () => {

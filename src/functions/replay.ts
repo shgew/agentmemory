@@ -14,10 +14,15 @@ import { parseJsonlText } from "../replay/jsonl-parser.js";
 import { projectTimeline, type Timeline } from "../replay/timeline.js";
 import { safeAudit } from "./audit.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
+import {
+  clearPendingCompression,
+  storeRawObservation,
+} from "./raw-observations.js";
 import { getSearchIndex } from "./search.js";
 import { logger } from "../logger.js";
 import { isAfter, laterTimestamp } from "../state/timestamp-compare.js";
 import { saveLesson } from "./lesson-state.js";
+import { withObservationSessionOwnerLock } from "./image-owner.js";
 
 export const MAX_FILES_DEFAULT = 200;
 export const MAX_FILES_UPPER_BOUND = 1000;
@@ -377,60 +382,102 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           ? firstPromptObs.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200)
           : undefined;
 
-        const existing = await kv.get<Session>(KV.sessions, parsed.sessionId);
-        if (existing) {
-          existing.observationCount =
-            (existing.observationCount || 0) + parsed.observations.length;
-          if (isAfter(parsed.endedAt, existing.endedAt)) {
-            existing.endedAt = parsed.endedAt;
-          }
-          if (existing.status === "active") existing.status = "completed";
-          existing.lastCheckpointAt = laterTimestamp(existing.lastCheckpointAt, parsed.endedAt);
-          const existingTags = existing.tags || [];
-          if (!existingTags.includes("jsonl-import")) {
-            existing.tags = [...existingTags, "jsonl-import"];
-          }
-          if (!existing.firstPrompt && firstPrompt) {
-            existing.firstPrompt = firstPrompt;
-          }
-          // #775: re-key on parsed.sessionId, not existing.id. Older
-          // session rows may be missing the `id` field; existing.id
-          // would then be undefined, JSON.stringify would drop the
-          // `key` from the state::set payload, and the engine would
-          // reject the call with `missing field \`key\``. Because the
-          // rejection aborts the whole import handler, a single
-          // legacy row killed the entire batch. parsed.sessionId is
-          // always populated (parseJsonlText has a three-level
-          // fallback) and is what we just used to read the row.
-          if (!existing.id) existing.id = parsed.sessionId;
-          await kv.set(KV.sessions, parsed.sessionId, existing);
-        } else {
-          const session: Session = {
-            id: parsed.sessionId,
-            project: parsed.project,
-            cwd: parsed.cwd,
-            startedAt: parsed.startedAt,
-            endedAt: parsed.endedAt,
-            status: "completed",
-            lastCheckpointAt: parsed.endedAt,
-            observationCount: parsed.observations.length,
-            tags: ["jsonl-import"],
-            firstPrompt,
-          };
-          await kv.set(KV.sessions, session.id, session);
-        }
-
         const searchIndex = getSearchIndex();
         const compressed: CompressedObservation[] = [];
-        await Promise.all(
-          parsed.observations.map(async (obs) => {
-            const synthetic = buildSyntheticCompression(obs);
-            compressed.push(synthetic);
-            await kv.set(KV.rawPayloads, obs.id, obs);
-            await kv.set(KV.observations(parsed.sessionId), obs.id, synthetic);
-            searchIndex.add(synthetic);
-          }),
-        );
+        await withObservationSessionOwnerLock(parsed.sessionId, async () => {
+            const existing = await kv.get<Session>(
+              KV.sessions,
+              parsed.sessionId,
+            );
+            if (existing) {
+              const updates: Array<{
+                type: "set";
+                path: string;
+                value: unknown;
+              }> = [
+                {
+                  type: "set",
+                  path: "observationCount",
+                  value:
+                    (existing.observationCount || 0) +
+                    parsed.observations.length,
+                },
+                {
+                  type: "set",
+                  path: "lastCheckpointAt",
+                  value: laterTimestamp(
+                    existing.lastCheckpointAt,
+                    parsed.endedAt,
+                  ),
+                },
+              ];
+              if (isAfter(parsed.endedAt, existing.endedAt)) {
+                updates.push({
+                  type: "set",
+                  path: "endedAt",
+                  value: parsed.endedAt,
+                });
+              }
+              if (existing.status === "active") {
+                updates.push({
+                  type: "set",
+                  path: "status",
+                  value: "completed",
+                });
+              }
+              if (!existing.tags?.includes("jsonl-import")) {
+                updates.push({
+                  type: "set",
+                  path: "tags",
+                  value: [...(existing.tags ?? []), "jsonl-import"],
+                });
+              }
+              if (!existing.firstPrompt && firstPrompt) {
+                updates.push({
+                  type: "set",
+                  path: "firstPrompt",
+                  value: firstPrompt,
+                });
+              }
+              if (!existing.id) {
+                updates.push({
+                  type: "set",
+                  path: "id",
+                  value: parsed.sessionId,
+                });
+              }
+              await kv.update(KV.sessions, parsed.sessionId, updates);
+            } else {
+              const session: Session = {
+                id: parsed.sessionId,
+                project: parsed.project,
+                cwd: parsed.cwd,
+                startedAt: parsed.startedAt,
+                endedAt: parsed.endedAt,
+                status: "completed",
+                lastCheckpointAt: parsed.endedAt,
+                observationCount: parsed.observations.length,
+                tags: ["jsonl-import"],
+                firstPrompt,
+              };
+              await kv.set(KV.sessions, session.id, session);
+            }
+
+            await Promise.all(
+              parsed.observations.map(async (obs) => {
+                const synthetic = buildSyntheticCompression(obs);
+                compressed.push(synthetic);
+                await storeRawObservation(kv, obs);
+                await kv.set(
+                  KV.observations(parsed.sessionId),
+                  obs.id,
+                  synthetic,
+                );
+                searchIndex.add(synthetic);
+                await clearPendingCompression(kv, parsed.sessionId, obs.id);
+              }),
+            );
+        });
         observationCount += parsed.observations.length;
         sessionIds.push(parsed.sessionId);
 

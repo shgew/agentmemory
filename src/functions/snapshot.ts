@@ -15,6 +15,15 @@ import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { VERSION } from "../version.js";
 import { logger } from "../logger.js";
+import {
+  type AccessTarget,
+  restoreOwnedAccessLogWithinOwnershipLock,
+} from "./access-tracker.js";
+import {
+  withImageOwnershipReadLock,
+  withObservationOwnerLock,
+  withObservationSessionOwnershipLock,
+} from "./observation-lock.js";
 
 const COMMIT_HASH_RE = /^[0-9a-f]{7,40}$/i;
 
@@ -48,22 +57,38 @@ export function registerSnapshotFunction(
         await ensureGitRepo(snapshotDir);
         const ts = new Date().toISOString();
 
-        const sessions = await kv.list<Session>(KV.sessions);
-        const memories = await kv.list<Memory>(KV.memories);
-        const graphNodes = await kv.list<GraphNode>(KV.graphNodes);
-        const accessLogs = await kv
-          .list<AccessLogExport>(KV.accessLog)
-          .catch(() => [] as AccessLogExport[]);
-
-        const observations: Record<string, unknown[]> = {};
-        for (const session of sessions) {
-          const obs = await kv
-            .list(KV.observations(session.id))
-            .catch(() => []);
-          if (obs.length > 0) {
-            observations[session.id] = obs;
-          }
-        }
+        const { sessions, memories, graphNodes, observations, accessLogs } =
+          await withImageOwnershipReadLock(async () => {
+            const sessions = await kv.list<Session>(KV.sessions);
+            const memories = await kv.list<Memory>(KV.memories);
+            const graphNodes = await kv.list<GraphNode>(KV.graphNodes);
+            const observations: Record<string, unknown[]> = {};
+            for (const session of sessions) {
+              const obs = await kv
+                .list(KV.observations(session.id))
+                .catch(() => []);
+              if (obs.length > 0) observations[session.id] = obs;
+            }
+            const ownerIds = new Set(memories.map((memory) => memory.id));
+            for (const rows of Object.values(observations)) {
+              for (const row of rows) {
+                const id = (row as { id?: unknown }).id;
+                if (typeof id === "string") ownerIds.add(id);
+              }
+            }
+            const accessLogs = (
+              await kv
+                .list<AccessLogExport>(KV.accessLog)
+                .catch(() => [] as AccessLogExport[])
+            ).filter((log) => ownerIds.has(log.memoryId));
+            return {
+              sessions,
+              memories,
+              graphNodes,
+              observations,
+              accessLogs,
+            };
+          });
 
         const state = {
           version: VERSION,
@@ -181,33 +206,58 @@ export function registerSnapshotFunction(
           accessLogs?: AccessLogExport[];
         };
 
-        if (state.sessions) {
-          for (const session of state.sessions) {
-            await kv.set(KV.sessions, session.id, session);
+        const sessionsById = new Map(
+          (state.sessions ?? []).map((session) => [session.id, session]),
+        );
+        const sessionIds = new Set([
+          ...sessionsById.keys(),
+          ...Object.keys(state.observations ?? {}),
+        ]);
+        const accessTargets = new Map<string, AccessTarget>();
+        for (const memory of state.memories ?? []) {
+          accessTargets.set(memory.id, { id: memory.id, scope: "memory" });
+        }
+        for (const [sessionId, observations] of Object.entries(
+          state.observations ?? {},
+        )) {
+          for (const observation of observations) {
+            accessTargets.set(observation.id, {
+              id: observation.id,
+              scope: "observation",
+              sessionId,
+            });
           }
         }
-        if (state.memories) {
-          for (const memory of state.memories) {
-            await kv.set(KV.memories, memory.id, memory);
-          }
-        }
-        if (state.graphNodes) {
-          for (const node of state.graphNodes) {
-            await kv.set(KV.graphNodes, node.id, node);
-          }
-        }
-        if (state.observations) {
-          for (const [sessionId, obs] of Object.entries(state.observations)) {
-            for (const o of obs) {
-              await kv.set(KV.observations(sessionId), o.id, o);
+        await withObservationSessionOwnershipLock(sessionIds, async () => {
+          for (const sessionId of sessionIds) {
+            const session = sessionsById.get(sessionId);
+            if (session) await kv.set(KV.sessions, sessionId, session);
+            for (const observation of state.observations?.[sessionId] ?? []) {
+              await withObservationOwnerLock(observation.id, async () => {
+                await kv.set(
+                  KV.observations(sessionId),
+                  observation.id,
+                  observation,
+                );
+              });
             }
           }
-        }
-        if (state.accessLogs) {
-          for (const log of state.accessLogs) {
-            await kv.set(KV.accessLog, log.memoryId, log);
+          for (const memory of state.memories ?? []) {
+            await kv.set(KV.memories, memory.id, memory);
           }
-        }
+          for (const node of state.graphNodes ?? []) {
+            await kv.set(KV.graphNodes, node.id, node);
+          }
+          for (const log of state.accessLogs ?? []) {
+            const target = accessTargets.get(log.memoryId);
+            if (!target) continue;
+            await restoreOwnedAccessLogWithinOwnershipLock(
+              kv,
+              target,
+              log,
+            );
+          }
+        });
 
         await gitExec(snapshotDir, ["checkout", "HEAD", "--", "state.json"]);
 

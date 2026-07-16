@@ -158,7 +158,7 @@ agentmemory fonctionne avec tout agent qui prend en charge les hooks, MCP ou l'A
 <td align="center" width="12.5%">
 <a href="https://github.com/opencode-ai/opencode"><img src="https://github.com/opencode-ai.png?size=120" alt="OpenCode" width="48" height="48" /></a><br/>
 <strong>OpenCode</strong><br/>
-<sub>40 chemins de capture + MCP + plugin</sub>
+<sub>41 chemins de capture + MCP + plugin</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/cline/cline"><img src="https://github.com/cline.png?size=120" alt="Cline" width="48" height="48" /></a><br/>
@@ -551,7 +551,7 @@ L'entrée agentmemory est le **même bloc serveur MCP** pour tous les hôtes uti
 | **Codex CLI (MCP seul)** | `.codex/config.toml` | Format TOML : `codex mcp add agentmemory -- npx -y @agentmemory/mcp`, ou ajoutez `[mcp_servers.agentmemory]` à la main. |
 | **Codex CLI (plugin complet)** | Marketplace de plugins Codex | `codex plugin marketplace add rohitg00/agentmemory` puis `codex plugin add agentmemory@agentmemory`. Enregistre MCP + 7 hooks de cycle de vie (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, SubagentStart, SubagentStop, Stop) + 16 skills. Lancez `agentmemory connect codex --with-hooks` seulement si `/hooks` n'affiche pas la source du plugin agentmemory. |
 | **OpenCode (MCP seul)** | `opencode.json` | Format différent — clé `mcp` au niveau racine, commande sous forme de tableau : `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`. |
-| **OpenCode (plugin complet)** | `plugin/opencode/` | 40 chemins de capture et 16 skills. Installation en une commande : `agentmemory connect opencode --with-plugin`. OpenCode découvre automatiquement le fichier dans le répertoire `plugins/`, donc aucun tableau `plugin` n'est nécessaire. Consultez [`plugin/opencode/README.md`](../plugin/opencode/README.md) pour le tableau complet. |
+| **OpenCode (plugin complet)** | `plugin/opencode/` | 41 chemins de capture et 16 skills. Installation en une commande : `agentmemory connect opencode --with-plugin`. OpenCode découvre automatiquement le fichier dans le répertoire `plugins/`, donc aucun tableau `plugin` n'est nécessaire. Consultez [`plugin/opencode/README.md`](../plugin/opencode/README.md) pour le tableau complet. |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | Copiez [`integrations/pi`](../integrations/pi/) et redémarrez pi. |
 | **Hermes Agent** | `~/.hermes/config.yaml` | Utilisez le [plugin de fournisseur de mémoire plus poussé](../integrations/hermes/) avec `memory.provider: agentmemory`. |
 | **Qwen Code** | `~/.qwen/settings.json` | `agentmemory connect qwen` écrit le bloc `mcpServers` standard. La charge utile des hooks est compatible champ-à-champ avec Claude Code, donc les 12 scripts de hooks existants fonctionnent sans modification — câblez-les via la section `hooks` du même `settings.json`. |

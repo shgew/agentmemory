@@ -14,6 +14,7 @@ vi.mock("iii-sdk", async (importOriginal) => {
 vi.mock("../src/functions/search.js", () => ({
   getSearchIndex: () => ({
     add: vi.fn(),
+    has: vi.fn(() => false),
   }),
   vectorIndexAddGuarded: vi.fn().mockResolvedValue(false),
 }));
@@ -47,6 +48,7 @@ const kv = mockKV() as any;
 
 import { registerObserveFunction } from "../src/functions/observe.js";
 import { registerCompressFunction } from "../src/functions/compress.js";
+import { KV } from "../src/state/schema.js";
 import type { RawObservation, CompressedObservation, MemoryProvider } from "../src/types.js";
 
 const VALID_COMPRESS_XML = `<type>image</type>
@@ -326,6 +328,109 @@ describe("Disk Size Manager", () => {
 });
 
 describe("Image Refs", () => {
+  it("applies a journaled release once when the state write response fails", async () => {
+    const localKv = mockKV() as any;
+    const localSdk = { trigger: vi.fn().mockResolvedValue(undefined) } as any;
+    const imageRef = "/managed/shared.png";
+    await localKv.set(KV.imageRefs, imageRef, 2);
+    const setRecord = localKv.set;
+    let rejectAppliedWrite = true;
+    vi.spyOn(localKv, "set").mockImplementation(
+      async (scope: string, key: string, value: unknown) => {
+        const result = await setRecord(scope, key, value);
+        if (
+          rejectAppliedWrite &&
+          scope === KV.imageRefs &&
+          key === imageRef &&
+          typeof value === "object"
+        ) {
+          rejectAppliedWrite = false;
+          throw new Error("state response lost");
+        }
+        return result;
+      },
+    );
+
+    const { getImageRefCount, releaseImageRef } = await import(
+      "../src/functions/image-refs.js"
+    );
+    await expect(
+      releaseImageRef(localKv, localSdk, imageRef, "release:obs_1"),
+    ).rejects.toThrow("state response lost");
+    await releaseImageRef(localKv, localSdk, imageRef, "release:obs_1");
+
+    expect(await getImageRefCount(localKv, imageRef)).toBe(1);
+  });
+
+  it("keeps a concurrently reacquired image file", async () => {
+    const localKv = mockKV() as any;
+    const localSdk = { trigger: vi.fn().mockResolvedValue(undefined) } as any;
+    const imageData = `data:image/png;base64,${Buffer.from(
+      "concurrent-image-ref",
+    ).toString("base64")}`;
+    const {
+      finalizeImageRefRelease,
+      getImageRefCount,
+      incrementImageRef,
+      releaseImageRef,
+      saveImageAndIncrementRef,
+    } = await import("../src/functions/image-refs.js");
+    const { saveImageToDisk } = await import("../src/utils/image-store.js");
+    const saved = await saveImageToDisk(imageData);
+    await incrementImageRef(localKv, saved.filePath);
+    const setRecord = localKv.set.bind(localKv);
+    let releaseStateWrite = () => {};
+    const stateWriteBlocked = new Promise<void>((resolve) => {
+      releaseStateWrite = resolve;
+    });
+    let markStateWriteStarted = () => {};
+    const stateWriteStarted = new Promise<void>((resolve) => {
+      markStateWriteStarted = resolve;
+    });
+    let blockRelease = true;
+    localKv.set = vi.fn(async (scope: string, key: string, value: unknown) => {
+      const result = await setRecord(scope, key, value);
+      if (
+        blockRelease &&
+        scope === KV.imageRefs &&
+        key === saved.filePath &&
+        typeof value === "object"
+      ) {
+        blockRelease = false;
+        markStateWriteStarted();
+        await stateWriteBlocked;
+      }
+      return result;
+    });
+    const releaseId = "release:concurrent";
+    const releasing = releaseImageRef(
+      localKv,
+      localSdk,
+      saved.filePath,
+      releaseId,
+    );
+    await stateWriteStarted;
+    const reacquiring = saveImageAndIncrementRef(localKv, imageData);
+    releaseStateWrite();
+    await Promise.all([releasing, reacquiring]);
+
+    expect(existsSync(saved.filePath)).toBe(true);
+    expect(await getImageRefCount(localKv, saved.filePath)).toBe(1);
+
+    await finalizeImageRefRelease(localKv, saved.filePath, releaseId);
+    await releaseImageRef(
+      localKv,
+      localSdk,
+      saved.filePath,
+      "release:cleanup",
+    );
+    await finalizeImageRefRelease(
+      localKv,
+      saved.filePath,
+      "release:cleanup",
+    );
+  });
+
   it("should increment and decrement ref counts correctly with deletion parity", async () => {
     const localKv = mockKV() as any;
     const localTrigger = vi.fn().mockResolvedValue(undefined);

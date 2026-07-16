@@ -8,6 +8,8 @@ import { logger } from "../logger.js";
 import { isAfter } from "../state/timestamp-compare.js";
 import { getEnvVar } from "../config.js";
 import { drainPendingCompression } from "./pending-compression.js";
+import { drainPendingImageReleases } from "./image-owner.js";
+import { withImageOwnershipReadLock } from "./observation-lock.js";
 
 const DEFAULT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_SWEEP_CONCURRENCY = 4;
@@ -131,6 +133,8 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
             ? new Set(data.sessionIds)
             : null;
 
+        if (!dryRun) await drainPendingImageReleases(sdk, kv);
+
         const now = Date.now();
         const swept: string[] = [];
         const checkpointed: string[] = [];
@@ -222,9 +226,11 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
               }
               if (rawPayloadsError) throw rawPayloadsError;
 
-              const drain = await drainPendingCompression(sdk, kv, session.id, {
-                rawPayloads: rawPayloadsBySession.get(session.id) ?? [],
-              });
+              const drain = await withImageOwnershipReadLock(() =>
+                drainPendingCompression(sdk, kv, session.id, {
+                  rawPayloads: rawPayloadsBySession.get(session.id) ?? [],
+                }),
+              );
               if (drain.remainingIds.length > 0) {
                 throw new Error(
                   `pending_compression_failed: ${drain.remainingIds.length} observation(s) remain`,

@@ -335,7 +335,11 @@ export class HybridSearch {
               .catch(() => null)
           : null;
         if (obs) {
-          return { observation: obs, sessionId: sessionId || r.sessionId };
+          return {
+            observation: obs,
+            ownerScope: "observation" as const,
+            sessionId: sessionId || r.sessionId,
+          };
         }
         // Fallback: indexed entry may originate from mem::remember, which
         // writes to KV.memories with a synthetic sessionId ("memory" or the
@@ -347,6 +351,7 @@ export class HybridSearch {
         return mem
           ? {
               observation: memoryToObservation(mem),
+              ownerScope: "memory" as const,
               sessionId: sessionId || r.sessionId,
             }
           : null;
@@ -358,6 +363,7 @@ export class HybridSearch {
       if (result) {
         enriched.push({
           observation: result.observation,
+          ownerScope: result.ownerScope,
           bm25Score: sliced[i].bm25Score,
           vectorScore: sliced[i].vectorScore,
           graphScore: sliced[i].graphScore,

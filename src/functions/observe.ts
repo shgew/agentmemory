@@ -10,7 +10,13 @@ import { buildSyntheticCompression } from "./compress-synthetic.js";
 import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
 import { isAfter } from "../state/timestamp-compare.js";
 import { logger } from "../logger.js";
-import { saveImageToDisk } from "../utils/image-store.js";
+import {
+  clearPendingCompression,
+  storeRawObservation,
+} from "./raw-observations.js";
+import {
+  withObservationSessionOwnerLock,
+} from "./image-owner.js";
 
 const postCompletionWarned = new Set<string>();
 const NOISE_HOOK_TYPES = new Set([
@@ -245,7 +251,7 @@ export function registerObserveFunction(
 
       const pendingImageData = extractedImage;
 
-      return withKeyedLock(`obs:${payload.sessionId}`, async () => {
+      const captureObservation = async () => {
         // The existing session row is the source of truth for both agentId
         // (even when undefined) and the observation-count cap. Env AGENT_ID
         // only applies when no row exists yet; otherwise an unscoped session
@@ -284,10 +290,12 @@ export function registerObserveFunction(
         }
 
         if (pendingImageData && (pendingImageData.startsWith("data:image/") || pendingImageData.startsWith("iVBORw0KGgo") || pendingImageData.startsWith("/9j/"))) {
-          const { filePath, bytesWritten } = await saveImageToDisk(pendingImageData);
+          const { saveImageAndIncrementRef } = await import("./image-refs.js");
+          const { filePath, bytesWritten } = await saveImageAndIncrementRef(
+            kv,
+            pendingImageData,
+          );
           raw.imageData = filePath;
-          const { incrementImageRef } = await import("./image-refs.js");
-          await incrementImageRef(kv, filePath);
           sdk.trigger({
             function_id: "mem::disk-size-delta",
             payload: { deltaBytes: bytesWritten },
@@ -308,7 +316,7 @@ export function registerObserveFunction(
 
         try {
 
-          await kv.set(KV.rawPayloads, obsId, raw);
+          await storeRawObservation(kv, raw);
 
         } catch (error) {
           if (raw.imageData) {
@@ -437,6 +445,7 @@ export function registerObserveFunction(
               observationId: obsId,
               sessionId: payload.sessionId,
               raw,
+              requireStoredRaw: true,
             },
             action: TriggerAction.Void(),
           });
@@ -453,6 +462,11 @@ export function registerObserveFunction(
             synthetic.sessionId,
             synthetic.title + " " + (synthetic.narrative || ""),
             { kind: "synthetic", logId: synthetic.id },
+          );
+          await clearPendingCompression(
+            kv,
+            payload.sessionId,
+            synthetic.id,
           );
           publishToStreams(sdk, obsId, payload.sessionId, [
             {
@@ -496,7 +510,11 @@ export function registerObserveFunction(
           }
         }
         return { observationId: obsId };
-      });
+      };
+      return withObservationSessionOwnerLock(
+        payload.sessionId,
+        captureObservation,
+      );
     },
   );
 }

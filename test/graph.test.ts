@@ -1070,6 +1070,8 @@ describe("getGraphChunkSize / getGraphChunkConcurrency", () => {
     expect(getGraphChunkSize()).toBe(150);
     process.env.GRAPH_CHUNK_SIZE = "-5";
     expect(getGraphChunkSize()).toBe(150);
+    process.env.GRAPH_CHUNK_SIZE = "1.5";
+    expect(getGraphChunkSize()).toBe(150);
   });
   it("getGraphChunkConcurrency defaults to 6 when unset", () => {
     expect(getGraphChunkConcurrency()).toBe(6);
@@ -1078,6 +1080,8 @@ describe("getGraphChunkSize / getGraphChunkConcurrency", () => {
     process.env.GRAPH_CHUNK_CONCURRENCY = "3";
     expect(getGraphChunkConcurrency()).toBe(3);
     process.env.GRAPH_CHUNK_CONCURRENCY = "3 workers";
+    expect(getGraphChunkConcurrency()).toBe(6);
+    process.env.GRAPH_CHUNK_CONCURRENCY = "1.5";
     expect(getGraphChunkConcurrency()).toBe(6);
   });
 });

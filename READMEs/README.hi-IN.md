@@ -158,7 +158,7 @@ agentmemory किसी भी ऐसे एजेंट के साथ क�
 <td align="center" width="12.5%">
 <a href="https://github.com/opencode-ai/opencode"><img src="https://github.com/opencode-ai.png?size=120" alt="OpenCode" width="48" height="48" /></a><br/>
 <strong>OpenCode</strong><br/>
-<sub>40 capture paths + MCP + plugin</sub>
+<sub>41 capture paths + MCP + plugin</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/cline/cline"><img src="https://github.com/cline.png?size=120" alt="Cline" width="48" height="48" /></a><br/>
@@ -551,7 +551,7 @@ agentmemory entry `mcpServers` shape का उपयोग करने वा�
 | **Codex CLI (केवल MCP)** | `.codex/config.toml` | TOML shape: `codex mcp add agentmemory -- npx -y @agentmemory/mcp`, या manually `[mcp_servers.agentmemory]` जोड़ें। |
 | **Codex CLI (पूर्ण plugin)** | Codex plugin marketplace | `codex plugin marketplace add rohitg00/agentmemory` फिर `codex plugin add agentmemory@agentmemory`। MCP + 7 lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, SubagentStart, SubagentStop, Stop) + 16 skills register करता है। `agentmemory connect codex --with-hooks` केवल तब चलाएँ जब `/hooks` agentmemory plugin source को list न करे। |
 | **OpenCode (केवल MCP)** | `opencode.json` | अलग shape — top-level `mcp` key, command array के रूप में: `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`। |
-| **OpenCode (पूर्ण plugin)** | `plugin/opencode/` | 40 capture paths और 16 skills। One-shot install: `agentmemory connect opencode --with-plugin`। OpenCode `plugins/` directory से file को auto-discover करता है, इसलिए `plugin` array की ज़रूरत नहीं है। पूरी table के लिए [`plugin/opencode/README.md`](../plugin/opencode/README.md) देखें। |
+| **OpenCode (पूर्ण plugin)** | `plugin/opencode/` | 41 capture paths और 16 skills। One-shot install: `agentmemory connect opencode --with-plugin`। OpenCode `plugins/` directory से file को auto-discover करता है, इसलिए `plugin` array की ज़रूरत नहीं है। पूरी table के लिए [`plugin/opencode/README.md`](../plugin/opencode/README.md) देखें। |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | [`integrations/pi`](../integrations/pi/) copy करें और pi restart करें। |
 | **Hermes Agent** | `~/.hermes/config.yaml` | गहरे [memory provider plugin](../integrations/hermes/) का उपयोग `memory.provider: agentmemory` के साथ करें। |
 | **Qwen Code** | `~/.qwen/settings.json` | `agentmemory connect qwen` standard `mcpServers` block लिखता है। Hook payload Claude Code के साथ field-compatible है, इसलिए मौजूदा 12-hook scripts modification के बिना काम करते हैं — उन्हें उसी `settings.json` के `hooks` section के माध्यम से जोड़ें। |
