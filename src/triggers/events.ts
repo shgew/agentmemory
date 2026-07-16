@@ -1,5 +1,10 @@
 import { TriggerAction, type ISdk } from "iii-sdk";
-import type { CompressedObservation, HookPayload, Session } from "../types.js";
+import type {
+  CompressedObservation,
+  HookPayload,
+  Session,
+  SessionSummary,
+} from "../types.js";
 import { KV, STREAM } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { isReflectEnabled } from "../functions/slots.js";
@@ -145,17 +150,28 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
     // summarize on each one is the O(N^2) drain that lets the consolidation
     // backlog outpace intake. The final summary is produced on session stop
     // or end; until then the graph and raw observations stay current.
-    const shouldSummarize = reason !== "idle-checkpoint";
+    let shouldSummarize = reason !== "idle-checkpoint";
     const session = summaryOnly === undefined
       ? await kv.get<Session>(KV.sessions, sessionId)
       : null;
     const runsFullConsolidation = !(summaryOnly ?? Boolean(session?.parentSessionId));
-    const graphPromise: Promise<void> = runsFullConsolidation && isGraphExtractionEnabled()
+    const runsGraphExtraction = runsFullConsolidation && isGraphExtractionEnabled();
+    const observationsPromise = shouldSummarize || runsGraphExtraction
+      ? kv.list<CompressedObservation>(KV.observations(sessionId))
+      : Promise.resolve<CompressedObservation[]>([]);
+    let expectedSummaryObservationCount: number | null = null;
+    if (shouldSummarize) {
+      const [existingSummary, observations] = await Promise.all([
+        kv.get<SessionSummary>(KV.summaries, sessionId),
+        observationsPromise,
+      ]);
+      expectedSummaryObservationCount = observations.length;
+      shouldSummarize = existingSummary?.observationCount !== observations.length;
+    }
+    const graphPromise: Promise<void> = runsGraphExtraction
       ? (async () => {
           try {
-            const observations = await kv.list<CompressedObservation>(
-              KV.observations(sessionId),
-            );
+            const observations = await observationsPromise;
             const compressed = observations.filter((o) => o.title);
             if (compressed.length > 0) {
               await sdk.trigger({
@@ -192,7 +208,10 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
           (summary as { success?: boolean }).success === false
         ) {
           const error = (summary as { error?: string }).error ?? "unknown";
-          if (error === "no_provider" || error === "no_observations") {
+          if (
+            reason !== "sweep-finalize" &&
+            (error === "no_provider" || error === "no_observations")
+          ) {
             logger.info("Summarize skipped as no-op, pipeline continues", {
               sessionId,
               error,
@@ -206,6 +225,18 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
       } catch (err) {
         summarizeError =
           err instanceof Error ? err : new Error(errorMessage(err));
+      }
+    }
+
+    if (reason === "sweep-finalize" && !summarizeError) {
+      const summary = await kv.get<SessionSummary>(KV.summaries, sessionId);
+      if (
+        !summary ||
+        summary.observationCount !== expectedSummaryObservationCount
+      ) {
+        summarizeError = new Error(
+          "sweep-finalize did not persist a fresh session summary",
+        );
       }
     }
 
