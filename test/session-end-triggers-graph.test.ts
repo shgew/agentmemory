@@ -57,6 +57,12 @@ describe("api::session::end → event::session::ended → event::session::stoppe
 describe("api::graph-build endpoint (#666)", () => {
   const api = readFileSync("src/triggers/api.ts", "utf-8");
 
+  it("rejects graph backfill when graph extraction is disabled", () => {
+    expect(api).toMatch(
+      /api::graph-build[\s\S]*?if \(!isGraphExtractionEnabled\(\)\) return graphDisabledResponse\(\);[\s\S]*?kv\.list<Session>\(KV\.sessions\)/,
+    );
+  });
+
   it("registers api::graph-build function", () => {
     expect(api).toMatch(/registerFunction\("api::graph-build"/);
   });
@@ -96,6 +102,16 @@ describe("api::graph-build endpoint (#666)", () => {
   it("imports getGraphExtractTimeoutMs from functions/graph.js", () => {
     expect(api).toMatch(
       /import\s*\{\s*getGraphExtractTimeoutMs\s*\}\s*from\s*"\.\.\/functions\/graph\.js"/,
+    );
+  });
+});
+
+describe("api::graph-extract endpoint", () => {
+  const api = readFileSync("src/triggers/api.ts", "utf-8");
+
+  it("rejects direct extraction when graph extraction is disabled", () => {
+    expect(api).toMatch(
+      /api::graph-extract[\s\S]*?if \(!isGraphExtractionEnabled\(\)\) return graphDisabledResponse\(\);[\s\S]*?function_id:\s*"mem::graph-extract"/,
     );
   });
 });

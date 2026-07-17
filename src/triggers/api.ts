@@ -1960,6 +1960,7 @@ export function registerApiTriggers(
     async (req: ApiRequest<{ observations: unknown[] }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      if (!isGraphExtractionEnabled()) return graphDisabledResponse();
       if (
         !Array.isArray(req.body?.observations) ||
         req.body.observations.length === 0
@@ -1995,6 +1996,7 @@ export function registerApiTriggers(
     async (req: ApiRequest<{ batchSize?: number }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      if (!isGraphExtractionEnabled()) return graphDisabledResponse();
       const batchSize = Math.max(
         1,
         Math.min(100, Number((req.body as { batchSize?: number })?.batchSize) || 25),
