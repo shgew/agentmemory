@@ -51,7 +51,7 @@ export interface PendingCompressionDrainOptions {
 async function loadPendingRawObservations(
   kv: StateKV,
   sessionId: string,
-): Promise<RawObservation[]> {
+): Promise<Map<string, RawObservation>> {
   const entries = await kv.list<PendingCompressionEntry>(
     KV.pendingCompression(sessionId),
   );
@@ -70,8 +70,10 @@ async function loadPendingRawObservations(
       }),
     ),
   );
-  return rows.flatMap(({ raw }) =>
-    raw && raw.sessionId === sessionId ? [raw] : [],
+  return new Map(
+    rows.flatMap(({ entry, raw }): [string, RawObservation][] =>
+      raw && raw.sessionId === sessionId ? [[entry.id, raw]] : [],
+    ),
   );
 }
 
@@ -125,7 +127,8 @@ export async function drainPendingCompression(
         )
         .map((observation) => observation.id),
     );
-    const indexedRawPayloads = await loadPendingRawObservations(kv, sessionId);
+    const pendingRawPayloads = await loadPendingRawObservations(kv, sessionId);
+    const indexedRawPayloads = [...pendingRawPayloads.values()];
     const rawPayloads = options?.rawPayloads
       ? [
           ...new Map(
@@ -138,8 +141,8 @@ export async function drainPendingCompression(
           ).values(),
         ]
       : indexedRawPayloads;
-    const completedBeforeDrain = rawPayloads.filter((raw) =>
-      compressedIds.has(raw.id),
+    const completedBeforeDrain = rawPayloads.filter(
+      (raw) => pendingRawPayloads.has(raw.id) && compressedIds.has(raw.id),
     );
     await Promise.all(
       completedBeforeDrain.map((raw) =>
@@ -149,7 +152,11 @@ export async function drainPendingCompression(
     const pending = rawPayloads.filter((raw) => !compressedIds.has(raw.id));
 
     if (pending.length === 0) {
-      return { attempted: 0, completed: 0, remainingIds: [] };
+      return {
+        attempted: 0,
+        completed: completedBeforeDrain.length,
+        remainingIds: [],
+      };
     }
 
     await Promise.all(pending.map((raw) => markPendingCompression(kv, raw)));
@@ -248,7 +255,7 @@ export async function drainPendingCompression(
 
     return {
       attempted: pending.length,
-      completed: completedIds.length,
+      completed: completedBeforeDrain.length + completedIds.length,
       remainingIds,
     };
   });

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -45,6 +45,15 @@ function mockSdk() {
   };
 }
 
+function registeredFunction(
+  sdk: ReturnType<typeof mockSdk>,
+  id: string,
+): Function {
+  const handler = sdk.getFunction(id);
+  if (!handler) throw new Error(`${id} was not registered`);
+  return handler;
+}
+
 function session(id: string, updatedSecond: number): Session {
   return {
     id,
@@ -84,6 +93,82 @@ describe("api::sessions limit + recency", () => {
     sdk = mockSdk();
     kv = mockKV();
     registerApiTriggers(sdk as never, kv as never);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("rejects scoped reads when isolated identity is missing", async () => {
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    vi.stubEnv("AGENT_ID", "");
+    await kv.set(KV.sessions, "private-session", session("private-session", 1));
+    await kv.set(KV.memories, "private-memory", {
+      id: "private-memory",
+      content: "private",
+    });
+    await kv.set(KV.observations("private-session"), "private-observation", {
+      id: "private-observation",
+      sessionId: "private-session",
+    });
+
+    const request = { body: undefined, headers: {}, query_params: {} };
+    const sessions = await registeredFunction(sdk, "api::sessions")(request);
+    const memories = await registeredFunction(sdk, "api::memories")(request);
+    const observations = await registeredFunction(sdk, "api::observations")({
+      ...request,
+      query_params: { sessionId: "private-session" },
+    });
+    const search = await registeredFunction(sdk, "api::search")({
+      ...request,
+      body: { query: "private" },
+    });
+    const smartSearch = await registeredFunction(sdk, "api::smart-search")({
+      ...request,
+      body: { query: "private" },
+    });
+
+    for (const response of [
+      sessions,
+      memories,
+      observations,
+      search,
+      smartSearch,
+    ]) {
+      expect(response).toEqual({
+        status_code: 403,
+        body: {
+          error: "agent identity is required when agent scope is isolated",
+        },
+      });
+    }
+  });
+
+  it("rejects scoped writes when isolated identity is missing", async () => {
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    vi.stubEnv("AGENT_ID", "");
+
+    const start = await registeredFunction(sdk, "api::session::start")({
+      body: { sessionId: "new", project: "project", cwd: "/tmp/project" },
+      headers: {},
+      query_params: {},
+    });
+    const remember = await registeredFunction(sdk, "api::remember")({
+      body: { content: "private" },
+      headers: {},
+      query_params: {},
+    });
+
+    for (const response of [start, remember]) {
+      expect(response).toEqual({
+        status_code: 403,
+        body: {
+          error: "agent identity is required when agent scope is isolated",
+        },
+      });
+    }
+    expect(await kv.get(KV.sessions, "new")).toBeNull();
+    expect(sdk.trigger).not.toHaveBeenCalled();
   });
 
   it("defaults to all sessions, most-recent first", async () => {

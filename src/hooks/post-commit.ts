@@ -21,6 +21,21 @@ function authHeaders(): Record<string, string> {
   return h;
 }
 
+function sanitizeRepoUrl(repo: string): string {
+  try {
+    const url = new URL(repo);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return repo
+      .replace(/^((?:[a-z][a-z\d+.-]*:\/\/)?)[^@/\s]+@/i, "$1")
+      .replace(/[?#][\s\S]*$/, "");
+  }
+}
+
 async function git(args: string[], cwd: string): Promise<string | null> {
   try {
     const { stdout } = await exec("git", args, { cwd, timeout: 1500 });
@@ -76,7 +91,7 @@ async function main() {
     sessionId,
     sha,
     branch: branch || undefined,
-    repo: repo || undefined,
+    repo: repo ? sanitizeRepoUrl(repo) : undefined,
     message: message || undefined,
     author: author || undefined,
     authoredAt: authoredAt || undefined,

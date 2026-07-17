@@ -11,6 +11,7 @@ import {
   rebuildIndex,
   registerSearchFunction,
   setEmbeddingProvider,
+  setIndexPersistence,
   setVectorIndex,
   vectorIndexAddGuarded,
   vectorIndexRemove,
@@ -68,6 +69,7 @@ describe("mem::search", () => {
   beforeEach(async () => {
     sdk = mockSdk();
     kv = mockKV();
+    setIndexPersistence(null);
     registerSearchFunction(sdk as never, kv as never);
 
     const session: Session = {
@@ -84,6 +86,7 @@ describe("mem::search", () => {
       id: "obs_a",
       sessionId: "ses_1",
       timestamp: "2026-01-01T00:00:00Z",
+      sourceType: "post_tool_use",
       type: "decision",
       title: "Auth middleware decision",
       subtitle: "JWT strategy",
@@ -97,6 +100,7 @@ describe("mem::search", () => {
       id: "obs_b",
       sessionId: "ses_1",
       timestamp: "2026-01-02T00:00:00Z",
+      sourceType: "post_tool_use",
       type: "file_edit",
       title: "UI button styling",
       facts: ["Updated primary button color"],
@@ -155,6 +159,74 @@ describe("mem::search", () => {
     expect(typeof result.text).toBe("string");
     expect(result.results.length).toBeLessThanOrEqual(2);
     expect(result.truncated).toBe(true);
+  });
+
+  it("excludes observations whose missing session prevents project verification", async () => {
+    const orphaned: CompressedObservation = {
+      id: "obs_orphaned",
+      sessionId: "ses_missing",
+      timestamp: "2026-01-03T00:00:00Z",
+      sourceType: "post_tool_use",
+      type: "decision",
+      title: "Orphaned project secret",
+      facts: [],
+      narrative: "This observation no longer has a session record.",
+      concepts: ["orphaned"],
+      files: [],
+      importance: 5,
+    };
+    await kv.set(KV.observations(orphaned.sessionId), orphaned.id, orphaned);
+    getSearchIndex().add(orphaned);
+
+    const result = (await sdk.trigger("mem::search", {
+      query: "orphaned project secret",
+      project: "demo",
+      format: "compact",
+    })) as { results: Array<{ obsId: string }> };
+
+    expect(result.results.map((entry) => entry.obsId)).not.toContain(orphaned.id);
+  });
+
+  it("schedules persistence after live BM25 and vector mutations", async () => {
+    const persistence = {
+      scheduleSave: vi.fn(),
+      save: async () => {},
+    };
+    const live: CompressedObservation = {
+      id: "obs_persisted",
+      sessionId: "ses_1",
+      timestamp: "2026-01-03T00:00:00Z",
+      sourceType: "post_tool_use",
+      type: "decision",
+      title: "Persisted live mutation",
+      facts: [],
+      narrative: "Live indexes need a durable snapshot.",
+      concepts: [],
+      files: [],
+      importance: 5,
+    };
+    setIndexPersistence(persistence);
+    getSearchIndex().add(live);
+    setVectorIndex(new VectorIndex());
+    setEmbeddingProvider({
+      name: "test",
+      dimensions: 3,
+      embed: async () => new Float32Array([0.1, 0.2, 0.3]),
+      embedBatch: async (texts) =>
+        texts.map(() => new Float32Array([0.1, 0.2, 0.3])),
+    });
+
+    await vectorIndexAddGuarded(live.id, live.sessionId, live.narrative, {
+      kind: "observation",
+      logId: live.id,
+    });
+    vectorIndexRemove(live.id);
+
+    expect(persistence.scheduleSave).toHaveBeenCalledTimes(3);
+
+    setVectorIndex(null);
+    setEmbeddingProvider(null);
+    setIndexPersistence(null);
   });
 
   it("rejects invalid format values", async () => {
@@ -356,16 +428,24 @@ describe("mem::search", () => {
 
     const rebuilding = rebuildIndex(blockedKv as never);
     await started;
-    const emptyResult = (await pendingSdk.trigger("mem::search", {
+    let coldSearchResolved = false;
+    const emptySearch = pendingSdk
+      .trigger("mem::search", {
       query: "absent during rebuild",
       format: "compact",
-    })) as { results: Array<{ obsId: string }> };
-    expect(emptyResult.results).toEqual([]);
+      })
+      .then((result) => {
+        coldSearchResolved = true;
+        return result as { results: Array<{ obsId: string }> };
+      });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(coldSearchResolved).toBe(false);
 
     const live: CompressedObservation = {
       id: "obs_live_pending",
       sessionId: "ses_1",
       timestamp: "2026-01-03T00:00:00Z",
+      sourceType: "post_tool_use",
       type: "decision",
       title: "Pending rebuild sentinel",
       facts: [],
@@ -386,10 +466,13 @@ describe("mem::search", () => {
 
     releaseList?.();
     await rebuilding;
+    await expect(emptySearch).resolves.toMatchObject({
+      results: [expect.objectContaining({ obsId: live.id })],
+    });
     expect(isIndexRebuildPending()).toBe(false);
   });
 
-  it("does not wait for a cold rebuild", async () => {
+  it("waits for a cold rebuild before returning search results", async () => {
     let releaseList = () => {};
     const listBlocked = new Promise<void>((resolve) => {
       releaseList = resolve;
@@ -413,7 +496,7 @@ describe("mem::search", () => {
     getSearchIndex().clear();
     let searchResolved = false;
     const searching = coldSdk
-      .trigger("mem::search", { query: "cold", format: "compact" })
+      .trigger("mem::search", { query: "auth", format: "compact" })
       .then((result) => {
         searchResolved = true;
         return result;
@@ -422,13 +505,60 @@ describe("mem::search", () => {
     await new Promise<void>((resolve) => setImmediate(resolve));
 
     try {
-      expect(searchResolved).toBe(true);
+      expect(searchResolved).toBe(false);
     } finally {
       releaseList();
     }
 
-    await expect(searching).resolves.toMatchObject({ results: [] });
+    await expect(searching).resolves.toMatchObject({
+      results: [expect.objectContaining({ obsId: "obs_a" })],
+    });
     await vi.waitFor(() => expect(isIndexRebuildPending()).toBe(false));
+  });
+
+  it("preserves healthy vectors when an embedding rebuild becomes partial", async () => {
+    const extras: CompressedObservation[] = Array.from({ length: 31 }, (_, index) => ({
+      id: `obs_extra_${index}`,
+      sessionId: "ses_1",
+      timestamp: "2026-01-03T00:00:00Z",
+      sourceType: "post_tool_use",
+      type: "decision",
+      title: `Extra rebuild observation ${index}`,
+      facts: [],
+      narrative: "Requires an embedding during rebuild.",
+      concepts: [],
+      files: [],
+      importance: 5,
+    }));
+    await Promise.all(
+      extras.map((observation) =>
+        kv.set(KV.observations(observation.sessionId), observation.id, observation),
+      ),
+    );
+    const vectors = new VectorIndex();
+    vectors.add("obs_healthy", "ses_1", new Float32Array([1, 0, 0]));
+    setVectorIndex(vectors);
+    let embedBatchCalls = 0;
+    setEmbeddingProvider({
+      name: "partial",
+      dimensions: 3,
+      embed: async () => new Float32Array([0, 1, 0]),
+      embedBatch: async (texts) => {
+        embedBatchCalls++;
+        if (embedBatchCalls === 2) throw new Error("embedding batch failed");
+        return texts.map(() => new Float32Array([0, 1, 0]));
+      },
+    });
+
+    await rebuildIndex(kv as never);
+
+    const serialized = getVectorIndex()!.serialize();
+    expect(embedBatchCalls).toBe(2);
+    expect(serialized).toContain('"obs_healthy"');
+    expect(serialized).not.toContain('"obs_extra_0"');
+
+    setVectorIndex(null);
+    setEmbeddingProvider(null);
   });
 
   it("leaves live indexes untouched when strict rebuild fails", async () => {

@@ -16,6 +16,18 @@ function authHeaders() {
 	if (SECRET) h["Authorization"] = `Bearer ${SECRET}`;
 	return h;
 }
+function sanitizeRepoUrl(repo) {
+	try {
+		const url = new URL(repo);
+		url.username = "";
+		url.password = "";
+		url.search = "";
+		url.hash = "";
+		return url.toString();
+	} catch {
+		return repo.replace(/^((?:[a-z][a-z\d+.-]*:\/\/)?)[^@/\s]+@/i, "$1").replace(/[?#][\s\S]*$/, "");
+	}
+}
 async function git(args, cwd) {
 	try {
 		const { stdout } = await exec("git", args, {
@@ -79,7 +91,7 @@ async function main() {
 		sessionId,
 		sha,
 		branch: branch || void 0,
-		repo: repo || void 0,
+		repo: repo ? sanitizeRepoUrl(repo) : void 0,
 		message: message || void 0,
 		author: author || void 0,
 		authoredAt: authoredAt || void 0,

@@ -4,6 +4,9 @@ export const KV = {
   sessions: "mem:sessions",
   observations: (sessionId: string) => `mem:obs:${sessionId}`,
   rawPayloads: "mem:raw-payloads",
+  rawPayloadsBySession: (sessionId: string) =>
+    `mem:raw-payloads-by-session:${sessionId}`,
+  rawPayloadsBySessionMigration: "mem:raw-payloads-by-session-migration",
   pendingCompression: (sessionId: string) =>
     `mem:pending-compression:${sessionId}`,
   imageReleases: "mem:image-releases",

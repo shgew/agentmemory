@@ -52,6 +52,16 @@ export interface PendingCompressionEntry {
   sessionId: string;
 }
 
+export interface RawPayloadSessionIndexEntry {
+  id: string;
+  sessionId: string;
+}
+
+export interface RawPayloadSessionIndexMigration {
+  completedAt: string;
+  indexed: number;
+}
+
 export interface PendingImageRelease {
   id: string;
   refs: string[];
@@ -744,7 +754,8 @@ export interface AuditEntry {
     | "session_sweep"
     | "session_checkpoint"
     | "vector_index_swap"
-    | "slot_seed_reconcile";
+    | "slot_seed_reconcile"
+    | "raw_payload_session_index_backfill";
   userId?: string;
   functionId: string;
   targetIds: string[];

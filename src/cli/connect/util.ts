@@ -1,13 +1,16 @@
 import {
+  chmodSync,
   constants,
   existsSync,
+  mkdtempSync,
   mkdirSync,
   readFileSync,
+  rmSync,
   writeFileSync,
   copyFileSync,
   renameSync,
 } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { homedir } from "node:os";
 import * as p from "@clack/prompts";
 
@@ -65,7 +68,8 @@ export function backupsDir(): string {
 
 export function ensureBackupsDir(): string {
   const dir = backupsDir();
-  mkdirSync(dir, { recursive: true });
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
   return dir;
 }
 
@@ -88,6 +92,7 @@ export function backupFile(
     );
     try {
       copyFileSync(sourcePath, target, constants.COPYFILE_EXCL);
+      chmodSync(target, 0o600);
       return target;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -389,9 +394,22 @@ export function upsertJsoncNestedPropertyAtomic(
 
 function writeTextAtomic(path: string, value: string): void {
   mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(tmp, value, "utf-8");
-  renameSync(tmp, path);
+  const temporaryDirectory = mkdtempSync(
+    join(dirname(path), `.${basename(path)}.tmp-`),
+  );
+  try {
+    chmodSync(temporaryDirectory, 0o700);
+    const temporaryPath = join(temporaryDirectory, "config");
+    writeFileSync(temporaryPath, value, {
+      encoding: "utf-8",
+      flag: "wx",
+      mode: 0o600,
+    });
+    chmodSync(temporaryPath, 0o600);
+    renameSync(temporaryPath, path);
+  } finally {
+    rmSync(temporaryDirectory, { recursive: true, force: true });
+  }
 }
 
 export function writeJsonAtomic(path: string, value: unknown): void {

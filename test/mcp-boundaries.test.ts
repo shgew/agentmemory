@@ -35,7 +35,9 @@ function createHarness() {
   registerMcpEndpoints(sdk as never, kv as never);
   const call = functions.get("mcp::tools::call");
   if (!call) throw new Error("mcp::tools::call was not registered");
-  return { call, sdk, seed };
+  const prompt = functions.get("mcp::prompts::get");
+  if (!prompt) throw new Error("mcp::prompts::get was not registered");
+  return { call, prompt, sdk, seed };
 }
 
 function request(name: string, args: Record<string, unknown>) {
@@ -172,5 +174,37 @@ describe("MCP boundaries", () => {
       function_id: "mem::remember",
       payload: expect.objectContaining({ agentId: "agent-a" }),
     });
+  });
+
+  it("rejects agent-scoped tools and prompts when isolated identity is missing", async () => {
+    const { call, prompt, sdk, seed } = createHarness();
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    vi.stubEnv("AGENT_ID", "");
+    seed(KV.sessions, "foreign", session("foreign", "agent-b"));
+
+    const responses = await Promise.all([
+      call(request("memory_recall", { query: "private" })),
+      call(request("memory_smart_search", { query: "private" })),
+      call(request("memory_sessions", {})),
+      call(request("memory_save", { content: "private" })),
+      prompt({
+        body: {
+          name: "recall_context",
+          arguments: { task_description: "private" },
+        },
+        headers: {},
+        query_params: {},
+      }),
+    ]);
+
+    for (const response of responses) {
+      expect(response).toEqual({
+        status_code: 403,
+        body: {
+          error: "agent identity is required when agent scope is isolated",
+        },
+      });
+    }
+    expect(sdk.trigger).not.toHaveBeenCalled();
   });
 });

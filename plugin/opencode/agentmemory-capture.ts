@@ -1,8 +1,10 @@
 /// <reference types="node" />
-import { basename, resolve } from "node:path";
+import { existsSync, linkSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, join, resolve } from "node:path";
 import { env } from "node:process";
 import { execFileSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { Plugin } from "@opencode-ai/plugin";
 import type { Event as EventV1, Part } from "@opencode-ai/sdk";
 import type { Event as EventV2 } from "@opencode-ai/sdk/v2";
@@ -26,7 +28,7 @@ type TodoPayload = { content?: string; priority?: string; status?: string };
 type QuestionOptionPayload = { label?: unknown; description?: unknown };
 type QuestionPayload = { question?: unknown; header?: unknown; options?: readonly QuestionOptionPayload[] };
 type QuestionToolPayload = { callID?: string; messageID?: string };
-const API = env.AGENTMEMORY_URL || "http://localhost:3111";
+const API = normalizeApiUrl(env.AGENTMEMORY_URL || "http://localhost:3111");
 const FILE_TOOLS = new Set(["read", "write", "edit", "glob", "grep"]);
 const FILE_PATH_KEYS: Record<string, readonly string[]> = {
   read: ["filePath", "file_path", "path", "file"],
@@ -39,6 +41,8 @@ const MAX_STASHED_FILES = 20;
 
 const DEBUG = env.OPENCODE_AGENTMEMORY_DEBUG === "1";
 const SECRET = env.AGENTMEMORY_SECRET || "";
+const PENDING_COMMIT_OUTBOX_VERSION = 1;
+const OUTBOX_DESTINATION_FINGERPRINT = destinationFingerprint(API, SECRET);
 
 const TIMEOUT_MS = Number(env.OPENCODE_AGENTMEMORY_TIMEOUT_MS) || 5000;
 
@@ -82,7 +86,136 @@ type QueuedCommit = {
   readonly branch?: string;
 };
 
+type PendingCommitPost = {
+  readonly version: typeof PENDING_COMMIT_OUTBOX_VERSION;
+  readonly destinationFingerprint: string;
+  readonly sessionId: string;
+  readonly metadata: GitCommitMetadata;
+  readonly order?: number;
+};
+
+type PendingCommitFile = {
+  readonly path: string;
+  readonly entry: PendingCommitPost;
+};
+
 const GIT_TIMEOUT_MS = 500;
+
+function pendingCommitOutboxDir(): string {
+  const stateDir = env.OPENCODE_AGENTMEMORY_STATE_DIR?.trim() || join(homedir(), ".agentmemory");
+  return join(stateDir, "opencode-pending-commits");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeApiUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
+    url.pathname = url.pathname.replace(/\/+$/, "");
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return value.trim().replace(/[?#].*$/, "").replace(/\/+$/, "");
+  }
+}
+
+function credentialIdentity(secret: string): string {
+  return createHash("sha256").update(secret).digest("hex");
+}
+
+function destinationFingerprint(apiUrl: string, secret: string): string {
+  return createHash("sha256")
+    .update(`agentmemory-opencode-outbox-v${PENDING_COMMIT_OUTBOX_VERSION}\u0000${apiUrl}\u0000${credentialIdentity(secret)}`)
+    .digest("hex");
+}
+
+function isPendingCommitPost(value: unknown): value is PendingCommitPost {
+  if (!isRecord(value)) return false;
+  const entry = value;
+  const metadata = entry["metadata"];
+  if (
+    entry["version"] !== PENDING_COMMIT_OUTBOX_VERSION ||
+    typeof entry["destinationFingerprint"] !== "string" ||
+    typeof entry["sessionId"] !== "string" ||
+    !isRecord(metadata)
+  ) {
+    return false;
+  }
+  const commit = metadata;
+  return typeof commit["sha"] === "string" &&
+    (commit["branch"] === undefined || typeof commit["branch"] === "string") &&
+    (commit["repo"] === undefined || typeof commit["repo"] === "string") &&
+    typeof commit["message"] === "string" &&
+    typeof commit["author"] === "string" &&
+    typeof commit["authoredAt"] === "string" &&
+    (entry["order"] === undefined || typeof entry["order"] === "number") &&
+    Array.isArray(commit["files"]) && commit["files"].every((file) => typeof file === "string");
+}
+
+function errorHasCode(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === code;
+}
+
+function pendingCommitOutboxPath(entry: PendingCommitPost): string {
+  const key = `${entry.destinationFingerprint}\u0000${entry.sessionId}\u0000${entry.metadata.sha}`;
+  return join(pendingCommitOutboxDir(), `${createHash("sha256").update(key).digest("hex")}.json`);
+}
+
+function readPendingCommitOutbox(): PendingCommitFile[] | null {
+  const dir = pendingCommitOutboxDir();
+  let filenames: string[];
+  try {
+    filenames = readdirSync(dir).filter((filename) => filename.endsWith(".json")).sort();
+  } catch (error) {
+    if (errorHasCode(error, "ENOENT")) return [];
+    if (DEBUG) console.error("[agentmemory] failed to read pending commit outbox:", error);
+    return null;
+  }
+  const pending: PendingCommitFile[] = [];
+  for (const filename of filenames) {
+    const path = join(dir, filename);
+    try {
+      const entry: unknown = JSON.parse(readFileSync(path, "utf-8"));
+      if (isPendingCommitPost(entry)) pending.push({ path, entry });
+    } catch (error) {
+      if (!errorHasCode(error, "ENOENT") && DEBUG) {
+        console.error("[agentmemory] failed to read pending commit outbox entry:", error);
+      }
+    }
+  }
+  return pending.sort((left, right) =>
+    (left.entry.order ?? 0) - (right.entry.order ?? 0) || left.path.localeCompare(right.path)
+  );
+}
+
+function enqueuePendingCommit(entry: PendingCommitPost): boolean {
+  const dir = pendingCommitOutboxDir();
+  const path = pendingCommitOutboxPath(entry);
+  const tmp = join(dir, `.${randomUUID()}.tmp`);
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    writeFileSync(tmp, JSON.stringify(entry), { encoding: "utf-8", flag: "wx", mode: 0o600 });
+    linkSync(tmp, path);
+    return true;
+  } catch (error) {
+    if (errorHasCode(error, "EEXIST") && existsSync(path)) return true;
+    if (DEBUG) console.error("[agentmemory] failed to enqueue pending commit:", error);
+    return false;
+  } finally {
+    try {
+      unlinkSync(tmp);
+    } catch (error) {
+      if (!errorHasCode(error, "ENOENT") && DEBUG) {
+        console.error("[agentmemory] failed to remove pending commit temporary file:", error);
+      }
+    }
+  }
+}
 
 function runGit(cwd: string, args: readonly string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], {
@@ -105,19 +238,19 @@ function tryGit(cwd: string, args: readonly string[]): string | null {
   }
 }
 
-// Strip embedded credentials (https://user:TOKEN@host/…) from a remote URL
-// before it leaves the machine. scp-style git@host:path URLs carry no userinfo
-// and pass through unchanged.
 function sanitizeRepoUrl(repo: string): string {
   try {
     const url = new URL(repo);
-    if (url.username || url.password) {
-      url.username = "";
-      url.password = "";
-    }
+    url.username = "";
+    url.password = "";
+    url.search = "";
+    url.hash = "";
     return url.toString();
   } catch {
-    return repo.replace(/^(\w+:\/\/)[^@/]+@/, "$1");
+    return repo
+      .replace(/[?#].*$/, "")
+      .replace(/^(\w+:\/\/)[^@/]+@/, "$1")
+      .replace(/^[^@/:]+@(?=[^/:]+:)/, "");
   }
 }
 
@@ -341,6 +474,36 @@ async function postOk(path: string, body: Record<string, unknown>, timeoutMs = T
   }
 }
 
+function flushPendingCommitOutbox(): Promise<boolean> {
+  return (async () => {
+    const pending = readPendingCommitOutbox();
+    if (!pending) return false;
+    let allPosted = true;
+    for (const { path, entry } of pending) {
+      if (entry.destinationFingerprint !== OUTBOX_DESTINATION_FINGERPRINT) {
+        allPosted = false;
+        continue;
+      }
+      const metadata = entry.metadata.repo === undefined
+        ? entry.metadata
+        : { ...entry.metadata, repo: sanitizeRepoUrl(entry.metadata.repo) };
+      if (!await postOk("/session/commit", { ...metadata, sessionId: entry.sessionId })) {
+        allPosted = false;
+        continue;
+      }
+      try {
+        unlinkSync(path);
+      } catch (error) {
+        if (!errorHasCode(error, "ENOENT")) {
+          if (DEBUG) console.error("[agentmemory] failed to remove pending commit:", error);
+          allPosted = false;
+        }
+      }
+    }
+    return allPosted;
+  })();
+}
+
 async function postJson<T = unknown>(path: string, body: Record<string, unknown>): Promise<T | null> {
   try {
     const res = await fetch(`${API}/agentmemory${path}`, {
@@ -495,6 +658,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
   const pendingCommitQueues = new Map<string, QueuedCommit[]>();
   const commitCheckChains = new Map<string, Promise<void>>();
   let nextCommitCompletionOrder = 0;
+  let nextPendingCommitOrder = 0;
 
   async function observe(
     sessionId: string,
@@ -522,43 +686,53 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
 
   async function flushCommitQueue(sessionId: string): Promise<boolean> {
     const queue = pendingCommitQueues.get(sessionId);
-    if (!queue) return true;
-    while (queue.length > 0) {
-      const commit = queue[0]!;
-      const metadata = collectGitCommitMetadata(commit.cwd, commit.sha, commit.branch);
-      if (!metadata) return false;
-      if (!isRefMovement(commit, metadata.message)) {
-        if (!await postOk("/session/commit", { ...metadata, sessionId })) return false;
+    if (queue) {
+      while (queue.length > 0) {
+        const commit = queue[0];
+        if (!commit) return false;
+        const metadata = collectGitCommitMetadata(commit.cwd, commit.sha, commit.branch);
+        if (!metadata) return false;
+        if (!isRefMovement(commit, metadata.message) && !enqueuePendingCommit({
+          version: PENDING_COMMIT_OUTBOX_VERSION,
+          destinationFingerprint: OUTBOX_DESTINATION_FINGERPRINT,
+          sessionId,
+          metadata,
+          order: ++nextPendingCommitOrder,
+        })) {
+          return false;
+        }
+        queue.shift();
       }
-      queue.shift();
+      pendingCommitQueues.delete(sessionId);
     }
-    pendingCommitQueues.delete(sessionId);
-    return true;
+    return flushPendingCommitOutbox();
   }
 
   async function linkPendingCommits(sessionId: string): Promise<void> {
-    if (!await flushCommitQueue(sessionId)) return;
+    await flushCommitQueue(sessionId);
     const checks = pendingCommitChecks.get(sessionId);
     if (!checks) return;
-    if ([...checks.values()].some((check) => !check.ready)) return;
 
-    const checksByCwd = new Map<string, Array<[string, PendingCommitCheck]>>();
+    const readyChecksByCwd = new Map<string, Array<[string, PendingCommitCheck]>>();
     for (const [callId, check] of checks) {
-      const cwdChecks = checksByCwd.get(check.cwd) ?? [];
+      if (!check.ready) continue;
+      const cwdChecks = readyChecksByCwd.get(check.cwd) ?? [];
       cwdChecks.push([callId, check]);
-      checksByCwd.set(check.cwd, cwdChecks);
+      readyChecksByCwd.set(check.cwd, cwdChecks);
     }
 
     const groups: QueuedCommit[][] = [];
-    for (const [cwd, cwdChecks] of checksByCwd) {
+    for (const [cwd, cwdChecks] of readyChecksByCwd) {
       const commits = collectCreatedCommits(cwd, cwdChecks.map(([, check]) => check));
       if (commits === null) continue;
       groups.push(commits);
       for (const [callId] of cwdChecks) checks.delete(callId);
     }
     if (checks.size === 0) pendingCommitChecks.delete(sessionId);
-    const queue = mergeCommitGroups(groups);
-    if (queue.length === 0) return;
+    const commits = mergeCommitGroups(groups);
+    if (commits.length === 0) return;
+    const queue = pendingCommitQueues.get(sessionId) ?? [];
+    queue.push(...commits);
     pendingCommitQueues.set(sessionId, queue);
     await flushCommitQueue(sessionId);
   }
@@ -649,6 +823,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
           project: projectPath,
           cwd: sessionCwd,
         });
+        await flushPendingCommitOutbox();
         const startCtx = startResult?.context;
         if (
           typeof startCtx === "string" &&
@@ -702,6 +877,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
             cwd: sessionCwd,
             resumed: true,
           });
+          await flushPendingCommitOutbox();
           const resumeCtx = resumeResult?.context;
           if (
             typeof resumeCtx === "string" &&

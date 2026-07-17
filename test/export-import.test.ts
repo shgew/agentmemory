@@ -1,8 +1,15 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+declare function setImmediate(callback: () => void): void;
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
+
+vi.mock("../src/utils/image-store.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/utils/image-store.js")>();
+  return { ...actual, deleteImage: vi.fn(async () => ({ deletedBytes: 0 })) };
+});
 
 import { registerExportImportFunction } from "../src/functions/export-import.js";
 import { registerCompressFunction } from "../src/functions/compress.js";
@@ -11,8 +18,18 @@ import {
   deleteImageBackedRecord,
   withObservationSessionOwnerLock,
 } from "../src/functions/image-owner.js";
-import { getSearchIndex, rebuildIndex } from "../src/functions/search.js";
+import {
+  getSearchIndex,
+  getVectorIndex,
+  rebuildIndex,
+  setEmbeddingProvider,
+  setIndexPersistence,
+  setVectorIndex,
+} from "../src/functions/search.js";
 import { KV } from "../src/state/schema.js";
+import { VectorIndex } from "../src/state/vector-index.js";
+import { deleteImage } from "../src/utils/image-store.js";
+import { logger } from "../src/logger.js";
 import type {
   Session,
   CompressedObservation,
@@ -63,6 +80,25 @@ function mockKV() {
       if (!store.has(scope)) store.set(scope, new Map());
       store.get(scope)!.set(key, data);
       return data;
+    },
+    update: async <T>(
+      scope: string,
+      key: string,
+      ops: Array<{ type: string; path: string; value?: unknown }>,
+    ): Promise<T> => {
+      const entry = store.get(scope)?.get(key);
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error(`Cannot update missing record: ${scope}/${key}`);
+      }
+      const updated: Record<string, unknown> = { ...entry };
+      for (const operation of ops) {
+        if (operation.type !== "set") {
+          throw new Error(`Unsupported update operation: ${operation.type}`);
+        }
+        updated[operation.path] = operation.value;
+      }
+      store.get(scope)!.set(key, updated);
+      return updated as T;
     },
     delete: async (scope: string, key: string): Promise<void> => {
       store.get(scope)?.delete(key);
@@ -164,6 +200,8 @@ describe("Export/Import Functions", () => {
   let kv: ReturnType<typeof mockKV>;
 
   beforeEach(async () => {
+    vi.stubEnv("AGENT_ID", "");
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "");
     sdk = mockSdk();
     kv = mockKV();
     registerExportImportFunction(sdk as never, kv as never);
@@ -173,6 +211,13 @@ describe("Export/Import Functions", () => {
     await kv.set("mem:raw-payloads", "obs_1", testRawPayload);
     await kv.set("mem:memories", "mem_1", testMemory);
     await kv.set("mem:summaries", "ses_1", testSummary);
+  });
+
+  afterEach(() => {
+    setIndexPersistence(null);
+    setVectorIndex(null);
+    setEmbeddingProvider(null);
+    vi.unstubAllEnvs();
   });
 
   it("export produces valid ExportData structure", async () => {
@@ -186,6 +231,74 @@ describe("Export/Import Functions", () => {
     expect(result.rawPayloads).toEqual([testRawPayload]);
     expect(result.memories.length).toBe(1);
     expect(result.summaries.length).toBe(1);
+  });
+
+  it("isolated export excludes another agent's rows", async () => {
+    vi.stubEnv("AGENT_ID", "agent-a");
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    const agentASession = { ...testSession, id: "ses_agent_a", agentId: "agent-a" };
+    const agentBSession = { ...testSession, id: "ses_agent_b", agentId: "agent-b" };
+    const agentAObservation = {
+      ...testObs,
+      id: "obs_agent_a",
+      sessionId: agentASession.id,
+      agentId: "agent-a",
+    };
+    const agentBObservation = {
+      ...testObs,
+      id: "obs_agent_b",
+      sessionId: agentBSession.id,
+      agentId: "agent-b",
+    };
+    await kv.set(KV.sessions, agentASession.id, agentASession);
+    await kv.set(KV.sessions, agentBSession.id, agentBSession);
+    await kv.set(
+      KV.observations(agentASession.id),
+      agentAObservation.id,
+      agentAObservation,
+    );
+    await kv.set(
+      KV.observations(agentBSession.id),
+      agentBObservation.id,
+      agentBObservation,
+    );
+    await kv.set(KV.memories, "mem_agent_a", {
+      ...testMemory,
+      id: "mem_agent_a",
+      agentId: "agent-a",
+    });
+    await kv.set(KV.memories, "mem_agent_b", {
+      ...testMemory,
+      id: "mem_agent_b",
+      agentId: "agent-b",
+    });
+    await kv.set(KV.semantic, "sem_agent_b", { id: "sem_agent_b" });
+    await kv.set(KV.accessLog, "sem_agent_b", {
+      memoryId: "sem_agent_b",
+      count: 1,
+      lastAt: "2026-02-01T00:00:00Z",
+      recent: [1],
+    });
+
+    const result = (await sdk.trigger("mem::export", {})) as ExportData;
+
+    expect(result.sessions).toEqual([agentASession]);
+    expect(result.observations).toEqual({
+      [agentASession.id]: [agentAObservation],
+    });
+    expect(result.memories).toEqual([
+      { ...testMemory, id: "mem_agent_a", agentId: "agent-a" },
+    ]);
+    expect(result.semanticMemories).toBeUndefined();
+    expect(result.accessLogs).toBeUndefined();
+  });
+
+  it("isolated export rejects missing agent identity", async () => {
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+
+    await expect(sdk.trigger("mem::export", {})).rejects.toThrow(
+      "mem::export: AGENTMEMORY_AGENT_SCOPE=isolated requires AGENT_ID",
+    );
   });
 
   it("import with merge strategy adds data", async () => {
@@ -259,6 +372,415 @@ describe("Export/Import Functions", () => {
 
     const oldSession = await kv.get("mem:sessions", "ses_1");
     expect(oldSession).toBeNull();
+  });
+
+  it("isolated import cannot overwrite another agent's memory", async () => {
+    vi.stubEnv("AGENT_ID", "agent-a");
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    const agentBMemory = {
+      ...testMemory,
+      id: "mem_agent_b",
+      content: "Agent B private memory",
+      agentId: "agent-b",
+    };
+    await kv.set(KV.memories, agentBMemory.id, agentBMemory);
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [],
+        observations: {},
+        memories: [{ ...agentBMemory, agentId: "agent-a" }],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "merge",
+    })) as { success: boolean; error: string };
+
+    expect(result.success).toBe(false);
+    expect(await kv.get(KV.memories, agentBMemory.id)).toEqual(agentBMemory);
+  });
+
+  it("isolated replace cannot delete another agent's rows", async () => {
+    vi.stubEnv("AGENT_ID", "agent-a");
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    const agentASession = { ...testSession, id: "ses_agent_a", agentId: "agent-a" };
+    const agentBSession = { ...testSession, id: "ses_agent_b", agentId: "agent-b" };
+    await kv.set(KV.sessions, agentASession.id, agentASession);
+    await kv.set(KV.sessions, agentBSession.id, agentBSession);
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [],
+        observations: {},
+        memories: [],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "replace",
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    expect(await kv.get(KV.sessions, agentASession.id)).toBeNull();
+    expect(await kv.get(KV.sessions, agentBSession.id)).toEqual(agentBSession);
+  });
+
+  it("isolated replace rejects missing agent identity before deleting data", async () => {
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+
+    await expect(
+      sdk.trigger("mem::import", {
+        exportData: {
+          version: "0.9.27",
+          exportedAt: new Date().toISOString(),
+          sessions: [],
+          observations: {},
+          memories: [],
+          summaries: [],
+        } satisfies ExportData,
+        strategy: "replace",
+      }),
+    ).rejects.toThrow(
+      "mem::import: AGENTMEMORY_AGENT_SCOPE=isolated requires AGENT_ID",
+    );
+    expect(await kv.get(KV.sessions, testSession.id)).toEqual(testSession);
+    expect(await kv.get(KV.memories, testMemory.id)).toEqual(testMemory);
+  });
+
+  it("replace removes raw payload session indexes", async () => {
+    await kv.set(
+      KV.rawPayloadsBySession(testRawPayload.sessionId),
+      testRawPayload.id,
+      { id: testRawPayload.id, sessionId: testRawPayload.sessionId },
+    );
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [],
+        observations: {},
+        memories: [],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "replace",
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    expect(
+      await kv.list(KV.rawPayloadsBySession(testRawPayload.sessionId)),
+    ).toEqual([]);
+  });
+
+  it("replace restores prior state after an imported write fails", async () => {
+    const setRecord = kv.set;
+    let failImportedSessionWrite = true;
+    vi.spyOn(kv, "set").mockImplementation(async (scope, key, value) => {
+      if (
+        failImportedSessionWrite &&
+        scope === KV.sessions &&
+        key === "ses_replace_failure"
+      ) {
+        failImportedSessionWrite = false;
+        throw new Error("injected import write failure");
+      }
+      return setRecord(scope, key, value);
+    });
+
+    await expect(
+      sdk.trigger("mem::import", {
+        exportData: {
+          version: "0.9.27",
+          exportedAt: new Date().toISOString(),
+          sessions: [{ ...testSession, id: "ses_replace_failure" }],
+          observations: {},
+          memories: [],
+          summaries: [],
+        } satisfies ExportData,
+        strategy: "replace",
+      }),
+    ).rejects.toThrow("injected import write failure");
+
+    expect(await kv.get(KV.sessions, testSession.id)).toEqual(testSession);
+    expect(await kv.get(KV.memories, testMemory.id)).toEqual(testMemory);
+    expect(await kv.get(KV.sessions, "ses_replace_failure")).toBeNull();
+  });
+
+  it("replace rollback preserves a concurrent unrelated write", async () => {
+    const setRecord = kv.set;
+    let releaseImportedWrite = () => {};
+    const importedWriteBlocked = new Promise<void>((resolve) => {
+      releaseImportedWrite = resolve;
+    });
+    let markImportedWriteStarted = () => {};
+    const importedWriteStarted = new Promise<void>((resolve) => {
+      markImportedWriteStarted = resolve;
+    });
+    vi.spyOn(kv, "set").mockImplementation(async (scope, key, value) => {
+      if (scope === KV.sessions && key === "ses_concurrent_rollback") {
+        markImportedWriteStarted();
+        await importedWriteBlocked;
+        throw new Error("injected import write failure");
+      }
+      return setRecord(scope, key, value);
+    });
+
+    const importing = sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [{ ...testSession, id: "ses_concurrent_rollback" }],
+        observations: {},
+        memories: [],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "replace",
+    });
+    await importedWriteStarted;
+    const unrelated = { value: "preserve me" };
+    await kv.set(KV.config, "unrelated", unrelated);
+    releaseImportedWrite();
+
+    await expect(importing).rejects.toThrow("injected import write failure");
+    expect(await kv.get(KV.config, "unrelated")).toEqual(unrelated);
+  });
+
+  it("restores live and persisted indexes when replace audit fails", async () => {
+    const importedMemory = {
+      ...testMemory,
+      id: "mem_replace_index",
+      title: "Replacement memory",
+      content: "Replacement content",
+    };
+    getSearchIndex().clear();
+    await rebuildIndex(kv as never);
+    const persistedStates: Array<{ original: boolean; replacement: boolean }> = [];
+    setIndexPersistence({
+      scheduleSave: vi.fn(),
+      save: vi.fn(async () => {
+        persistedStates.push({
+          original: getSearchIndex().has(testMemory.id),
+          replacement: getSearchIndex().has(importedMemory.id),
+        });
+      }),
+      saveStrict: vi.fn(async () => {
+        persistedStates.push({
+          original: getSearchIndex().has(testMemory.id),
+          replacement: getSearchIndex().has(importedMemory.id),
+        });
+      }),
+    });
+    const setRecord = kv.set;
+    vi.spyOn(kv, "set").mockImplementation(async (scope, key, value) => {
+      if (scope === KV.audit) throw new Error("injected audit write failure");
+      return setRecord(scope, key, value);
+    });
+
+    await expect(
+      sdk.trigger("mem::import", {
+        exportData: {
+          version: "0.9.27",
+          exportedAt: new Date().toISOString(),
+          sessions: [],
+          observations: {},
+          memories: [importedMemory],
+          summaries: [],
+        } satisfies ExportData,
+        strategy: "replace",
+      }),
+    ).rejects.toThrow("injected audit write failure");
+
+    expect(await kv.get(KV.memories, testMemory.id)).toEqual(testMemory);
+    expect(getSearchIndex().has(testMemory.id)).toBe(true);
+    expect(getSearchIndex().has(importedMemory.id)).toBe(false);
+    expect(persistedStates.at(-1)).toEqual({ original: true, replacement: false });
+  });
+
+  it("rolls back replace when vector rebuilding is incomplete", async () => {
+    const importedMemories = Array.from({ length: 33 }, (_, index) => ({
+      ...testMemory,
+      id: `mem_partial_${index}`,
+      title: `Partial replacement ${index}`,
+      content: `Partial replacement content ${index}`,
+      sessionIds: [],
+    }));
+    getSearchIndex().clear();
+    await rebuildIndex(kv as never);
+    const vectors = new VectorIndex();
+    vectors.add(testMemory.id, "ses_1", new Float32Array([1, 0, 0]));
+    setVectorIndex(vectors);
+    let embedBatchCalls = 0;
+    setEmbeddingProvider({
+      name: "partial",
+      dimensions: 3,
+      embed: async () => new Float32Array([0, 1, 0]),
+      embedBatch: async (texts) => {
+        embedBatchCalls++;
+        if (embedBatchCalls === 2) throw new Error("embedding batch failed");
+        return texts.map(() => new Float32Array([0, 1, 0]));
+      },
+    });
+    const persistedVectors: string[] = [];
+    setIndexPersistence({
+      scheduleSave: vi.fn(),
+      save: vi.fn(async () => {
+        persistedVectors.push(getVectorIndex()?.serialize() ?? "");
+      }),
+      saveStrict: vi.fn(async () => {
+        persistedVectors.push(getVectorIndex()?.serialize() ?? "");
+      }),
+    });
+
+    await expect(
+      sdk.trigger("mem::import", {
+        exportData: {
+          version: "0.9.27",
+          exportedAt: new Date().toISOString(),
+          sessions: [],
+          observations: {},
+          memories: importedMemories,
+          summaries: [],
+        } satisfies ExportData,
+        strategy: "replace",
+      }),
+    ).rejects.toThrow("vector index rebuild incomplete");
+
+    expect(embedBatchCalls).toBe(3);
+    expect(await kv.get(KV.memories, testMemory.id)).toEqual(testMemory);
+    expect(await kv.get(KV.memories, importedMemories[0].id)).toBeNull();
+    expect(getSearchIndex().has(testMemory.id)).toBe(true);
+    expect(getSearchIndex().has(importedMemories[0].id)).toBe(false);
+    expect(getVectorIndex()?.serialize()).toContain(`"${testMemory.id}"`);
+    expect(getVectorIndex()?.serialize()).not.toContain(`"${importedMemories[0].id}"`);
+    expect(persistedVectors.at(-1)).toContain(`"${testMemory.id}"`);
+  });
+
+  it("does not delete replace-orphaned images before audit succeeds", async () => {
+    const imageRef = "/managed/pre-import.png";
+    await kv.set(KV.memories, testMemory.id, { ...testMemory, imageRef });
+    await kv.set(KV.imageRefs, imageRef, 1);
+    await kv.set(KV.imageEmbeddings, imageRef, { embedding: [1, 2, 3] });
+    vi.mocked(deleteImage).mockClear();
+    const setRecord = kv.set;
+    vi.spyOn(kv, "set").mockImplementation(async (scope, key, value) => {
+      if (scope === KV.audit) throw new Error("injected audit write failure");
+      return setRecord(scope, key, value);
+    });
+
+    await expect(
+      sdk.trigger("mem::import", {
+        exportData: {
+          version: "0.9.27",
+          exportedAt: new Date().toISOString(),
+          sessions: [],
+          observations: {},
+          memories: [],
+          summaries: [],
+        } satisfies ExportData,
+        strategy: "replace",
+      }),
+    ).rejects.toThrow("injected audit write failure");
+
+    expect(deleteImage).not.toHaveBeenCalled();
+    expect(await kv.get(KV.imageEmbeddings, imageRef)).toEqual({
+      embedding: [1, 2, 3],
+    });
+  });
+
+  it("preserves a concurrent same-key write when replace rolls back", async () => {
+    const setRecord = kv.set;
+    let releaseImportedWrite = () => {};
+    const importedWriteBlocked = new Promise<void>((resolve) => {
+      releaseImportedWrite = resolve;
+    });
+    let markImportedWriteStarted = () => {};
+    const importedWriteStarted = new Promise<void>((resolve) => {
+      markImportedWriteStarted = resolve;
+    });
+    vi.spyOn(kv, "set").mockImplementation(async (scope, key, value) => {
+      if (scope === KV.sessions && key === "ses_same_key_rollback") {
+        markImportedWriteStarted();
+        await importedWriteBlocked;
+        throw new Error("injected import write failure");
+      }
+      return setRecord(scope, key, value);
+    });
+
+    const importing = sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [{ ...testSession, id: "ses_same_key_rollback" }],
+        observations: {},
+        memories: [],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "replace",
+    });
+    await importedWriteStarted;
+    const concurrentMemory = {
+      ...testMemory,
+      content: "Concurrent writer wins",
+    };
+    await kv.set(KV.memories, concurrentMemory.id, concurrentMemory);
+    releaseImportedWrite();
+
+    await expect(importing).rejects.toThrow("injected import write failure");
+    expect(await kv.get(KV.memories, concurrentMemory.id)).toEqual(
+      concurrentMemory,
+    );
+  });
+
+  it("restores a concurrent same-key value overwritten before replace rollback", async () => {
+    const deleteRecord = kv.delete;
+    let releaseClearedSession = () => {};
+    const clearedSessionBlocked = new Promise<void>((resolve) => {
+      releaseClearedSession = resolve;
+    });
+    let markClearedSession = () => {};
+    const clearedSession = new Promise<void>((resolve) => {
+      markClearedSession = resolve;
+    });
+    vi.spyOn(kv, "delete").mockImplementation(async (scope, key) => {
+      const result = await deleteRecord(scope, key);
+      if (scope === KV.sessions && key === testSession.id) {
+        markClearedSession();
+        await clearedSessionBlocked;
+      }
+      return result;
+    });
+    const setRecord = kv.set;
+    vi.spyOn(kv, "set").mockImplementation(async (scope, key, value) => {
+      if (scope === KV.sessions && key === "ses_rollback_failure") {
+        throw new Error("injected import write failure");
+      }
+      return setRecord(scope, key, value);
+    });
+    const concurrentSession = { ...testSession, project: "concurrent project" };
+
+    const importing = sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [
+          { ...testSession, project: "imported project" },
+          { ...testSession, id: "ses_rollback_failure" },
+        ],
+        observations: {},
+        memories: [],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "replace",
+    });
+    await clearedSession;
+    await kv.set(KV.sessions, concurrentSession.id, concurrentSession);
+    releaseClearedSession();
+
+    await expect(importing).rejects.toThrow("injected import write failure");
+    expect(await kv.get(KV.sessions, concurrentSession.id)).toEqual(
+      concurrentSession,
+    );
   });
 
   it.each([
@@ -450,6 +972,10 @@ describe("Export/Import Functions", () => {
 
     expect(result).toMatchObject({ success: true });
     expect(await kv.get(KV.pendingCompression(sessionId), raw.id)).toEqual({
+      id: raw.id,
+      sessionId,
+    });
+    expect(await kv.get(KV.rawPayloadsBySession(sessionId), raw.id)).toEqual({
       id: raw.id,
       sessionId,
     });
@@ -1050,6 +1576,61 @@ describe("Export/Import Functions", () => {
     expect(await kv.get("mem:image-refs", "/managed/new.png")).toBe(1);
   });
 
+  it("commits replace when an orphan cleanup fails and retains retry state", async () => {
+    const failedRef = "/managed/retryable.png";
+    const releasedRef = "/managed/released.png";
+    const failedEmbedding = { embedding: [1, 2, 3] };
+    await kv.set(KV.memories, testMemory.id, {
+      ...testMemory,
+      imageRef: failedRef,
+    });
+    await kv.set(KV.observations(testSession.id), testObs.id, {
+      ...testObs,
+      imageRef: releasedRef,
+    });
+    await kv.set(KV.imageRefs, failedRef, 1);
+    await kv.set(KV.imageRefs, releasedRef, 1);
+    await kv.set(KV.imageEmbeddings, failedRef, failedEmbedding);
+    await kv.set(KV.imageEmbeddings, releasedRef, { embedding: [4, 5, 6] });
+    vi.mocked(logger.warn).mockClear();
+    const deleteRecord = kv.delete;
+    let failCleanup = true;
+    vi.spyOn(kv, "delete").mockImplementation(async (scope, key) => {
+      if (failCleanup && scope === KV.imageEmbeddings && key === failedRef) {
+        failCleanup = false;
+        throw new Error("injected orphan cleanup failure");
+      }
+      return deleteRecord(scope, key);
+    });
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.9.27",
+        exportedAt: new Date().toISOString(),
+        sessions: [],
+        observations: {},
+        memories: [],
+        summaries: [],
+      } satisfies ExportData,
+      strategy: "replace",
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    expect(await kv.get(KV.imageRefs, failedRef)).toBe(1);
+    expect(await kv.get(KV.imageEmbeddings, failedRef)).toEqual(
+      failedEmbedding,
+    );
+    expect(await kv.get(KV.imageRefs, releasedRef)).toBeNull();
+    expect(await kv.get(KV.imageEmbeddings, releasedRef)).toBeNull();
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Import orphan image cleanup failed",
+      {
+        imageRef: failedRef,
+        error: "injected orphan cleanup failure",
+      },
+    );
+  });
+
   it("holds image owner deletion until reference rebuild completes", async () => {
     const imageRef = "/managed/import-barrier.png";
     await kv.set(KV.memories, "mem_1", { ...testMemory, imageRef });
@@ -1303,6 +1884,70 @@ describe("Export/Import Functions", () => {
     );
     expect(await kv.get(KV.imageReleases, releaseId)).not.toBeNull();
     expect(await kv.get(KV.sessions, "ses_new")).toBeNull();
+  });
+
+  it("does not roll back a completed pending observation release", async () => {
+    const releaseId = `observation:${testSession.id}:${testObs.id}`;
+    const session = { ...testSession, observationCount: 2 };
+    await kv.set(KV.sessions, session.id, session);
+    await kv.set(KV.imageReleases, releaseId, {
+      id: releaseId,
+      refs: [],
+      kind: "observation",
+      sessionId: testSession.id,
+      observationId: testObs.id,
+      observation: testObs,
+      raw: testRawPayload,
+    });
+    const update = vi.spyOn(kv, "update");
+    const setRecord = kv.set;
+    const failingSessions = new Set([
+      "ses_pending_release_failure",
+      "ses_pending_release_retry_failure",
+    ]);
+    vi.spyOn(kv, "set").mockImplementation(async (scope, key, value) => {
+      if (scope === KV.sessions && failingSessions.has(key)) {
+        throw new Error("injected import write failure");
+      }
+      return setRecord(scope, key, value);
+    });
+    const failedReplace = (id: string) =>
+      sdk.trigger("mem::import", {
+        exportData: {
+          version: "0.9.27",
+          exportedAt: new Date().toISOString(),
+          sessions: [{ ...testSession, id }],
+          observations: {},
+          memories: [],
+          summaries: [],
+        } satisfies ExportData,
+        strategy: "replace",
+      });
+
+    await expect(failedReplace("ses_pending_release_failure")).rejects.toThrow(
+      "injected import write failure",
+    );
+    await expect(
+      failedReplace("ses_pending_release_retry_failure"),
+    ).rejects.toThrow("injected import write failure");
+
+    expect({
+      release: await kv.get(KV.imageReleases, releaseId),
+      session: await kv.get(KV.sessions, session.id),
+      observation: await kv.get(KV.observations(testSession.id), testObs.id),
+      raw: await kv.get(KV.rawPayloads, testRawPayload.id),
+      updateCount: update.mock.calls.length,
+    }).toEqual({
+      release: null,
+      session: {
+        ...session,
+        observationCount: 1,
+        appliedObservationDeletionIds: [],
+      },
+      observation: null,
+      raw: null,
+      updateCount: 2,
+    });
   });
 
   it("rebuilds graph snapshot and lookup indexes after import", async () => {

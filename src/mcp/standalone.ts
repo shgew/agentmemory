@@ -145,14 +145,21 @@ interface Validated {
 }
 
 function resolveAgentFilter(requestedAgentId: unknown): string | undefined {
-  if (isAgentScopeIsolated()) return getAgentId();
+  if (isAgentScopeIsolated()) {
+    const agentId = getAgentId();
+    if (!agentId) {
+      throw new Error(
+        "AGENTMEMORY_AGENT_SCOPE=isolated requires AGENT_ID",
+      );
+    }
+    return agentId;
+  }
   if (typeof requestedAgentId !== "string") return undefined;
   const agentId = requestedAgentId.trim();
   return agentId && agentId !== "*" ? agentId.slice(0, 128) : undefined;
 }
 
 function resolveWriteAgentId(requestedAgentId: unknown): string | undefined {
-  if (isAgentScopeIsolated()) return getAgentId();
   return resolveAgentFilter(requestedAgentId) ?? getAgentId();
 }
 
@@ -224,6 +231,7 @@ function validate(toolName: string, args: Record<string, unknown>): Validated {
       return v;
     }
     case "memory_export":
+      v.agentId = resolveAgentFilter(args["agentId"]);
       return v;
     case "memory_audit": {
       v.limit = parseLimit(args["limit"], 50);
@@ -402,8 +410,16 @@ async function handleLocal(
     }
 
     case "memory_export": {
-      const memories = await kvInstance.list("mem:memories");
-      const sessions = await kvInstance.list("mem:sessions");
+      const [allMemories, allSessions] = await Promise.all([
+        kvInstance.list<Record<string, unknown>>("mem:memories"),
+        kvInstance.list<Record<string, unknown>>("mem:sessions"),
+      ]);
+      const memories = v.agentId
+        ? allMemories.filter((memory) => memory["agentId"] === v.agentId)
+        : allMemories;
+      const sessions = v.agentId
+        ? allSessions.filter((session) => session["agentId"] === v.agentId)
+        : allSessions;
       return textResponse({ version: VERSION, memories, sessions }, true);
     }
 

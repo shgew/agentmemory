@@ -5,23 +5,58 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { KV } from "../src/state/schema.js";
+import { withKeyedLock } from "../src/state/keyed-mutex.js";
 import type { CommitLink, Session } from "../src/types.js";
 import { registerApiTriggers } from "../src/triggers/api.js";
 import { registerMcpEndpoints } from "../src/mcp/server.js";
 
 type Handler = (data: unknown) => unknown | Promise<unknown>;
+type Deferred = {
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+};
+
+function deferred(): Deferred {
+  let resolve = (): void => {};
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
+  let blockedSet: {
+    readonly scope: string;
+    readonly key: string;
+    readonly entered: Deferred;
+    readonly release: Deferred;
+  } | null = null;
   const seed = (scope: string, key: string, value: unknown): void => {
     if (!store.has(scope)) store.set(scope, new Map());
     store.get(scope)?.set(key, value);
   };
   return {
     seed,
+    blockFirstSet: (scope: string, key: string) => {
+      const block = {
+        scope,
+        key,
+        entered: deferred(),
+        release: deferred(),
+      };
+      blockedSet = block;
+      return block;
+    },
     get: async <T>(scope: string, key: string): Promise<T | null> =>
       (store.get(scope)?.get(key) as T) ?? null,
     set: async <T>(scope: string, key: string, value: T): Promise<T> => {
+      const block = blockedSet;
+      if (block?.scope === scope && block.key === key) {
+        blockedSet = null;
+        block.entered.resolve();
+        await block.release.promise;
+      }
       seed(scope, key, value);
       return value;
     },
@@ -103,6 +138,25 @@ async function mcpCall(
 const SHA40 = "abc123def456abc123def456abc123def456abcd";
 const SHA64 =
   "abc123def456abc123def456abc123def456abc123def456abc123def456abcd";
+const HTTPS_REPO = "https://user:access-token@git.example.com/org/repo.git";
+const HTTPS_QUERY_REPO = "https://viewer:query-token@git.example.com/org/repo.git";
+const SCP_REPO = "access-token@git.example.com:org/repo.git";
+const REPO_FILTER_CASES = [
+  [
+    "credential-bearing HTTPS",
+    SHA40,
+    HTTPS_QUERY_REPO,
+    HTTPS_REPO,
+    "https://git.example.com/org/repo.git",
+  ],
+  [
+    "git SCP",
+    SHA64,
+    "git@git.example.com:org/repo.git",
+    "git.example.com:org/repo.git",
+    "git.example.com:org/repo.git",
+  ],
+] as const;
 
 describe("api::session::commit ingest", () => {
   let sdk: ReturnType<typeof mockSdk>;
@@ -224,6 +278,36 @@ describe("api::session::commit ingest", () => {
     ).toEqual([SHA40]);
   });
 
+  it("holds the session lock from final ownership validation through the commit update", async () => {
+    kv.seed(KV.sessions, "s1", session({ id: "s1", agentId: "agent-a" }));
+    const commitWrite = kv.blockFirstSet(KV.commits, SHA40);
+    const request = commit(
+      postBody({ sha: SHA40, sessionId: "s1", agentId: "agent-a" }),
+    );
+
+    await commitWrite.entered.promise;
+    let ownershipChanged = false;
+    const ownershipChange = withKeyedLock("session:s1", async () => {
+      ownershipChanged = true;
+      await kv.update<Session>(KV.sessions, "s1", [
+        { type: "set", path: "agentId", value: "agent-b" },
+      ]);
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const ownershipChangedDuringCommitWrite = ownershipChanged;
+
+    commitWrite.release.resolve();
+    const result = (await request) as { status_code: number };
+    await ownershipChange;
+
+    expect(result.status_code).toBe(200);
+    expect(ownershipChangedDuringCommitWrite).toBe(false);
+    expect((await kv.get<Session>(KV.sessions, "s1"))?.commitShas).toEqual([
+      SHA40,
+    ]);
+  });
+
   it("hides other agents' session IDs from an isolated commit response", async () => {
     vi.stubEnv("AGENT_ID", "agent-a");
     vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
@@ -232,7 +316,9 @@ describe("api::session::commit ingest", () => {
     kv.seed(KV.commits, SHA40, {
       sha: SHA40,
       shortSha: SHA40.slice(0, 7),
-      sessionIds: ["s2"],
+      branch: "agent-b-private",
+      repo: "https://git.example.com/agent-b/private.git",
+      sessionIds: ["s1", "s2"],
       linkedAt: "2026-01-01T00:00:00.000Z",
     } satisfies CommitLink);
 
@@ -242,6 +328,112 @@ describe("api::session::commit ingest", () => {
 
     expect(res.status_code).toBe(200);
     expect(res.body.commit.sessionIds).toEqual(["s1"]);
+    expect(res.body.commit.branch).toBeUndefined();
+    expect(res.body.commit.repo).toBeUndefined();
+  });
+
+  it("rejects an isolated link to a SHA retained only by another agent", async () => {
+    vi.stubEnv("AGENT_ID", "agent-a");
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    kv.seed(KV.sessions, "s1", session({ id: "s1", agentId: "agent-a" }));
+    kv.seed(KV.sessions, "s2", session({ id: "s2", agentId: "agent-b" }));
+    const foreignCommit = {
+      sha: SHA40,
+      shortSha: SHA40.slice(0, 7),
+      message: "agent B private commit metadata",
+      sessionIds: ["s2"],
+      linkedAt: "2026-01-01T00:00:00.000Z",
+    } satisfies CommitLink;
+    kv.seed(KV.commits, SHA40, foreignCommit);
+
+    const res = (await commit(postBody({ sha: SHA40, sessionId: "s1" }))) as {
+      status_code: number;
+      body: Record<string, unknown>;
+    };
+
+    expect(res.status_code).toBe(403);
+    expect(res.body).toEqual({
+      error: "commit is linked only to sessions owned by another agent",
+    });
+    expect(await kv.get(KV.commits, SHA40)).toEqual(foreignCommit);
+    expect((await kv.get<Session>(KV.sessions, "s1"))?.commitShas).toBeUndefined();
+  });
+
+  it("rejects an isolated link to a SHA retained only by deleted sessions", async () => {
+    vi.stubEnv("AGENT_ID", "agent-a");
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    kv.seed(KV.sessions, "s1", session({ id: "s1", agentId: "agent-a" }));
+    const deletedSessionCommit = {
+      sha: SHA40,
+      shortSha: SHA40.slice(0, 7),
+      message: "retained commit metadata",
+      sessionIds: ["deleted-session"],
+      linkedAt: "2026-01-01T00:00:00.000Z",
+    } satisfies CommitLink;
+    kv.seed(KV.commits, SHA40, deletedSessionCommit);
+
+    const res = (await commit(postBody({ sha: SHA40, sessionId: "s1" }))) as {
+      status_code: number;
+      body: Record<string, unknown>;
+    };
+
+    expect(res.status_code).toBe(403);
+    expect(res.body).toEqual({
+      error: "commit is linked only to sessions owned by another agent",
+    });
+    expect(await kv.get(KV.commits, SHA40)).toEqual(deletedSessionCommit);
+    expect((await kv.get<Session>(KV.sessions, "s1"))?.commitShas).toBeUndefined();
+  });
+
+  it("strips repository credentials before storing a direct commit report", async () => {
+    const res = (await commit(
+      postBody({
+        sha: SHA40,
+        repo: "https://user:access-token@git.example.com/org/repo.git",
+      }),
+    )) as { status_code: number; body: { commit: CommitLink } };
+
+    expect(res.status_code).toBe(200);
+    expect(res.body.commit.repo).toBe("https://git.example.com/org/repo.git");
+    expect((await kv.get<CommitLink>(KV.commits, SHA40))?.repo).toBe(
+      "https://git.example.com/org/repo.git",
+    );
+  });
+
+  it("strips SCP-style repository credentials before storing a direct commit report", async () => {
+    const res = (await commit(
+      postBody({
+        sha: SHA40,
+        repo: "access-token@git.example.com:org/repo.git",
+      }),
+    )) as { status_code: number; body: { commit: CommitLink } };
+
+    expect(res.status_code).toBe(200);
+    expect(res.body.commit.repo).toBe("git.example.com:org/repo.git");
+    expect((await kv.get<CommitLink>(KV.commits, SHA40))?.repo).toBe(
+      "git.example.com:org/repo.git",
+    );
+  });
+
+  it("sanitizes retained repository metadata before replying", async () => {
+    kv.seed(KV.commits, SHA40, {
+      sha: SHA40,
+      shortSha: SHA40.slice(0, 7),
+      repo: "https://user:access-token@git.example.com/org/repo.git",
+      sessionIds: [],
+      linkedAt: "2026-01-01T00:00:00.000Z",
+    } satisfies CommitLink);
+
+    const res = (await commit(postBody({ sha: SHA40 }))) as {
+      status_code: number;
+      body: { commit: CommitLink };
+    };
+
+    expect(res.status_code).toBe(200);
+    expect(res.body.commit.repo).toBe("https://git.example.com/org/repo.git");
+    expect((await kv.get<CommitLink>(KV.commits, SHA40))?.repo).toBe(
+      "https://git.example.com/org/repo.git",
+    );
   });
 
   it("does not let wildcard agentId override isolation", async () => {
@@ -266,6 +458,18 @@ describe("api::session::commit ingest", () => {
     expect(await kv.get<Session>(KV.sessions, "missing")).toBeNull();
   });
 
+  it("requires a sessionId under isolation", async () => {
+    vi.stubEnv("AGENT_ID", "agent-a");
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+
+    const res = (await commit(postBody({ sha: SHA40 }))) as {
+      status_code: number;
+    };
+
+    expect(res.status_code).toBe(400);
+    expect(await kv.get<CommitLink>(KV.commits, SHA40)).toBeNull();
+  });
+
   it("regression: no env scope links freely across agent-tagged sessions", async () => {
     kv.seed(KV.sessions, "s1", session({ id: "s1", agentId: "agent-a" }));
     const res = (await commit(
@@ -275,6 +479,19 @@ describe("api::session::commit ingest", () => {
     expect(
       (await kv.get<Session>(KV.sessions, "s1"))?.commitShas,
     ).toEqual([SHA40]);
+  });
+
+  it("allows shared-mode ingest without a sessionId", async () => {
+    vi.stubEnv("AGENT_ID", "agent-a");
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "shared");
+
+    const res = (await commit(postBody({ sha: SHA40 }))) as {
+      status_code: number;
+      body: { commit: CommitLink };
+    };
+
+    expect(res.status_code).toBe(200);
+    expect(res.body.commit.sessionIds).toEqual([]);
   });
 });
 
@@ -295,6 +512,8 @@ describe("api::session::by-commit lookup", () => {
       sha: SHA40,
       shortSha: SHA40.slice(0, 7),
       message: "secret work",
+      branch: "agent-b-private",
+      repo: HTTPS_REPO,
       sessionIds: ["a-sess", "b-sess"],
       linkedAt: "2026-01-01T00:00:00.000Z",
     } satisfies CommitLink);
@@ -307,6 +526,7 @@ describe("api::session::by-commit lookup", () => {
   });
 
   it("returns all sessions when no filter is active", async () => {
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "shared");
     const res = (await byCommit(getReq({ sha: SHA40 }))) as {
       status_code: number;
       body: { sessions: Session[] };
@@ -316,6 +536,16 @@ describe("api::session::by-commit lookup", () => {
       "a-sess",
       "b-sess",
     ]);
+  });
+
+  it("projects legacy HTTPS credentials without rewriting by-commit storage", async () => {
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "shared");
+    const res = (await byCommit(getReq({ sha: SHA40 }))) as {
+      body: { commit: CommitLink };
+    };
+
+    expect(res.body.commit.repo).toBe("https://git.example.com/org/repo.git");
+    expect((await kv.get<CommitLink>(KV.commits, SHA40))?.repo).toBe(HTTPS_REPO);
   });
 
   it("normalizes uppercase SHAs and rejects malformed SHAs", async () => {
@@ -344,7 +574,7 @@ describe("api::session::by-commit lookup", () => {
   it("404s under isolation when none of the linked sessions are visible", async () => {
     vi.stubEnv("AGENT_ID", "agent-c");
     vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
-    const res = (await byCommit(getReq({ sha: SHA40 }))) as {
+    const res = (await byCommit(getReq({ sha: SHA40, agentId: "agent-a" }))) as {
       status_code: number;
     };
     expect(res.status_code).toBe(404);
@@ -355,9 +585,19 @@ describe("api::session::by-commit lookup", () => {
     vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
     const res = (await byCommit(getReq({ sha: SHA40 }))) as {
       status_code: number;
-      body: { sessions: Session[] };
+      body: { commit: CommitLink; sessions: Session[] };
     };
     expect(res.body.sessions.map((s) => s.id)).toEqual(["b-sess"]);
+    expect(res.body.commit.branch).toBeUndefined();
+    expect(res.body.commit.repo).toBeUndefined();
+  });
+
+  it("fails closed under isolation without an agent identity", async () => {
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    const res = (await byCommit(getReq({ sha: SHA40, agentId: "agent-a" }))) as {
+      status_code: number;
+    };
+    expect(res.status_code).toBe(404);
   });
 
   it("does not let wildcard agentId bypass env isolation", async () => {
@@ -387,12 +627,15 @@ describe("api::commits list", () => {
     kv.seed(KV.commits, SHA40, {
       sha: SHA40,
       shortSha: SHA40.slice(0, 7),
+      branch: "agent-b-private",
+      repo: HTTPS_REPO,
       sessionIds: ["a-sess", "b-sess"],
       linkedAt: "2026-01-02T00:00:00.000Z",
     } satisfies CommitLink);
     kv.seed(KV.commits, SHA64, {
       sha: SHA64,
       shortSha: SHA64.slice(0, 7),
+      repo: SCP_REPO,
       sessionIds: ["b-sess"],
       linkedAt: "2026-01-01T00:00:00.000Z",
     } satisfies CommitLink);
@@ -405,6 +648,7 @@ describe("api::commits list", () => {
   });
 
   it("lists all commits when no filter is active", async () => {
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "shared");
     const res = (await commits(getReq({}))) as {
       body: { commits: CommitLink[] };
     };
@@ -413,13 +657,63 @@ describe("api::commits list", () => {
     );
   });
 
-  it("only shows commits with a session visible to the caller (isolated)", async () => {
-    vi.stubEnv("AGENT_ID", "agent-a");
-    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+  it.each(REPO_FILTER_CASES)(
+    "matches %s repo filters without exposing credentials",
+    async (_label, sha, repo, storedRepo, expectedRepo) => {
+      const existing = await kv.get<CommitLink>(KV.commits, sha);
+      if (!existing) throw new Error("seeded commit was not found");
+      kv.seed(KV.commits, sha, { ...existing, repo: storedRepo });
+      const otherSha = sha === SHA40 ? SHA64 : SHA40;
+      const other = await kv.get<CommitLink>(KV.commits, otherSha);
+      if (!other) throw new Error("other seeded commit was not found");
+      kv.seed(KV.commits, otherSha, {
+        ...other,
+        repo: "https://git.example.com/other/repo.git",
+      });
+
+      const res = (await commits(getReq({ repo }))) as {
+        body: { commits: CommitLink[] };
+      };
+
+      expect(res.body.commits.map((commit) => commit.sha)).toEqual([sha]);
+      expect(res.body.commits[0]?.repo).toBe(expectedRepo);
+      expect((await kv.get<CommitLink>(KV.commits, sha))?.repo).toBe(storedRepo);
+    },
+  );
+
+  it("projects legacy credentials without rewriting listed commit storage", async () => {
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "shared");
     const res = (await commits(getReq({}))) as {
       body: { commits: CommitLink[] };
     };
+
+    expect(res.body.commits.find((commit) => commit.sha === SHA40)?.repo).toBe(
+      "https://git.example.com/org/repo.git",
+    );
+    expect(res.body.commits.find((commit) => commit.sha === SHA64)?.repo).toBe(
+      "git.example.com:org/repo.git",
+    );
+    expect((await kv.get<CommitLink>(KV.commits, SHA40))?.repo).toBe(HTTPS_REPO);
+    expect((await kv.get<CommitLink>(KV.commits, SHA64))?.repo).toBe(SCP_REPO);
+  });
+
+  it("only shows commits with a session visible to the caller (isolated)", async () => {
+    vi.stubEnv("AGENT_ID", "agent-a");
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    const res = (await commits(getReq({ agentId: "agent-a" }))) as {
+      body: { commits: CommitLink[] };
+    };
     expect(res.body.commits.map((c) => c.sha)).toEqual([SHA40]);
+    expect(res.body.commits[0]?.branch).toBeUndefined();
+    expect(res.body.commits[0]?.repo).toBeUndefined();
+  });
+
+  it("returns no commits under isolation without an agent identity", async () => {
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    const res = (await commits(getReq({ agentId: "agent-a" }))) as {
+      body: { commits: CommitLink[] };
+    };
+    expect(res.body.commits).toEqual([]);
   });
 
   it("returns no commits when the caller owns none (isolated)", async () => {
@@ -458,12 +752,15 @@ describe("MCP memory_commit_lookup / memory_commits isolation", () => {
     kv.seed(KV.commits, SHA40, {
       sha: SHA40,
       shortSha: SHA40.slice(0, 7),
+      branch: "agent-b-private",
+      repo: SCP_REPO,
       sessionIds: ["a-sess", "b-sess"],
       linkedAt: "2026-01-02T00:00:00.000Z",
     } satisfies CommitLink);
     kv.seed(KV.commits, SHA64, {
       sha: SHA64,
       shortSha: SHA64.slice(0, 7),
+      repo: HTTPS_REPO,
       sessionIds: ["b-sess"],
       linkedAt: "2026-01-01T00:00:00.000Z",
     } satisfies CommitLink);
@@ -484,6 +781,15 @@ describe("MCP memory_commit_lookup / memory_commits isolation", () => {
       "a-sess",
       "b-sess",
     ]);
+  });
+
+  it("commit_lookup projects legacy SCP credentials without rewriting storage", async () => {
+    const { parsed } = await mcpCall(call, "memory_commit_lookup", {
+      sha: SHA40,
+    });
+
+    expect((parsed.commit as CommitLink).repo).toBe("git.example.com:org/repo.git");
+    expect((await kv.get<CommitLink>(KV.commits, SHA40))?.repo).toBe(SCP_REPO);
   });
 
   it("commit_lookup normalizes uppercase SHAs and rejects malformed SHAs", async () => {
@@ -508,6 +814,28 @@ describe("MCP memory_commit_lookup / memory_commits isolation", () => {
     expect(parsed.sessions).toEqual([]);
   });
 
+  it("commit_lookup fails closed under isolation without an agent identity", async () => {
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    const { parsed } = await mcpCall(call, "memory_commit_lookup", {
+      sha: SHA40,
+      agentId: "agent-a",
+    });
+    expect(parsed.commit).toBeNull();
+    expect(parsed.sessions).toEqual([]);
+  });
+
+  it("commit_lookup returns no retained foreign metadata for the active agent", async () => {
+    vi.stubEnv("AGENT_ID", "agent-a");
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+
+    const { parsed } = await mcpCall(call, "memory_commit_lookup", {
+      sha: SHA64,
+    });
+
+    expect(parsed.commit).toBeNull();
+    expect(parsed.sessions).toEqual([]);
+  });
+
   it("does not let commit_lookup wildcard agentId bypass isolation", async () => {
     vi.stubEnv("AGENT_ID", "agent-b");
     vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
@@ -516,18 +844,65 @@ describe("MCP memory_commit_lookup / memory_commits isolation", () => {
       agentId: "*",
     });
     expect((parsed.commit as CommitLink).sessionIds).toEqual(["b-sess"]);
+    expect((parsed.commit as CommitLink).branch).toBeUndefined();
+    expect((parsed.commit as CommitLink).repo).toBeUndefined();
   });
 
   it("commits lists only the caller's commits under isolation", async () => {
     vi.stubEnv("AGENT_ID", "agent-a");
     vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
-    const { parsed } = await mcpCall(call, "memory_commits", {});
+    const { parsed } = await mcpCall(call, "memory_commits", { agentId: "agent-a" });
     expect((parsed.commits as CommitLink[]).map((c) => c.sha)).toEqual([SHA40]);
     expect((parsed.commits as CommitLink[])[0]?.sessionIds).toEqual(["a-sess"]);
+    expect((parsed.commits as CommitLink[])[0]?.branch).toBeUndefined();
+    expect((parsed.commits as CommitLink[])[0]?.repo).toBeUndefined();
+  });
+
+  it("commits returns no results under isolation without an agent identity", async () => {
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    const { parsed } = await mcpCall(call, "memory_commits", { agentId: "agent-a" });
+    expect(parsed.commits).toEqual([]);
   });
 
   it("commits regression: no scope lists everything", async () => {
     const { parsed } = await mcpCall(call, "memory_commits", {});
     expect((parsed.commits as CommitLink[]).length).toBe(2);
+  });
+
+  it.each(REPO_FILTER_CASES)(
+    "commits matches %s repo filters without exposing credentials",
+    async (_label, sha, repo, storedRepo, expectedRepo) => {
+      const existing = await kv.get<CommitLink>(KV.commits, sha);
+      if (!existing) throw new Error("seeded commit was not found");
+      kv.seed(KV.commits, sha, { ...existing, repo: storedRepo });
+      const otherSha = sha === SHA40 ? SHA64 : SHA40;
+      const other = await kv.get<CommitLink>(KV.commits, otherSha);
+      if (!other) throw new Error("other seeded commit was not found");
+      kv.seed(KV.commits, otherSha, {
+        ...other,
+        repo: "https://git.example.com/other/repo.git",
+      });
+
+      const { parsed } = await mcpCall(call, "memory_commits", { repo });
+      const commits = parsed.commits as CommitLink[];
+
+      expect(commits.map((commit) => commit.sha)).toEqual([sha]);
+      expect(commits[0]?.repo).toBe(expectedRepo);
+      expect((await kv.get<CommitLink>(KV.commits, sha))?.repo).toBe(storedRepo);
+    },
+  );
+
+  it("commits projects legacy credentials without rewriting storage", async () => {
+    const { parsed } = await mcpCall(call, "memory_commits", {});
+    const commits = parsed.commits as CommitLink[];
+
+    expect(commits.find((commit) => commit.sha === SHA40)?.repo).toBe(
+      "git.example.com:org/repo.git",
+    );
+    expect(commits.find((commit) => commit.sha === SHA64)?.repo).toBe(
+      "https://git.example.com/org/repo.git",
+    );
+    expect((await kv.get<CommitLink>(KV.commits, SHA40))?.repo).toBe(SCP_REPO);
+    expect((await kv.get<CommitLink>(KV.commits, SHA64))?.repo).toBe(HTTPS_REPO);
   });
 });

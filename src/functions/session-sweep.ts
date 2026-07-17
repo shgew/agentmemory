@@ -1,5 +1,5 @@
 import type { ISdk } from "iii-sdk";
-import type { RawObservation, Session } from "../types.js";
+import type { Session } from "../types.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { safeAudit } from "./audit.js";
@@ -8,6 +8,7 @@ import { logger } from "../logger.js";
 import { isAfter } from "../state/timestamp-compare.js";
 import { getEnvVar } from "../config.js";
 import { drainPendingCompression } from "./pending-compression.js";
+import { listSessionRawObservations } from "./raw-observations.js";
 import { drainPendingImageReleases } from "./image-owner.js";
 import { withImageOwnershipReadLock } from "./observation-lock.js";
 
@@ -133,7 +134,9 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
             ? new Set(data.sessionIds)
             : null;
 
-        if (!dryRun) await drainPendingImageReleases(sdk, kv);
+        if (!dryRun) {
+          await drainPendingImageReleases(sdk, kv);
+        }
 
         const now = Date.now();
         const swept: string[] = [];
@@ -152,31 +155,6 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
         const scoped = idFilter
           ? candidates.filter((s) => idFilter.has(s.id))
           : candidates;
-
-        const rawPayloadsBySession = new Map<string, RawObservation[]>();
-        let rawPayloadsError: unknown;
-        if (
-          !dryRun &&
-          scoped.some((session) => {
-            const anchor = activityAnchor(session);
-            if (!anchor) return false;
-            const ageMs = sessionAgeMs(anchor, now);
-            return ageMs !== null && ageMs > maxAgeMs;
-          })
-        ) {
-          try {
-            const scopedIds = new Set(scoped.map((session) => session.id));
-            const rawPayloads = await kv.list<RawObservation>(KV.rawPayloads);
-            for (const raw of rawPayloads) {
-              if (!scopedIds.has(raw.sessionId)) continue;
-              const sessionPayloads = rawPayloadsBySession.get(raw.sessionId);
-              if (sessionPayloads) sessionPayloads.push(raw);
-              else rawPayloadsBySession.set(raw.sessionId, [raw]);
-            }
-          } catch (error) {
-            rawPayloadsError = error;
-          }
-        }
 
         const processSession = async (session: Session): Promise<void> => {
           const anchor = activityAnchor(session);
@@ -224,11 +202,9 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
                 skipped.push(session.id);
                 return;
               }
-              if (rawPayloadsError) throw rawPayloadsError;
-
-              const drain = await withImageOwnershipReadLock(() =>
+              const drain = await withImageOwnershipReadLock(async () =>
                 drainPendingCompression(sdk, kv, session.id, {
-                  rawPayloads: rawPayloadsBySession.get(session.id) ?? [],
+                  rawPayloads: await listSessionRawObservations(kv, session.id),
                 }),
               );
               if (drain.remainingIds.length > 0) {

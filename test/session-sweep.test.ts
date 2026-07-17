@@ -18,6 +18,7 @@ vi.mock("../src/config.js", () => ({
 }));
 
 import { registerSessionSweepFunction } from "../src/functions/session-sweep.js";
+import { registerMigrateFunction } from "../src/functions/migrate.js";
 import { upsertSession } from "../src/functions/session-upsert.js";
 import { registerObserveFunction } from "../src/functions/observe.js";
 import type {
@@ -199,7 +200,7 @@ describe("Session Sweep Function", () => {
     const importing = withImageOwnershipLock(async () => {
       importEntered = true;
     });
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     expect(importEntered).toBe(false);
 
     releasePendingRead.resolve();
@@ -507,7 +508,8 @@ describe("Session Sweep Scheduling", () => {
     expect(maxActive).toBe(4);
   });
 
-  it("loads raw payloads once and recovers pending compression for every session", async () => {
+  it("recovers session-owned pending payloads without scanning all raw payloads", async () => {
+    registerMigrateFunction(sdk as never, kv as never);
     const staleAt = new Date(
       Date.now() - 10 * 60 * 60 * 1000,
     ).toISOString();
@@ -526,7 +528,15 @@ describe("Session Sweep Scheduling", () => {
         userPrompt: sessionId,
       };
       await kv.set(KV.rawPayloads, raw.id, raw);
+      await kv.set(KV.pendingCompression(sessionId), raw.id, {
+        id: raw.id,
+        sessionId,
+      });
     }
+    await sdk.trigger({
+      function_id: "mem::migrate",
+      payload: { step: "raw-payloads-by-session" },
+    });
 
     let rawPayloadListCount = 0;
     const originalList = kv.list;
@@ -565,7 +575,7 @@ describe("Session Sweep Scheduling", () => {
       payload: {},
     })) as { swept: string[]; failed: unknown[] };
 
-    expect(rawPayloadListCount).toBe(1);
+    expect(rawPayloadListCount).toBe(0);
     expect(result.swept.sort()).toEqual(["ses_pending_a", "ses_pending_b"]);
     expect(result.failed).toHaveLength(0);
     const stoppedCalls = sdk.triggerCalls.filter(
@@ -586,6 +596,115 @@ describe("Session Sweep Scheduling", () => {
             .pendingCompressionRecovered === true,
       ),
     ).toBe(true);
+  });
+
+  it("backfills legacy raw payloads once then sweeps them without a global scan", async () => {
+    configMocks.autoCompress = true;
+    registerMigrateFunction(sdk as never, kv as never);
+    const sessionId = "ses_legacy_raw";
+    const staleAt = new Date(
+      Date.now() - 10 * 60 * 60 * 1000,
+    ).toISOString();
+    const raw: RawObservation = {
+      id: "obs_legacy_raw",
+      sessionId,
+      timestamp: staleAt,
+      hookType: "prompt_submit",
+      raw: { prompt: "legacy raw payload" },
+      userPrompt: "legacy raw payload",
+    };
+    await kv.set(
+      KV.sessions,
+      sessionId,
+      makeSession({ id: sessionId, updatedAt: staleAt }),
+    );
+    await kv.set(KV.rawPayloads, raw.id, raw);
+    sdk.registerFunction("mem::compress", async () => {
+      await kv.set(KV.observations(sessionId), raw.id, {
+        id: raw.id,
+        sessionId,
+        timestamp: raw.timestamp,
+        sourceType: raw.hookType,
+        type: "conversation",
+        title: "Recovered legacy raw payload",
+        facts: [],
+        narrative: raw.userPrompt ?? "",
+        concepts: [],
+        files: [],
+        importance: 5,
+      } satisfies CompressedObservation);
+      return { success: true };
+    });
+    const list = vi.spyOn(kv, "list");
+
+    const firstMigration = (await sdk.trigger({
+      function_id: "mem::migrate",
+      payload: { step: "raw-payloads-by-session" },
+    })) as { success: boolean; indexed?: number; alreadyComplete?: boolean };
+    const secondMigration = (await sdk.trigger({
+      function_id: "mem::migrate",
+      payload: { step: "raw-payloads-by-session" },
+    })) as { success: boolean; indexed?: number; alreadyComplete?: boolean };
+
+    expect(firstMigration).toMatchObject({ success: true, indexed: 1 });
+    expect(secondMigration).toMatchObject({
+      success: true,
+      indexed: 1,
+      alreadyComplete: true,
+    });
+    expect(
+      list.mock.calls.filter(([scope]) => scope === KV.rawPayloads),
+    ).toHaveLength(1);
+    list.mockClear();
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: [sessionId] },
+    })) as { swept: string[]; failed: unknown[] };
+
+    expect(result.swept).toEqual([sessionId]);
+    expect(result.failed).toHaveLength(0);
+    expect(list).not.toHaveBeenCalledWith(KV.rawPayloads);
+    expect(await kv.get(KV.observations(sessionId), raw.id)).not.toBeNull();
+    expect(
+      sdk.triggerCalls.find(
+        (call) => call.function_id === "event::session::stopped",
+      )?.payload,
+    ).toMatchObject({
+      pendingCompressionRecovered: true,
+      until: undefined,
+    });
+  });
+
+  it("does not globally scan raw payloads during a live sweep", async () => {
+    const sessionId = "ses_unindexed_legacy_raw";
+    const staleAt = new Date(
+      Date.now() - 10 * 60 * 60 * 1000,
+    ).toISOString();
+    const raw: RawObservation = {
+      id: "obs_unindexed_legacy_raw",
+      sessionId,
+      timestamp: staleAt,
+      hookType: "prompt_submit",
+      raw: { prompt: "unindexed legacy raw payload" },
+      userPrompt: "unindexed legacy raw payload",
+    };
+    await kv.set(
+      KV.sessions,
+      sessionId,
+      makeSession({ id: sessionId, updatedAt: staleAt }),
+    );
+    await kv.set(KV.rawPayloads, raw.id, raw);
+    const list = vi.spyOn(kv, "list");
+
+    const first = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: [sessionId] },
+    })) as { swept: string[]; failed: unknown[] };
+
+    expect(first.swept).toEqual([sessionId]);
+    expect(first.failed).toHaveLength(0);
+    expect(list).not.toHaveBeenCalledWith(KV.rawPayloads);
   });
 
   it("allows observations during consolidation and defers finalization", async () => {
@@ -681,6 +800,10 @@ describe("Session Sweep Scheduling", () => {
       userPrompt: "resume race",
     };
     await kv.set(KV.rawPayloads, raw.id, raw);
+    await kv.set(KV.pendingCompression(sessionId), raw.id, {
+      id: raw.id,
+      sessionId,
+    });
 
     const compressionStarted = deferred();
     const releaseCompression = deferred();
@@ -910,6 +1033,78 @@ describe("Session Sweep - Option K checkpoint path", () => {
     expect(result.checkpointed).not.toContain("ses_no_resume");
     expect(result.swept).not.toContain("ses_no_resume");
     expect(result.skipped).toContain("ses_no_resume");
+  });
+
+  it("does not reconsolidate a completed session after its recovered pending marker is cleared", async () => {
+    const anchor = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const sessionId = "ses_recovered_pending_once";
+    const raw: RawObservation = {
+      id: "obs_recovered_pending_once",
+      sessionId,
+      timestamp: anchor,
+      hookType: "prompt_submit",
+      raw: { prompt: "already compressed" },
+      userPrompt: "already compressed",
+    };
+    const observation: CompressedObservation = {
+      id: raw.id,
+      sessionId,
+      timestamp: raw.timestamp,
+      sourceType: raw.hookType,
+      type: "conversation",
+      title: "Recovered pending observation",
+      facts: [],
+      narrative: raw.userPrompt ?? "",
+      concepts: [],
+      files: [],
+      importance: 5,
+    };
+    await kv.set(
+      SESSIONS_SCOPE,
+      sessionId,
+      makeSession({
+        id: sessionId,
+        startedAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(),
+        updatedAt: anchor,
+        status: "completed",
+        endedAt: new Date(Date.now() - 18 * 60 * 60 * 1000).toISOString(),
+        lastCheckpointAt: anchor,
+      }),
+    );
+    await kv.set(KV.rawPayloads, raw.id, raw);
+    await kv.set(KV.rawPayloadsBySession(sessionId), raw.id, {
+      id: raw.id,
+      sessionId,
+    });
+    await kv.set(KV.observations(sessionId), observation.id, observation);
+    await kv.set(KV.pendingCompression(sessionId), raw.id, {
+      id: raw.id,
+      sessionId,
+    });
+
+    const first = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: [sessionId] },
+    })) as { checkpointed: string[] };
+
+    expect(first.checkpointed).toEqual([sessionId]);
+    expect(await kv.get(KV.pendingCompression(sessionId), raw.id)).toBeNull();
+    const checkpointCount = sdk.triggerCalls.filter(
+      (call) => call.function_id === "event::session::checkpoint",
+    ).length;
+
+    const second = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: { sessionIds: [sessionId] },
+    })) as { checkpointed: string[]; skipped: string[] };
+
+    expect(second.checkpointed).toHaveLength(0);
+    expect(second.skipped).toContain(sessionId);
+    expect(
+      sdk.triggerCalls.filter(
+        (call) => call.function_id === "event::session::checkpoint",
+      ),
+    ).toHaveLength(checkpointCount);
   });
 
   it("records session_checkpoint audit operation for checkpoint path", async () => {

@@ -20,9 +20,7 @@ vi.mock("../src/config.js", () => ({
   getEnvVar: vi.fn((key: string) => process.env[key]),
   getStandalonePersistPath: vi.fn(() => "/tmp/test-standalone.json"),
   isAgentScopeIsolated: vi.fn(
-    () =>
-      Boolean(process.env["AGENT_ID"]) &&
-      process.env["AGENTMEMORY_AGENT_SCOPE"] === "isolated",
+    () => process.env["AGENTMEMORY_AGENT_SCOPE"] === "isolated",
   ),
 }));
 
@@ -555,6 +553,57 @@ describe("handleToolCall", () => {
       (memory: { content: string }) => memory.content,
     );
     expect(contents).toEqual(["agent b memory"]);
+  });
+
+  it("rejects local fallback access when isolated identity is missing", async () => {
+    const kv = new InMemoryKV();
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    vi.stubEnv("AGENT_ID", "");
+
+    await expect(
+      handleToolCall("memory_recall", { query: "memory" }, kv),
+    ).rejects.toThrow(
+      "AGENTMEMORY_AGENT_SCOPE=isolated requires AGENT_ID",
+    );
+  });
+
+  it("rejects local fallback writes when isolated identity is missing", async () => {
+    const kv = new InMemoryKV();
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    vi.stubEnv("AGENT_ID", "");
+
+    await expect(
+      handleToolCall("memory_save", { content: "private" }, kv),
+    ).rejects.toThrow(
+      "AGENTMEMORY_AGENT_SCOPE=isolated requires AGENT_ID",
+    );
+    expect(await kv.list("mem:memories")).toEqual([]);
+  });
+
+  it("rejects local fallback export when isolated identity is missing", async () => {
+    const kv = new InMemoryKV();
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    vi.stubEnv("AGENT_ID", "");
+
+    await expect(handleToolCall("memory_export", {}, kv)).rejects.toThrow(
+      "AGENTMEMORY_AGENT_SCOPE=isolated requires AGENT_ID",
+    );
+  });
+
+  it("isolated local fallback export returns only the server identity", async () => {
+    const kv = new InMemoryKV();
+    vi.stubEnv("AGENTMEMORY_AGENT_SCOPE", "isolated");
+    vi.stubEnv("AGENT_ID", "agent-a");
+    await handleToolCall("memory_save", { content: "agent a memory" }, kv);
+    vi.stubEnv("AGENT_ID", "agent-b");
+    await handleToolCall("memory_save", { content: "agent b memory" }, kv);
+
+    const result = await handleToolCall("memory_export", {}, kv);
+    const parsed = JSON.parse(result.content[0].text);
+
+    expect(parsed.memories).toHaveLength(1);
+    expect(parsed.memories[0].content).toBe("agent b memory");
+    expect(parsed.memories[0].agentId).toBe("agent-b");
   });
 
   it("memory_recall with project also matches legacy memories without a project field", async () => {

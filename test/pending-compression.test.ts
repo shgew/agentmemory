@@ -114,6 +114,36 @@ describe("pending compression recovery", () => {
     ).toHaveLength(0);
   });
 
+  it("counts an already-compressed pending marker as recovered work", async () => {
+    const kv = mockKV();
+    const raw = rawObservation();
+    await seedPending(kv, raw);
+    await kv.set(KV.observations(raw.sessionId), raw.id, {
+      id: raw.id,
+      sessionId: raw.sessionId,
+      timestamp: raw.timestamp,
+      sourceType: raw.hookType,
+      type: "conversation",
+      title: "Already compressed",
+      facts: [],
+      narrative: "retain this",
+      concepts: [],
+      files: [],
+      importance: 5,
+    } satisfies CompressedObservation);
+
+    const result = await drainPendingCompression(
+      { trigger: vi.fn() } as never,
+      kv as never,
+      raw.sessionId,
+    );
+
+    expect(result).toEqual({ attempted: 0, completed: 1, remainingIds: [] });
+    expect(
+      await kv.get(KV.pendingCompression(raw.sessionId), raw.id),
+    ).toBeNull();
+  });
+
   it("uses mem::compress when automatic compression is enabled", async () => {
     vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "true");
     const kv = mockKV();
@@ -180,7 +210,7 @@ describe("pending compression recovery", () => {
       raw.sessionId,
     );
 
-    expect(second).toEqual({ attempted: 0, completed: 0, remainingIds: [] });
+    expect(second).toEqual({ attempted: 0, completed: 1, remainingIds: [] });
     expect(searchIds.has(raw.id)).toBe(true);
     expect(
       await kv.get(KV.pendingCompression(raw.sessionId), raw.id),
@@ -224,6 +254,23 @@ describe("pending compression recovery", () => {
     expect(
       await kv.list(KV.pendingCompression(raw.sessionId)),
     ).toHaveLength(0);
+  });
+
+  it("maintains a session-owned raw index through the raw lifecycle", async () => {
+    const kv = mockKV();
+    const raw = rawObservation();
+
+    await storeRawObservation(kv as never, raw);
+
+    expect(
+      await kv.get(`mem:raw-payloads-by-session:${raw.sessionId}`, raw.id),
+    ).toEqual({ id: raw.id, sessionId: raw.sessionId });
+
+    await deleteRawObservation(kv as never, raw.sessionId, raw.id);
+
+    expect(
+      await kv.get(`mem:raw-payloads-by-session:${raw.sessionId}`, raw.id),
+    ).toBeNull();
   });
 
   it("clears stale pending entries while using a sweep raw snapshot", async () => {

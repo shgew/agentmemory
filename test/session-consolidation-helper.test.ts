@@ -205,6 +205,45 @@ describe("event::session::stopped + checkpoint pipeline", () => {
     expect(graphCall).toBeDefined();
   });
 
+  it("runs graph extraction for an already-compressed pending marker outside the requested window", async () => {
+    const sessionId = "ses_recovered_marker";
+    const raw = {
+      id: "obs_recovered_marker",
+      sessionId,
+      timestamp: "2026-01-01T12:00:00.000Z",
+      hookType: "prompt_submit",
+      raw: { prompt: "recovered" },
+      userPrompt: "recovered",
+    };
+    await kv.set(KV.rawPayloads, raw.id, raw);
+    await kv.set(KV.pendingCompression(sessionId), raw.id, {
+      id: raw.id,
+      sessionId,
+    });
+    await kv.set(
+      KV.observations(sessionId),
+      raw.id,
+      makeObs(raw.id, sessionId, raw.timestamp),
+    );
+
+    await sdk.trigger({
+      function_id: "event::session::stopped",
+      payload: {
+        sessionId,
+        since: "2026-01-01T09:00:00.000Z",
+        until: "2026-01-01T10:00:00.000Z",
+        waitForCompletion: true,
+      },
+    });
+
+    const graphCall = sdk.calls.find(
+      (call) => call.function_id === "mem::graph-extract",
+    );
+    expect(graphCall?.payload).toEqual({
+      observations: [makeObs(raw.id, sessionId, raw.timestamp)],
+    });
+  });
+
   it("event::session::ended hydrates lastCheckpointAt from activity anchor", async () => {
     const sessionId = "ses_ended";
     const startedAt = "2026-01-01T09:00:00.000Z";

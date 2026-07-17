@@ -28,6 +28,9 @@ export { clipEmbedInput } from "../state/embedding-input.js";
 let index: SearchIndex | null = null;
 let vectorIndex: VectorIndex | null = null;
 let currentEmbeddingProvider: EmbeddingProvider | null = null;
+let activeSearchIndexRebuild: Promise<number> | null = null;
+let activeSearchMutationJournal: ((mutation: SearchIndexMutation) => void) | null =
+  null;
 type VectorMutation =
   | { type: "add"; id: string; sessionId: string; embedding: Float32Array }
   | { type: "remove"; id: string };
@@ -58,7 +61,13 @@ export function withIndexMaintenance<T>(
 }
 
 export function getSearchIndex(): SearchIndex {
-  if (!index) index = new SearchIndex();
+  if (!index) {
+    index = new SearchIndex();
+    index.setMutationListener((mutation) => {
+      activeSearchMutationJournal?.(mutation);
+      scheduleIndexSave();
+    });
+  }
   return index;
 }
 
@@ -79,7 +88,9 @@ export function getEmbeddingProvider(): EmbeddingProvider | null {
 }
 
 export function vectorIndexRemove(id: string): void {
-  vectorIndex?.remove(id);
+  const currentIndex = vectorIndex;
+  currentIndex?.remove(id);
+  if (currentIndex) scheduleIndexSave();
   activeVectorMutationJournal?.push({ type: "remove", id });
 }
 
@@ -91,6 +102,7 @@ function addVector(
   recordMutation = true,
 ): void {
   target.add(id, sessionId, embedding);
+  if (target === vectorIndex) scheduleIndexSave();
   if (recordMutation) {
     activeVectorMutationJournal?.push({
       type: "add",
@@ -279,7 +291,7 @@ export async function vectorIndexAddBatchGuarded(
 
 async function rebuildIndexNow(
   kv: StateKV,
-  options: { strict?: boolean } = {},
+  options: { strict?: boolean; requireCompleteVectorRebuild?: boolean } = {},
 ): Promise<number> {
   if (activeVectorMutationJournal) {
     throw new Error("index rebuild already in progress");
@@ -291,6 +303,7 @@ async function rebuildIndexNow(
   const rebuiltVectorIndex = liveVectorIndex ? new VectorIndex() : null;
   const searchJournal: SearchIndexMutation[] = [];
   const vectorJournal: VectorMutation[] = [];
+  let vectorRebuildFailed = !!(liveVectorIndex && !embeddingProvider);
   const recordSearchMutation = (mutation: SearchIndexMutation): void => {
     if (mutation.type === "remove") {
       searchJournal.push(mutation);
@@ -306,7 +319,7 @@ async function rebuildIndexNow(
       },
     });
   };
-  liveSearchIndex.setMutationListener(recordSearchMutation);
+  activeSearchMutationJournal = recordSearchMutation;
   activeVectorMutationJournal = vectorJournal;
   const batchSize = getRebuildEmbedBatchSize();
   const pending: EmbedJob[] = [];
@@ -315,12 +328,13 @@ async function rebuildIndexNow(
   const flush = async (): Promise<void> => {
     if (pending.length === 0) return;
     if (rebuiltVectorIndex && embeddingProvider) {
-      await addVectorBatch(
+      const result = await addVectorBatch(
         rebuiltVectorIndex,
         embeddingProvider,
         pending,
         false,
       );
+      vectorRebuildFailed ||= result.fail > 0;
     }
     pending.length = 0;
   };
@@ -398,8 +412,11 @@ async function rebuildIndexNow(
         "embedding provider or vector index changed during index rebuild",
       );
     }
+    if (options.requireCompleteVectorRebuild && vectorRebuildFailed) {
+      throw new Error("vector index rebuild incomplete");
+    }
 
-    liveSearchIndex.setMutationListener(null);
+    activeSearchMutationJournal = null;
     activeVectorMutationJournal = null;
     liveSearchIndex.restoreFrom(rebuiltSearchIndex);
     for (const mutation of searchJournal) {
@@ -409,7 +426,7 @@ async function rebuildIndexNow(
         liveSearchIndex.add(mutation.observation);
       }
     }
-    if (liveVectorIndex && rebuiltVectorIndex) {
+    if (liveVectorIndex && rebuiltVectorIndex && !vectorRebuildFailed) {
       liveVectorIndex.restoreFrom(rebuiltVectorIndex);
       for (const mutation of vectorJournal) {
         if (mutation.type === "remove") {
@@ -423,27 +440,49 @@ async function rebuildIndexNow(
         }
       }
     }
+    scheduleIndexSave();
     return count;
   } finally {
-    liveSearchIndex.setMutationListener(null);
+    if (activeSearchMutationJournal === recordSearchMutation) {
+      activeSearchMutationJournal = null;
+    }
     if (activeVectorMutationJournal === vectorJournal) {
       activeVectorMutationJournal = null;
     }
   }
 }
 
+function trackSearchIndexRebuild(rebuilding: Promise<number>): Promise<number> {
+  activeSearchIndexRebuild = rebuilding;
+  void rebuilding.then(
+    () => {
+      if (activeSearchIndexRebuild === rebuilding) {
+        activeSearchIndexRebuild = null;
+      }
+    },
+    () => {
+      if (activeSearchIndexRebuild === rebuilding) {
+        activeSearchIndexRebuild = null;
+      }
+    },
+  );
+  return rebuilding;
+}
+
 export function rebuildIndex(
   kv: StateKV,
-  options: { strict?: boolean } = {},
+  options: { strict?: boolean; requireCompleteVectorRebuild?: boolean } = {},
 ): Promise<number> {
-  return queueIndexRebuild(() => rebuildIndexNow(kv, options));
+  return trackSearchIndexRebuild(
+    queueIndexRebuild(() => rebuildIndexNow(kv, options)),
+  );
 }
 
 export function rebuildIndexWithinMaintenance(
   kv: StateKV,
-  options: { strict?: boolean } = {},
+  options: { strict?: boolean; requireCompleteVectorRebuild?: boolean } = {},
 ): Promise<number> {
-  return rebuildIndexNow(kv, options);
+  return trackSearchIndexRebuild(rebuildIndexNow(kv, options));
 }
 
 // Re-embed the whole corpus against the active embedding provider and swap
@@ -646,16 +685,8 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
         tokenBudget = data.token_budget;
       }
 
-      if (idx.size === 0 && !isIndexRebuildPending()) {
-        void rebuildIndex(kv)
-          .then((count) =>
-            logger.info("Search index rebuilt", { entries: count }),
-          )
-          .catch((error) =>
-            logger.warn("Search index rebuild failed", {
-              error: error instanceof Error ? error.message : String(error),
-            }),
-          );
+      if (idx.size === 0) {
+        await (activeSearchIndexRebuild ?? rebuildIndex(kv));
       }
 
       // When filtering by project/cwd, over-fetch from the index so the
@@ -734,7 +765,7 @@ export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {
             // unscoped and let it through" to preserve backward-compatibility.
             if (projectFilter) {
               const memProject = await loadMemoryProject(r.obsId);
-              if (memProject !== null && memProject !== projectFilter) continue;
+              if (memProject !== projectFilter) continue;
             }
             // cwd filter does not apply to unbound entries.
           }

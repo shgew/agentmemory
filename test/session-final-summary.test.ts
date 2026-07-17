@@ -272,6 +272,10 @@ describe("session sweep final summary", () => {
       userPrompt: "retain this",
     };
     await kv.set(KV.rawPayloads, raw.id, raw);
+    await kv.set(KV.rawPayloadsBySession(sessionId), raw.id, {
+      id: raw.id,
+      sessionId,
+    });
     const compress = vi.fn(async () => {
       await kv.set(
         KV.observations(sessionId),

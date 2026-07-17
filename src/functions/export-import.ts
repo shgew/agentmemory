@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import type { ISdk } from "iii-sdk";
 import type {
   Session,
@@ -33,6 +34,7 @@ import {
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { VERSION } from "../version.js";
+import { getAgentId, isAgentScopeIsolated } from "../config.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import {
@@ -48,6 +50,7 @@ import {
 } from "./search.js";
 import {
   clearPendingCompression,
+  deleteRawObservation,
   markPendingCompression,
   storeRawObservationUnderOwnerLock,
 } from "./raw-observations.js";
@@ -84,12 +87,180 @@ function validateImportRows(
   return null;
 }
 
-async function clearImportedState(kv: StateKV): Promise<void> {
-  const sessions = await kv.list<Session>(KV.sessions);
+function getIsolatedAgentId(operation: string): string | undefined {
+  if (!isAgentScopeIsolated()) return undefined;
+  const agentId = getAgentId();
+  if (!agentId) {
+    throw new Error(
+      `${operation}: AGENTMEMORY_AGENT_SCOPE=isolated requires AGENT_ID`,
+    );
+  }
+  return agentId;
+}
+
+type ScopedImportResult =
+  | { readonly data: ExportData }
+  | { readonly error: string };
+
+function scopeImportData(
+  importData: ExportData,
+  agentId: string,
+): ScopedImportResult {
+  const foreignSession = importData.sessions.find(
+    (session) => session.agentId !== undefined && session.agentId !== agentId,
+  );
+  if (foreignSession) {
+    return { error: `session ${foreignSession.id} belongs to another agent` };
+  }
+  const foreignObservation = Object.values(importData.observations)
+    .flat()
+    .find(
+      (observation) =>
+        observation.agentId !== undefined && observation.agentId !== agentId,
+    );
+  if (foreignObservation) {
+    return {
+      error: `observation ${foreignObservation.id} belongs to another agent`,
+    };
+  }
+  const foreignRawPayload = (importData.rawPayloads ?? []).find(
+    (raw) => raw.agentId !== undefined && raw.agentId !== agentId,
+  );
+  if (foreignRawPayload) {
+    return {
+      error: `raw payload ${foreignRawPayload.id} belongs to another agent`,
+    };
+  }
+  const foreignMemory = importData.memories.find(
+    (memory) => memory.agentId !== undefined && memory.agentId !== agentId,
+  );
+  if (foreignMemory) {
+    return { error: `memory ${foreignMemory.id} belongs to another agent` };
+  }
+
+  return {
+    data: {
+      version: importData.version,
+      exportedAt: importData.exportedAt,
+      sessions: importData.sessions.map((session) => ({ ...session, agentId })),
+      observations: Object.fromEntries(
+        Object.entries(importData.observations).map(([sessionId, rows]) => [
+          sessionId,
+          rows.map((observation) => ({ ...observation, agentId })),
+        ]),
+      ),
+      rawPayloads: (importData.rawPayloads ?? []).map((raw) => ({
+        ...raw,
+        agentId,
+      })),
+      memories: importData.memories.map((memory) => ({ ...memory, agentId })),
+      summaries: importData.summaries,
+      ...(importData.pagination !== undefined && {
+        pagination: importData.pagination,
+      }),
+    },
+  };
+}
+
+type StateMutation = {
+  readonly scope: string;
+  readonly key: string;
+  rollbackValue: unknown | null;
+  written?: unknown | null;
+};
+
+function beginImportRollback(kv: StateKV): {
+  readonly kv: StateKV;
+  disarm: () => void;
+  rollback: () => Promise<void>;
+} {
+  const set = kv.set.bind(kv);
+  const deleteRecord = kv.delete.bind(kv);
+  const mutations = new Map<string, StateMutation>();
+  let armed = true;
+  const mutationKey = (scope: string, key: string) => `${scope}\u0000${key}`;
+  const capture = async (scope: string, key: string): Promise<StateMutation> => {
+    const id = mutationKey(scope, key);
+    const existing = mutations.get(id);
+    if (existing) return existing;
+    const mutation = {
+      scope,
+      key,
+      rollbackValue: await kv.get(scope, key),
+    };
+    mutations.set(id, mutation);
+    return mutation;
+  };
+  const captureBeforeOverwrite = async (
+    scope: string,
+    key: string,
+  ): Promise<StateMutation> => {
+    const mutation = await capture(scope, key);
+    if (!("written" in mutation)) return mutation;
+    // StateKV has no CAS, so writes in this read-to-write gap remain undetectable.
+    const current = await kv.get(scope, key);
+    if (!isDeepStrictEqual(current, mutation.written)) {
+      mutation.rollbackValue = current;
+    }
+    return mutation;
+  };
+  const scopedKv = new Proxy(kv, {
+    get(target, property) {
+      if (property === "set") {
+        return async <T>(scope: string, key: string, value: T): Promise<T> => {
+          const mutation = await captureBeforeOverwrite(scope, key);
+          const written = await set(scope, key, value);
+          mutation.written = written;
+          return written;
+        };
+      }
+      if (property === "delete") {
+        return async (scope: string, key: string): Promise<void> => {
+          const mutation = await captureBeforeOverwrite(scope, key);
+          await deleteRecord(scope, key);
+          mutation.written = null;
+        };
+      }
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+
+  return {
+    kv: scopedKv,
+    disarm: () => {
+      armed = false;
+    },
+    rollback: async () => {
+      if (!armed) return;
+      for (const mutation of [...mutations.values()].reverse()) {
+        if (!("written" in mutation)) continue;
+        const current = await kv.get(mutation.scope, mutation.key);
+        if (!isDeepStrictEqual(current, mutation.written)) continue;
+        if (mutation.rollbackValue === null) {
+          await deleteRecord(mutation.scope, mutation.key);
+        } else {
+          await set(mutation.scope, mutation.key, mutation.rollbackValue);
+        }
+      }
+    },
+  };
+}
+
+async function clearImportedState(
+  kv: StateKV,
+  agentId?: string,
+): Promise<void> {
+  const sessions = (await kv.list<Session>(KV.sessions)).filter(
+    (session) => agentId === undefined || session.agentId === agentId,
+  );
   const observations = await Promise.all(
     sessions.map(async (session) => ({
       sessionId: session.id,
-      rows: await kv.list<CompressedObservation>(KV.observations(session.id)),
+      rows: (await kv.list<CompressedObservation>(KV.observations(session.id))).filter(
+        (observation) =>
+          agentId === undefined || observation.agentId === agentId,
+      ),
     })),
   );
   const pendingCompression = await Promise.all(
@@ -121,9 +292,26 @@ async function clearImportedState(kv: StateKV): Promise<void> {
     profiles,
     accessLogs,
   ] = await Promise.all([
-    kv.list<RawObservation>(KV.rawPayloads),
-    kv.list<Memory>(KV.memories),
-    kv.list<SessionSummary>(KV.summaries),
+    kv
+      .list<RawObservation>(KV.rawPayloads)
+      .then((rows) =>
+        rows.filter(
+          (row) =>
+            agentId === undefined ||
+            (row.agentId === agentId &&
+              sessions.some((session) => session.id === row.sessionId)),
+        ),
+      ),
+    kv
+      .list<Memory>(KV.memories)
+      .then((rows) => rows.filter((row) => agentId === undefined || row.agentId === agentId)),
+    kv
+      .list<SessionSummary>(KV.summaries)
+      .then((rows) =>
+        rows.filter(
+          (row) => agentId === undefined || sessions.some((session) => session.id === row.sessionId),
+        ),
+      ),
     kv.list<Action>(KV.actions),
     kv.list<ActionEdge>(KV.actionEdges),
     kv.list<Routine>(KV.routines),
@@ -151,6 +339,9 @@ async function clearImportedState(kv: StateKV): Promise<void> {
   };
 
   const observationOwners = new Map<string, Set<string>>();
+  const rawPayloadSessions = new Map(
+    rawPayloads.map((raw) => [raw.id, raw.sessionId]),
+  );
   const addObservationOwner = (id: string, sessionId: string) => {
     const sessionIds = observationOwners.get(id) ?? new Set<string>();
     sessionIds.add(sessionId);
@@ -164,7 +355,9 @@ async function clearImportedState(kv: StateKV): Promise<void> {
   for (const row of rawPayloads) addObservationOwner(row.id, row.sessionId);
   for (const bucket of pendingCompression) {
     for (const row of bucket.rows) {
-      addObservationOwner(row.id, bucket.sessionId);
+      if (agentId === undefined || observationOwners.has(row.id)) {
+        addObservationOwner(row.id, bucket.sessionId);
+      }
     }
   }
 
@@ -175,7 +368,10 @@ async function clearImportedState(kv: StateKV): Promise<void> {
         await kv.delete(KV.observations(sessionId), observationId);
         await kv.delete(KV.pendingCompression(sessionId), observationId);
       }
-      await kv.delete(KV.rawPayloads, observationId);
+      const rawSessionId = rawPayloadSessions.get(observationId);
+      if (rawSessionId !== undefined) {
+        await deleteRawObservation(kv, rawSessionId, observationId);
+      }
       await deleteOwnerAccess(observationId);
     });
   }
@@ -184,43 +380,45 @@ async function clearImportedState(kv: StateKV): Promise<void> {
     await deleteOwnerAccess(row.id);
   }
   for (const row of summaries) await kv.delete(KV.summaries, row.sessionId);
-  for (const row of actions) await kv.delete(KV.actions, row.id);
-  for (const row of actionEdges) await kv.delete(KV.actionEdges, row.id);
-  for (const row of routines) await kv.delete(KV.routines, row.id);
-  for (const row of signals) await kv.delete(KV.signals, row.id);
-  for (const row of checkpoints) await kv.delete(KV.checkpoints, row.id);
-  for (const row of sentinels) await kv.delete(KV.sentinels, row.id);
-  for (const row of sketches) await kv.delete(KV.sketches, row.id);
-  for (const row of crystals) await kv.delete(KV.crystals, row.id);
-  for (const row of facets) await kv.delete(KV.facets, row.id);
-  for (const row of lessons) await kv.delete(KV.lessons, row.id);
-  for (const row of insights) await kv.delete(KV.insights, row.id);
-  for (const row of graphEdges) {
-    await kv.delete(KV.graphEdges, row.id);
-    await kv.delete(
-      KV.graphEdgeKey,
-      edgeIndexKey(row.sourceNodeId, row.targetNodeId, row.type),
-    );
+  if (agentId === undefined) {
+    for (const row of actions) await kv.delete(KV.actions, row.id);
+    for (const row of actionEdges) await kv.delete(KV.actionEdges, row.id);
+    for (const row of routines) await kv.delete(KV.routines, row.id);
+    for (const row of signals) await kv.delete(KV.signals, row.id);
+    for (const row of checkpoints) await kv.delete(KV.checkpoints, row.id);
+    for (const row of sentinels) await kv.delete(KV.sentinels, row.id);
+    for (const row of sketches) await kv.delete(KV.sketches, row.id);
+    for (const row of crystals) await kv.delete(KV.crystals, row.id);
+    for (const row of facets) await kv.delete(KV.facets, row.id);
+    for (const row of lessons) await kv.delete(KV.lessons, row.id);
+    for (const row of insights) await kv.delete(KV.insights, row.id);
+    for (const row of graphEdges) {
+      await kv.delete(KV.graphEdges, row.id);
+      await kv.delete(
+        KV.graphEdgeKey,
+        edgeIndexKey(row.sourceNodeId, row.targetNodeId, row.type),
+      );
+    }
+    for (const row of graphNodes) {
+      await kv.delete(KV.graphNodes, row.id);
+      await kv.delete(KV.graphNameIndex, nameIndexKey(row.type, row.name));
+      await kv.delete(KV.graphNodeDegree, row.id);
+    }
+    for (const row of graphTombstones) {
+      await kv.delete(KV.graphTombstones, row.id);
+    }
+    await kv.delete(KV.graphSnapshot, SNAPSHOT_KEY);
+    for (const row of semantic) {
+      await kv.delete(KV.semantic, row.id);
+      await deleteOwnerAccess(row.id);
+    }
+    for (const row of procedural) {
+      await kv.delete(KV.procedural, row.id);
+      await deleteOwnerAccess(row.id);
+    }
+    for (const row of profiles) await kv.delete(KV.profiles, row.project);
+    for (const row of accessLogs) await deleteOwnerAccess(row.memoryId);
   }
-  for (const row of graphNodes) {
-    await kv.delete(KV.graphNodes, row.id);
-    await kv.delete(KV.graphNameIndex, nameIndexKey(row.type, row.name));
-    await kv.delete(KV.graphNodeDegree, row.id);
-  }
-  for (const row of graphTombstones) {
-    await kv.delete(KV.graphTombstones, row.id);
-  }
-  await kv.delete(KV.graphSnapshot, SNAPSHOT_KEY);
-  for (const row of semantic) {
-    await kv.delete(KV.semantic, row.id);
-    await deleteOwnerAccess(row.id);
-  }
-  for (const row of procedural) {
-    await kv.delete(KV.procedural, row.id);
-    await deleteOwnerAccess(row.id);
-  }
-  for (const row of profiles) await kv.delete(KV.profiles, row.project);
-  for (const row of accessLogs) await deleteOwnerAccess(row.memoryId);
 }
 
 async function collectImageReferenceCounts(
@@ -264,23 +462,48 @@ async function collectImageReferenceCounts(
 }
 
 async function rebuildImageReferenceCounts(
-  sdk: ISdk,
   kv: StateKV,
   previousRefs: ReadonlySet<string>,
-): Promise<number> {
+): Promise<{ imageRefs: number; orphanedRefs: string[] }> {
   const counts = await collectImageReferenceCounts(kv);
   await Promise.all(
     Array.from(counts, ([ref, count]) => kv.set(KV.imageRefs, ref, count)),
   );
   const orphanedRefs = [...previousRefs].filter((ref) => !counts.has(ref));
-  if (orphanedRefs.length > 0) {
-    const { decrementImageRef } = await import("./image-refs.js");
-    for (const ref of orphanedRefs) {
-      await kv.set(KV.imageRefs, ref, 1);
+  for (const ref of orphanedRefs) {
+    await kv.set(KV.imageRefs, ref, 1);
+  }
+  return { imageRefs: counts.size, orphanedRefs };
+}
+
+async function releaseOrphanedImageRefs(
+  sdk: ISdk,
+  kv: StateKV,
+  orphanedRefs: string[],
+): Promise<void> {
+  if (orphanedRefs.length === 0) return;
+  const { decrementImageRef } = await import("./image-refs.js");
+  for (const ref of orphanedRefs) {
+    try {
       await decrementImageRef(kv, sdk, ref);
+    } catch (error) {
+      logger.warn("Import orphan image cleanup failed", {
+        imageRef: ref,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      try {
+        await kv.set(KV.imageRefs, ref, 1);
+      } catch (retryStateError) {
+        logger.warn("Import orphan image retry state failed", {
+          imageRef: ref,
+          error:
+            retryStateError instanceof Error
+              ? retryStateError.message
+              : String(retryStateError),
+        });
+      }
     }
   }
-  return counts.size;
 }
 
 async function rebuildImportedGraphState(kv: StateKV): Promise<void> {
@@ -334,6 +557,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction(
     "mem::export",
     async (data?: { maxSessions?: number; offset?: number }) => {
+      const isolatedAgentId = getIsolatedAgentId("mem::export");
       const rawMax = Number(data?.maxSessions);
       const maxSessions =
         Number.isFinite(rawMax) && rawMax > 0
@@ -345,12 +569,18 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           ? Math.floor(rawOffset)
           : 0;
 
-      const allSessions = await kv.list<Session>(KV.sessions);
+      const allSessions = (await kv.list<Session>(KV.sessions)).filter(
+        (session) =>
+          isolatedAgentId === undefined || session.agentId === isolatedAgentId,
+      );
       const paginatedSessions =
         maxSessions !== undefined
           ? allSessions.slice(offset, offset + maxSessions)
           : allSessions;
-      const memories = await kv.list<Memory>(KV.memories);
+      const memories = (await kv.list<Memory>(KV.memories)).filter(
+        (memory) =>
+          isolatedAgentId === undefined || memory.agentId === isolatedAgentId,
+      );
       const summaries = await kv.list<SessionSummary>(KV.summaries);
 
       const observations: Record<string, CompressedObservation[]> = {};
@@ -362,16 +592,27 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         ),
       );
       for (const { sessionId, obs } of obsResults) {
-        if (obs.length > 0) {
-          observations[sessionId] = obs;
+        const scopedObservations = obs.filter(
+          (observation) =>
+            isolatedAgentId === undefined ||
+            observation.agentId === isolatedAgentId,
+        );
+        if (scopedObservations.length > 0) {
+          observations[sessionId] = scopedObservations;
         }
       }
       const exportedSessionIds = new Set(
         paginatedSessions.map((session) => session.id),
       );
-      const rawPayloads = (
-        await kv.list<RawObservation>(KV.rawPayloads)
-      ).filter((raw) => exportedSessionIds.has(raw.sessionId));
+      const rawPayloads = (await kv.list<RawObservation>(KV.rawPayloads)).filter(
+        (raw) =>
+          exportedSessionIds.has(raw.sessionId) &&
+          (isolatedAgentId === undefined || raw.agentId === isolatedAgentId),
+      );
+      const exportedSummaries =
+        isolatedAgentId === undefined
+          ? summaries
+          : summaries.filter((summary) => exportedSessionIds.has(summary.sessionId));
 
       const profiles: ProjectProfile[] = [];
       const uniqueProjects = [
@@ -423,9 +664,13 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       ]);
       const exportedAccessOwnerIds = new Set([
         ...memories.map((memory) => memory.id),
-        ...semanticMemories.map((memory) => memory.id),
-        ...proceduralMemories.map((memory) => memory.id),
-        ...lessons.map((lesson) => lesson.id),
+        ...(isolatedAgentId === undefined
+          ? [
+              ...semanticMemories.map((memory) => memory.id),
+              ...proceduralMemories.map((memory) => memory.id),
+              ...lessons.map((lesson) => lesson.id),
+            ]
+          : []),
         ...Object.values(observations).flatMap((rows) =>
           rows.map((observation) => observation.id),
         ),
@@ -441,25 +686,61 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         observations,
         rawPayloads: rawPayloads.length > 0 ? rawPayloads : undefined,
         memories,
-        summaries,
-        profiles: profiles.length > 0 ? profiles : undefined,
-        graphNodes: graphNodes.length > 0 ? graphNodes : undefined,
-        graphEdges: graphEdges.length > 0 ? graphEdges : undefined,
+        summaries: exportedSummaries,
+        profiles:
+          isolatedAgentId === undefined && profiles.length > 0
+            ? profiles
+            : undefined,
+        graphNodes:
+          isolatedAgentId === undefined && graphNodes.length > 0
+            ? graphNodes
+            : undefined,
+        graphEdges:
+          isolatedAgentId === undefined && graphEdges.length > 0
+            ? graphEdges
+            : undefined,
         semanticMemories:
-          semanticMemories.length > 0 ? semanticMemories : undefined,
+          isolatedAgentId === undefined && semanticMemories.length > 0
+            ? semanticMemories
+            : undefined,
         proceduralMemories:
-          proceduralMemories.length > 0 ? proceduralMemories : undefined,
-        actions: actions.length > 0 ? actions : undefined,
-        actionEdges: actionEdges.length > 0 ? actionEdges : undefined,
-        sentinels: sentinels.length > 0 ? sentinels : undefined,
-        sketches: sketches.length > 0 ? sketches : undefined,
-        crystals: crystals.length > 0 ? crystals : undefined,
-        facets: facets.length > 0 ? facets : undefined,
-        lessons: lessons.length > 0 ? lessons : undefined,
-        insights: insights.length > 0 ? insights : undefined,
-        routines: routines.length > 0 ? routines : undefined,
-        signals: signals.length > 0 ? signals : undefined,
-        checkpoints: checkpoints.length > 0 ? checkpoints : undefined,
+          isolatedAgentId === undefined && proceduralMemories.length > 0
+            ? proceduralMemories
+            : undefined,
+        actions:
+          isolatedAgentId === undefined && actions.length > 0 ? actions : undefined,
+        actionEdges:
+          isolatedAgentId === undefined && actionEdges.length > 0
+            ? actionEdges
+            : undefined,
+        sentinels:
+          isolatedAgentId === undefined && sentinels.length > 0
+            ? sentinels
+            : undefined,
+        sketches:
+          isolatedAgentId === undefined && sketches.length > 0
+            ? sketches
+            : undefined,
+        crystals:
+          isolatedAgentId === undefined && crystals.length > 0
+            ? crystals
+            : undefined,
+        facets:
+          isolatedAgentId === undefined && facets.length > 0 ? facets : undefined,
+        lessons:
+          isolatedAgentId === undefined && lessons.length > 0 ? lessons : undefined,
+        insights:
+          isolatedAgentId === undefined && insights.length > 0 ? insights : undefined,
+        routines:
+          isolatedAgentId === undefined && routines.length > 0
+            ? routines
+            : undefined,
+        signals:
+          isolatedAgentId === undefined && signals.length > 0 ? signals : undefined,
+        checkpoints:
+          isolatedAgentId === undefined && checkpoints.length > 0
+            ? checkpoints
+            : undefined,
         accessLogs:
           exportedAccessLogs.length > 0 ? exportedAccessLogs : undefined,
       };
@@ -513,7 +794,15 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
             error: "strategy must be merge, replace, or skip",
           };
         }
-        const importData = data.exportData;
+        const isolatedAgentId = getIsolatedAgentId("mem::import");
+        let importData = data.exportData;
+        if (isolatedAgentId !== undefined) {
+          const scopedImport = scopeImportData(importData, isolatedAgentId);
+          if ("error" in scopedImport) {
+            return { success: false, error: scopedImport.error };
+          }
+          importData = scopedImport.data;
+        }
 
         const supportedVersions = new Set([
           "0.3.0",
@@ -740,8 +1029,17 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
 
         return withIndexMaintenance(async () => {
           await drainPendingImageReleases(sdk, kv);
+          const rollback =
+            strategy === "replace" ? beginImportRollback(kv) : undefined;
+          try {
+            return await (async (kv: StateKV) => {
           const ownershipResult = await withImageOwnershipLock(async () => {
-            const currentSessions = await kv.list<Session>(KV.sessions);
+            const allCurrentSessions = await kv.list<Session>(KV.sessions);
+            const currentSessions = allCurrentSessions.filter(
+              (session) =>
+                isolatedAgentId === undefined ||
+                session.agentId === isolatedAgentId,
+            );
             const sessionIds = new Set(
               importData.sessions.map((session) => session.id),
             );
@@ -755,6 +1053,23 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
                 const availableSessionIds = new Set(
                   importData.sessions.map((session) => session.id),
                 );
+                if (isolatedAgentId !== undefined) {
+                  const currentSessionsById = new Map(
+                    allCurrentSessions.map((session) => [session.id, session]),
+                  );
+                  for (const session of importData.sessions) {
+                    const existing = currentSessionsById.get(session.id);
+                    if (
+                      existing !== undefined &&
+                      existing.agentId !== isolatedAgentId
+                    ) {
+                      return {
+                        success: false as const,
+                        error: `session ${session.id} belongs to another agent`,
+                      };
+                    }
+                  }
+                }
                 if (strategy !== "replace") {
                   for (const session of currentSessions) {
                     availableSessionIds.add(session.id);
@@ -777,6 +1092,61 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
                     success: false as const,
                     error: `rawPayloads references unavailable session ${unavailableRawSession.sessionId}`,
                   };
+                }
+                const unavailableSummary = importData.summaries.find(
+                  (summary) => !availableSessionIds.has(summary.sessionId),
+                );
+                if (unavailableSummary) {
+                  return {
+                    success: false as const,
+                    error: `summary references unavailable session ${unavailableSummary.sessionId}`,
+                  };
+                }
+                if (isolatedAgentId !== undefined) {
+                  for (const rows of Object.values(importData.observations)) {
+                    for (const observation of rows) {
+                      const existing = await kv.get<CompressedObservation>(
+                        KV.observations(observation.sessionId),
+                        observation.id,
+                      );
+                      if (
+                        existing !== null &&
+                        existing.agentId !== isolatedAgentId
+                      ) {
+                        return {
+                          success: false as const,
+                          error: `observation ${observation.id} belongs to another agent`,
+                        };
+                      }
+                    }
+                  }
+                  for (const raw of rawPayloads) {
+                    const existing = await kv.get<RawObservation>(
+                      KV.rawPayloads,
+                      raw.id,
+                    );
+                    if (
+                      existing !== null &&
+                      existing.agentId !== isolatedAgentId
+                    ) {
+                      return {
+                        success: false as const,
+                        error: `raw payload ${raw.id} belongs to another agent`,
+                      };
+                    }
+                  }
+                  for (const memory of importData.memories) {
+                    const existing = await kv.get<Memory>(KV.memories, memory.id);
+                    if (
+                      existing !== null &&
+                      existing.agentId !== isolatedAgentId
+                    ) {
+                      return {
+                        success: false as const,
+                        error: `memory ${memory.id} belongs to another agent`,
+                      };
+                    }
+                  }
                 }
                 if (strategy !== "replace") {
                   for (
@@ -830,7 +1200,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
                 );
                 if (pendingImageReleases.length > 0) {
                   return {
-                    success: false,
+                    success: false as const,
                     error: "pending image releases must complete before import",
                   };
                 }
@@ -846,7 +1216,9 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
                   (await collectImageReferenceCounts(kv)).keys(),
                 );
 
-                if (strategy === "replace") await clearImportedState(kv);
+                if (strategy === "replace") {
+                  await clearImportedState(kv, isolatedAgentId);
+                }
 
                 for (const session of importData.sessions) {
                   if (strategy === "skip") {
@@ -1237,13 +1609,13 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
                 if (importData.accessLogs) {
                   if (!Array.isArray(importData.accessLogs)) {
                     return {
-                      success: false,
+                      success: false as const,
                       error: "accessLogs must be an array",
                     };
                   }
                   if (importData.accessLogs.length > MAX_ACCESS_LOGS) {
                     return {
-                      success: false,
+                      success: false as const,
                       error: `Too many access logs (max ${MAX_ACCESS_LOGS})`,
                     };
                   }
@@ -1307,41 +1679,54 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
                 ) {
                   await rebuildImportedGraphState(kv);
                 }
-                const imageRefs = await rebuildImageReferenceCounts(
-                  sdk,
+                const imageState = await rebuildImageReferenceCounts(
                   kv,
                   previousImageRefs,
                 );
-                return { success: true as const, imageRefs, stats };
+                return { success: true as const, ...imageState, stats };
               },
             );
-          });
-          if (!ownershipResult.success) return ownershipResult;
-          const { imageRefs, stats } = ownershipResult;
-          const indexEntries = await rebuildIndexWithinMaintenance(kv, {
-            strict: true,
-          });
-          await flushIndexSave();
+            });
+            if (!ownershipResult.success) {
+              rollback?.disarm();
+              return ownershipResult;
+            }
+            const { imageRefs, orphanedRefs, stats } = ownershipResult;
+            await recordAudit(kv, "import", "mem::import", [], {
+              strategy,
+              imageRefs,
+              stats,
+            });
+            const indexEntries = await rebuildIndexWithinMaintenance(kv, {
+              strict: true,
+              requireCompleteVectorRebuild: strategy === "replace",
+            });
+            await flushIndexSave();
+            rollback?.disarm();
+            await releaseOrphanedImageRefs(sdk, kv, orphanedRefs);
 
-          logger.info("Import complete", {
-            strategy,
-            imageRefs,
-            indexEntries,
-            ...stats,
-          });
-          await recordAudit(kv, "import", "mem::import", [], {
-            strategy,
-            imageRefs,
-            indexEntries,
-            stats,
-          });
-          return {
-            success: true,
-            strategy,
-            imageRefs,
-            indexEntries,
-            ...stats,
-          };
+            logger.info("Import complete", {
+              strategy,
+              imageRefs,
+              indexEntries,
+              ...stats,
+            });
+            return {
+              success: true,
+              strategy,
+              imageRefs,
+              indexEntries,
+              ...stats,
+            };
+            })(rollback?.kv ?? kv);
+          } catch (error) {
+            if (rollback) {
+              await rollback.rollback();
+              await rebuildIndexWithinMaintenance(kv, { strict: true });
+              await flushIndexSave();
+            }
+            throw error;
+          }
         });
       }),
   );

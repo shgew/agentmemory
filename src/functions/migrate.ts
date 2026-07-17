@@ -15,6 +15,7 @@ import type {
 import { logger } from "../logger.js";
 import { recordAudit } from "./audit.js";
 import { canonicalizeFilePath } from "./profile.js";
+import { backfillRawPayloadSessionIndex } from "./raw-payload-session-index.js";
 
 export const DEFAULT_CANONICAL_PROJECT_MAP: Readonly<Record<string, string>> = {};
 
@@ -746,6 +747,10 @@ export function registerMigrateFunction(sdk: ISdk, kv: StateKV): void {
           dryRun,
           mapping: data.mapping,
         });
+      }
+
+      if (data.step === "raw-payloads-by-session") {
+        return backfillRawPayloadSessionIndex(kv, data.dryRun ?? false);
       }
 
       if (data.step === "canonicalize-profile-paths") {

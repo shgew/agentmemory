@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -9,7 +18,12 @@ import {
   resolveAdapter,
 } from "../src/cli/connect/index.js";
 import type { ConnectAdapter } from "../src/cli/connect/types.js";
-import { readJsoncSafe } from "../src/cli/connect/util.js";
+import {
+  backupFile,
+  readJsoncSafe,
+  upsertJsoncNestedPropertyAtomic,
+  writeJsonAtomic,
+} from "../src/cli/connect/util.js";
 
 const EXPECTED_COPILOT_MCP_COMMAND =
   process.platform === "win32"
@@ -20,7 +34,100 @@ const EXPECTED_COPILOT_MCP_COMMAND =
     : {
         command: "npx",
         args: ["-y", "@agentmemory/mcp"],
-      };
+    };
+
+describe("atomic config writes", () => {
+  it("creates a new JSON config with private mode", () => {
+    const dir = mkdtempSync(join(tmpdir(), "am-config-mode-"));
+    const path = join(dir, "config.json");
+    const originalUmask = process.umask(0o022);
+    try {
+      writeJsonAtomic(path, { mcpServers: { agentmemory: {} } });
+
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+    } finally {
+      process.umask(originalUmask);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves an existing JSON config's restrictive mode", () => {
+    const dir = mkdtempSync(join(tmpdir(), "am-config-mode-"));
+    const path = join(dir, "config.json");
+    try {
+      writeFileSync(path, "{}\n");
+      chmodSync(path, 0o600);
+
+      writeJsonAtomic(path, { mcpServers: { agentmemory: {} } });
+
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("makes an existing permissive JSON config private", () => {
+    const dir = mkdtempSync(join(tmpdir(), "am-config-mode-"));
+    const path = join(dir, "config.json");
+    try {
+      writeFileSync(path, "{}\n");
+      chmodSync(path, 0o644);
+
+      writeJsonAtomic(path, { mcpServers: { agentmemory: {} } });
+
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves an existing JSONC config's restrictive mode", () => {
+    const dir = mkdtempSync(join(tmpdir(), "am-config-mode-"));
+    const path = join(dir, "config.jsonc");
+    try {
+      writeFileSync(path, '{ "mcp": {} }\n');
+      chmodSync(path, 0o600);
+
+      upsertJsoncNestedPropertyAtomic(path, "mcp", "agentmemory", { command: "npx" });
+
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("connect backups", () => {
+  it.skipIf(process.platform === "win32")(
+    "makes existing permissive backup directories and copied files private",
+    () => {
+      const home = mkdtempSync(join(tmpdir(), "am-backup-mode-"));
+      const source = join(home, "config.json");
+      const backupDirectory = join(home, ".agentmemory", "backups");
+      const originalHome = process.env["HOME"];
+      const originalUserprofile = process.env["USERPROFILE"];
+      try {
+        writeFileSync(source, "{}\n");
+        chmodSync(source, 0o644);
+        mkdirSync(backupDirectory, { recursive: true, mode: 0o777 });
+        chmodSync(backupDirectory, 0o777);
+        process.env["HOME"] = home;
+        process.env["USERPROFILE"] = home;
+
+        const backup = backupFile(source, "claude-code");
+
+        expect(statSync(backupDirectory).mode & 0o777).toBe(0o700);
+        expect(statSync(backup).mode & 0o777).toBe(0o600);
+      } finally {
+        if (originalHome === undefined) delete process.env["HOME"];
+        else process.env["HOME"] = originalHome;
+        if (originalUserprofile === undefined) delete process.env["USERPROFILE"];
+        else process.env["USERPROFILE"] = originalUserprofile;
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+});
 
 describe("agentmemory connect — dispatcher", () => {
   it("resolves every known agent by lowercase name", () => {
@@ -615,8 +722,10 @@ describe("agentmemory connect — copilot-cli adapter (mock filesystem)", () => 
     expect(a.detect()).toBe(true);
 
     const result = await a.install({ dryRun: false, force: false });
-    expect(result.kind).toBe("installed");
-    expect(result.mutatedPath).toBe(join(customCopilotHome, "mcp-config.json"));
+    expect(result).toMatchObject({
+      kind: "installed",
+      mutatedPath: join(customCopilotHome, "mcp-config.json"),
+    });
     expect(existsSync(join(customCopilotHome, "mcp-config.json"))).toBe(true);
     expect(existsSync(join(tmpHome, ".copilot", "mcp-config.json"))).toBe(false);
   });

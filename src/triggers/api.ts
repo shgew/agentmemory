@@ -27,6 +27,7 @@ import { getSummarizeTimeoutMs } from "../functions/summarize.js";
 import { getGraphExtractTimeoutMs } from "../functions/graph.js";
 import { validateMapping } from "../functions/migrate.js";
 import { upsertSession } from "../functions/session-upsert.js";
+import { projectCommitLink, sanitizeCommitRepository } from "../commit-links.js";
 
 type Response = {
   status_code: number;
@@ -128,9 +129,21 @@ function normalizeCommitSha(value: unknown): string | null {
 }
 
 function resolveAgentFilter(requestedAgentId: unknown): string | undefined {
-  if (isAgentScopeIsolated()) return getAgentId();
+  if (isIsolatedScopeConfigured()) return getAgentId();
   const agentId = asNonEmptyString(requestedAgentId);
   return agentId && agentId !== "*" ? agentId.slice(0, 128) : undefined;
+}
+
+function isIsolatedScopeConfigured(): boolean {
+  return isAgentScopeIsolated();
+}
+
+function isolatedIdentityError(): Response | null {
+  if (!isIsolatedScopeConfigured() || getAgentId()) return null;
+  return {
+    status_code: 403,
+    body: { error: "agent identity is required when agent scope is isolated" },
+  };
 }
 
 function resolveSessionAgentId(requestedAgentId: unknown): string | undefined {
@@ -145,7 +158,10 @@ function restrictCommitSessions(
   const sessionIds = (commit.sessionIds ?? []).filter((sessionId) =>
     allowedSessionIds.has(sessionId),
   );
-  return sessionIds.length > 0 ? { ...commit, sessionIds } : null;
+  if (sessionIds.length === 0) return null;
+  return sessionIds.length === (commit.sessionIds ?? []).length
+    ? { ...commit, sessionIds }
+    : { ...commit, branch: undefined, repo: undefined, sessionIds };
 }
 
 async function isSubagentSession(kv: StateKV, value: unknown): Promise<boolean> {
@@ -485,6 +501,8 @@ export function registerApiTriggers(
         typeof body.agentId === "string" && body.agentId.trim().length > 0
           ? (body.agentId as string).trim()
           : undefined;
+      const identityError = isolatedIdentityError();
+      if (identityError) return identityError;
       const payload = {
         query: body.query.trim(),
         limit: body.limit as number | undefined,
@@ -638,6 +656,8 @@ export function registerApiTriggers(
       }
       const title = typeof body.title === "string" ? body.title.trim() : undefined;
       const parentSessionId = asNonEmptyString(body.parentID);
+      const identityError = isolatedIdentityError();
+      if (identityError) return identityError;
       const agentId = resolveSessionAgentId(body.agentId);
       const { session, projectConflict, identityConflict } = await upsertSession(kv, {
         sessionId,
@@ -832,10 +852,16 @@ export function registerApiTriggers(
       }
       const sessionId = asNonEmptyString(body.sessionId) ?? undefined;
       const branch = asNonEmptyString(body.branch) ?? undefined;
-      const repo = asNonEmptyString(body.repo) ?? undefined;
+      const repo = asNonEmptyString(body.repo);
+      const sanitizedRepo = repo ? sanitizeCommitRepository(repo) : undefined;
       const author = asNonEmptyString(body.author) ?? undefined;
       const authoredAt = asNonEmptyString(body.authoredAt) ?? undefined;
-      for (const [field, value] of Object.entries({ branch, repo, author, authoredAt })) {
+      for (const [field, value] of Object.entries({
+        branch,
+        repo: sanitizedRepo,
+        author,
+        authoredAt,
+      })) {
         if (value && value.length > 2000) {
           return {
             status_code: 400,
@@ -851,29 +877,45 @@ export function registerApiTriggers(
             .map((f) => f.slice(0, 1000))
         : undefined;
 
+      const isolated = isIsolatedScopeConfigured();
       const filterAgentId = resolveAgentFilter(body.agentId);
-      if (sessionId && filterAgentId) {
-        const owner = await kv.get<Session>(KV.sessions, sessionId);
-        const ownerMismatch = isAgentScopeIsolated()
-          ? owner?.agentId !== filterAgentId
-          : Boolean(owner?.agentId && owner.agentId !== filterAgentId);
-        if (ownerMismatch) {
-          return {
-            status_code: 403,
-            body: { error: "session is not owned by the current agent" },
-          };
-        }
+      if (isolated && !sessionId) {
+        return {
+          status_code: 400,
+          body: { error: "sessionId is required when agent scope is isolated" },
+        };
       }
-
-      const link = await withKeyedLock(`commit:${sha}`, async () => {
+      if (isolated && !filterAgentId) {
+        return {
+          status_code: 403,
+          body: { error: "agent identity is required when agent scope is isolated" },
+        };
+      }
+      const mutateCommit = async (): Promise<CommitLink | null> => {
         const existing = await kv.get<CommitLink>(KV.commits, sha);
+        if (isolated && existing) {
+          const agentId = getAgentId();
+          if (!agentId) return null;
+          const linkedSessions = (
+            await Promise.all(
+              (existing.sessionIds ?? []).map((id) =>
+                kv.get<Session>(KV.sessions, id),
+              ),
+            )
+          ).filter((session): session is Session => session !== null);
+          if (!linkedSessions.some((session) => session.agentId === agentId)) {
+            return null;
+          }
+        }
         const sessionSet = new Set<string>(existing?.sessionIds ?? []);
         if (sessionId) sessionSet.add(sessionId);
         const merged: CommitLink = {
           sha,
           shortSha: existing?.shortSha ?? sha.slice(0, 7),
           branch: existing?.branch ?? branch,
-          repo: existing?.repo ?? repo,
+          repo: existing?.repo
+            ? sanitizeCommitRepository(existing.repo)
+            : sanitizedRepo,
           message: existing?.message ?? message,
           author: existing?.author ?? author,
           authoredAt: existing?.authoredAt ?? authoredAt,
@@ -883,22 +925,50 @@ export function registerApiTriggers(
         };
         await kv.set(KV.commits, sha, merged);
         return merged;
-      });
+      };
 
-      if (sessionId) {
-        await withKeyedLock(`session:${sessionId}`, async () => {
-          const session = await kv.get<Session>(KV.sessions, sessionId);
-          if (!session) return;
-          const shaSet = new Set<string>(session.commitShas ?? []);
-          shaSet.add(sha);
-          await kv.update<Session>(KV.sessions, sessionId, [
-            {
-              type: "set",
-              path: "commitShas",
-              value: Array.from(shaSet),
-            },
-          ]);
-        });
+      let ownershipDenied = false;
+      const link = sessionId
+        ? await withKeyedLock(`session:${sessionId}`, async () => {
+            const session = await kv.get<Session>(KV.sessions, sessionId);
+            const ownerMismatch = isolated
+              ? session?.agentId !== filterAgentId
+              : Boolean(
+                  filterAgentId && session?.agentId && session.agentId !== filterAgentId,
+                );
+            if (ownerMismatch) {
+              ownershipDenied = true;
+              return null;
+            }
+            const merged = await withKeyedLock(`commit:${sha}`, mutateCommit);
+            if (!merged || !session) return merged;
+            const shaSet = new Set<string>(session.commitShas ?? []);
+            shaSet.add(sha);
+            await kv.update<Session>(KV.sessions, sessionId, [
+              {
+                type: "set",
+                path: "commitShas",
+                value: Array.from(shaSet),
+              },
+            ]);
+            return merged;
+          })
+        : await withKeyedLock(`commit:${sha}`, mutateCommit);
+
+      if (ownershipDenied) {
+        return {
+          status_code: 403,
+          body: { error: "session is not owned by the current agent" },
+        };
+      }
+
+      if (link === null) {
+        return {
+          status_code: 403,
+          body: {
+            error: "commit is linked only to sessions owned by another agent",
+          },
+        };
       }
 
       let visibleLink = link;
@@ -914,7 +984,7 @@ export function registerApiTriggers(
           { ...link, sessionIds: [] };
       }
 
-      return { status_code: 200, body: { commit: visibleLink } };
+      return { status_code: 200, body: { commit: projectCommitLink(visibleLink) } };
     },
   );
   sdk.registerTrigger({
@@ -938,6 +1008,13 @@ export function registerApiTriggers(
           body: { error: "sha must be a 40- or 64-character hex string" },
         };
       }
+      const filterAgentId = resolveAgentFilter(req.query_params?.["agentId"]);
+      if (isIsolatedScopeConfigured() && !filterAgentId) {
+        return {
+          status_code: 404,
+          body: { error: "no sessions linked to this commit" },
+        };
+      }
       const link = await kv.get<CommitLink>(KV.commits, sha);
       if (!link) {
         return {
@@ -949,7 +1026,6 @@ export function registerApiTriggers(
         (link.sessionIds ?? []).map((sid) => kv.get<Session>(KV.sessions, sid)),
       );
       const allSessions = fetched.filter((s): s is Session => s !== null);
-      const filterAgentId = resolveAgentFilter(req.query_params?.["agentId"]);
       const sessions = filterAgentId
         ? allSessions.filter((s) => s.agentId === filterAgentId)
         : allSessions;
@@ -960,9 +1036,21 @@ export function registerApiTriggers(
         };
       }
       const commit = filterAgentId
-        ? { ...link, sessionIds: sessions.map((session) => session.id) }
+        ? restrictCommitSessions(
+            link,
+            new Set(sessions.map((session) => session.id)),
+          )
         : link;
-      return { status_code: 200, body: { commit, sessions } };
+      if (!commit) {
+        return {
+          status_code: 404,
+          body: { error: "no sessions linked to this commit" },
+        };
+      }
+      return {
+        status_code: 200,
+        body: { commit: projectCommitLink(commit), sessions },
+      };
     },
   );
   sdk.registerTrigger({
@@ -981,9 +1069,13 @@ export function registerApiTriggers(
       if (authErr) return authErr;
       const branch = asNonEmptyString(req.query_params?.["branch"]);
       const repo = asNonEmptyString(req.query_params?.["repo"]);
+      const sanitizedRepo = repo ? sanitizeCommitRepository(repo) : undefined;
       const rawLimit = parseOptionalInt(req.query_params?.["limit"]);
       const limit = Math.max(1, Math.min(500, rawLimit ?? 100));
       const filterAgentId = resolveAgentFilter(req.query_params?.["agentId"]);
+      if (isIsolatedScopeConfigured() && !filterAgentId) {
+        return { status_code: 200, body: { commits: [] } };
+      }
       const all = await kv.list<CommitLink>(KV.commits);
       let visible = all;
       if (filterAgentId) {
@@ -999,10 +1091,17 @@ export function registerApiTriggers(
       }
       const filtered = visible
         .filter((c) => !branch || c.branch === branch)
-        .filter((c) => !repo || c.repo === repo)
+        .filter(
+          (c) =>
+            !sanitizedRepo ||
+            sanitizeCommitRepository(c.repo ?? "") === sanitizedRepo,
+        )
         .sort((a, b) => ((a.linkedAt ?? "") < (b.linkedAt ?? "") ? 1 : -1))
         .slice(0, limit);
-      return { status_code: 200, body: { commits: filtered } };
+      return {
+        status_code: 200,
+        body: { commits: filtered.map(projectCommitLink) },
+      };
     },
   );
   sdk.registerTrigger({
@@ -1019,6 +1118,8 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const identityError = isolatedIdentityError();
+      if (identityError) return identityError;
       const rawLimit = parseOptionalInt(req.query_params?.["limit"]);
       const sessions = await kv.list<Session>(KV.sessions);
       const includeSubagents = req.query_params?.["includeSubagents"] === "true";
@@ -1065,6 +1166,8 @@ export function registerApiTriggers(
       const sessionId = asNonEmptyString(req.query_params?.["sessionId"]);
       if (!sessionId)
         return { status_code: 400, body: { error: "sessionId required" } };
+      const identityError = isolatedIdentityError();
+      if (identityError) return identityError;
       const observations = await kv.list<CompressedObservation>(
         KV.observations(sessionId),
       );
@@ -1189,6 +1292,8 @@ export function registerApiTriggers(
       ) {
         return { status_code: 400, body: { error: "project must be a non-empty string" } };
       }
+      const identityError = isolatedIdentityError();
+      if (identityError) return identityError;
       const agentId = resolveAgentFilter(req.body.agentId);
       const result = await sdk.trigger({
         function_id: "mem::remember",
@@ -1393,6 +1498,8 @@ export function registerApiTriggers(
       const sourceHeader = headers["x-agentmemory-source"] ?? headers["X-Agentmemory-Source"];
       const sourceFromHeader = Array.isArray(sourceHeader) ? sourceHeader[0] : sourceHeader;
       const includeTimings = req.query_params?.["includeTimings"] === "true";
+      const identityError = isolatedIdentityError();
+      if (identityError) return identityError;
       // Whitelist payload fields explicitly — REST endpoints never pass
       // the raw request body through to sdk.trigger (AGENTS.md security
       // section). Drops unknown fields so a misbehaving client can't
@@ -2169,6 +2276,8 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const identityError = isolatedIdentityError();
+      if (identityError) return identityError;
       const memories = await kv.list<import("../types.js").Memory>(KV.memories);
       const latest = req.query_params?.["latest"] === "true";
       const includeOrphans =

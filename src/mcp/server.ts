@@ -14,6 +14,7 @@ import { getVisibleTools, isToolVisible } from "./tools-registry.js";
 import { trimGraphQueryForMcp } from "./graph-trim.js";
 import { timingSafeCompare } from "../auth.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
+import { projectCommitLink, sanitizeCommitRepository } from "../commit-links.js";
 
 type McpResponse = {
   status_code: number;
@@ -51,9 +52,21 @@ function normalizeCommitSha(value: unknown): string | undefined {
 }
 
 function resolveAgentFilter(requestedAgentId: unknown): string | undefined {
-  if (isAgentScopeIsolated()) return getAgentId();
+  if (isIsolatedScopeConfigured()) return getAgentId();
   const agentId = asNonEmptyString(requestedAgentId);
   return agentId && agentId !== "*" ? agentId.slice(0, 128) : undefined;
+}
+
+function isIsolatedScopeConfigured(): boolean {
+  return isAgentScopeIsolated();
+}
+
+function isolatedIdentityError(): McpResponse | null {
+  if (!isIsolatedScopeConfigured() || getAgentId()) return null;
+  return {
+    status_code: 403,
+    body: { error: "agent identity is required when agent scope is isolated" },
+  };
 }
 
 function restrictCommitSessions(
@@ -63,7 +76,10 @@ function restrictCommitSessions(
   const sessionIds = (commit.sessionIds ?? []).filter((sessionId) =>
     allowedSessionIds.has(sessionId),
   );
-  return sessionIds.length > 0 ? { ...commit, sessionIds } : null;
+  if (sessionIds.length === 0) return null;
+  return sessionIds.length === (commit.sessionIds ?? []).length
+    ? { ...commit, sessionIds }
+    : { ...commit, branch: undefined, repo: undefined, sessionIds };
 }
 
 export function registerMcpEndpoints(
@@ -153,6 +169,8 @@ export function registerMcpEndpoints(
                 body: { error: "project must be a non-empty string" },
               };
             }
+            const identityError = isolatedIdentityError();
+            if (identityError) return identityError;
             const recallAgentId = resolveAgentFilter(args.agentId);
             const result = await sdk.trigger({ function_id: "mem::search", payload: {
               query: args.query,
@@ -226,6 +244,8 @@ export function registerMcpEndpoints(
                 body: { error: "project must be a non-empty string" },
               };
             }
+            const identityError = isolatedIdentityError();
+            if (identityError) return identityError;
             const agentId = resolveAgentFilter(args.agentId);
 
             const result = await sdk.trigger({ function_id: "mem::remember", payload: {
@@ -295,6 +315,8 @@ export function registerMcpEndpoints(
           }
 
           case "memory_sessions": {
+            const identityError = isolatedIdentityError();
+            if (identityError) return identityError;
             const rawLimit = Number(args.limit);
             const limit =
               Number.isFinite(rawLimit) && rawLimit > 0
@@ -343,6 +365,8 @@ export function registerMcpEndpoints(
                 body: { error: "project must be a non-empty string" },
               };
             }
+            const identityError = isolatedIdentityError();
+            if (identityError) return identityError;
             const result = await sdk.trigger({
               function_id: "mem::smart-search",
               payload: {
@@ -1349,6 +1373,13 @@ export function registerMcpEndpoints(
                 body: { error: "sha must be a 40- or 64-character hex string" },
               };
             }
+            const filterAgentId = resolveAgentFilter(args.agentId);
+            if (isIsolatedScopeConfigured() && !filterAgentId) {
+              return {
+                status_code: 200,
+                body: { content: [{ type: "text", text: JSON.stringify({ commit: null, sessions: [] }, null, 2) }] },
+              };
+            }
             const link = await kv.get<CommitLink>(KV.commits, sha);
             if (!link) {
               return {
@@ -1360,7 +1391,6 @@ export function registerMcpEndpoints(
               (link.sessionIds ?? []).map((sid) => kv.get<Session>(KV.sessions, sid)),
             );
             const allSessions = fetched.filter((s): s is Session => s !== null);
-            const filterAgentId = resolveAgentFilter(args.agentId);
             const sessions = filterAgentId
               ? allSessions.filter((s) => s.agentId === filterAgentId)
               : allSessions;
@@ -1371,19 +1401,42 @@ export function registerMcpEndpoints(
               };
             }
             const commit = filterAgentId
-              ? { ...link, sessionIds: sessions.map((session) => session.id) }
+              ? restrictCommitSessions(
+                  link,
+                  new Set(sessions.map((session) => session.id)),
+                )
               : link;
+            if (!commit) {
+              return {
+                status_code: 200,
+                body: { content: [{ type: "text", text: JSON.stringify({ commit: null, sessions: [] }, null, 2) }] },
+              };
+            }
             return {
               status_code: 200,
-              body: { content: [{ type: "text", text: JSON.stringify({ commit, sessions }, null, 2) }] },
+              body: {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify({ commit: projectCommitLink(commit), sessions }, null, 2),
+                }],
+              },
             };
           }
 
           case "memory_commits": {
             const branch = typeof args.branch === "string" ? args.branch : undefined;
-            const repo = typeof args.repo === "string" ? args.repo : undefined;
+            const rawRepo = typeof args.repo === "string" ? args.repo : undefined;
+            const repo = rawRepo ? sanitizeCommitRepository(rawRepo) : undefined;
             const limit = Math.max(1, Math.min(500, asNumber(args.limit, 100) ?? 100));
             const filterAgentId = resolveAgentFilter(args.agentId);
+            if (isIsolatedScopeConfigured() && !filterAgentId) {
+              return {
+                status_code: 200,
+                body: {
+                  content: [{ type: "text", text: JSON.stringify({ commits: [] }, null, 2) }],
+                },
+              };
+            }
             const all = await kv.list<CommitLink>(KV.commits);
             let visible = all;
             if (filterAgentId) {
@@ -1399,12 +1452,17 @@ export function registerMcpEndpoints(
             }
             const filtered = visible
               .filter((c) => !branch || c.branch === branch)
-              .filter((c) => !repo || c.repo === repo)
+              .filter((c) => !repo || sanitizeCommitRepository(c.repo ?? "") === repo)
               .sort((a, b) => ((a.linkedAt ?? "") < (b.linkedAt ?? "") ? 1 : -1))
               .slice(0, limit);
             return {
               status_code: 200,
-              body: { content: [{ type: "text", text: JSON.stringify({ commits: filtered }, null, 2) }] },
+              body: {
+                content: [{
+                  type: "text",
+                  text: JSON.stringify({ commits: filtered.map(projectCommitLink) }, null, 2),
+                }],
+              },
             };
           }
 
@@ -1796,6 +1854,8 @@ export function registerMcpEndpoints(
                 },
               };
             }
+            const identityError = isolatedIdentityError();
+            if (identityError) return identityError;
             // #817: mem::search now enforces agent-scope upstream when
             // AGENTMEMORY_AGENT_SCOPE=isolated, so the search half of
             // this prompt is safe by default.

@@ -306,10 +306,8 @@ export function getAgentId(): string | undefined {
   return loadAgentScope()?.agentId;
 }
 
-// True only when AGENT_ID is set AND scope=isolated. Recall paths
-// consult this to decide whether to filter.
 export function isAgentScopeIsolated(): boolean {
-  return loadAgentScope()?.mode === "isolated";
+  return getMergedEnv()["AGENTMEMORY_AGENT_SCOPE"] === "isolated";
 }
 
 export function loadSnapshotConfig(): {
