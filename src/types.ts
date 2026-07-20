@@ -420,7 +420,8 @@ export interface ExportData {
     | "0.9.24"
     | "0.9.25"
     | "0.9.26"
-    | "0.9.27";
+    | "0.9.27"
+    | "0.9.28";
   exportedAt: string;
   sessions: Session[];
   observations: Record<string, CompressedObservation[]>;

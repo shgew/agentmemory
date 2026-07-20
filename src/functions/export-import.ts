@@ -860,6 +860,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           "0.9.25",
           "0.9.26",
           "0.9.27",
+          "0.9.28",
         ]);
         if (!supportedVersions.has(importData.version)) {
           return {

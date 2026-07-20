@@ -49,6 +49,7 @@ async function main() {
 	} catch {
 		return;
 	}
+	if (!data || typeof data !== "object") return;
 	if (isSdkChildContext(data)) return;
 	const rawSessionId = data.session_id ?? data.sessionId;
 	const sessionId = typeof rawSessionId === "string" && rawSessionId.length > 0 ? rawSessionId : "unknown";
@@ -70,7 +71,7 @@ async function main() {
 	}).catch(() => {});
 	setTimeout(() => process.exit(0), 500).unref();
 }
-main();
+main().catch(() => process.exit(0));
 //#endregion
 export {};
 

@@ -17,6 +17,7 @@ import {
 } from "./slots.js";
 import { filterSupersededLessons } from "./lesson-state.js";
 import { buildSessionContextBlocks } from "./session-context.js";
+import { getAgentId, isAgentScopeIsolated } from "../config.js";
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 3);
@@ -37,11 +38,39 @@ export function registerContextFunction(
 ): void {
   sdk.registerFunction(
     "mem::context",
-    async (data: { sessionId: string; project: string; budget?: number }) => {
+    async (data: {
+      sessionId: string;
+      project: string;
+      budget?: number;
+      agentId?: string;
+    }) => {
       const budget = data.budget || tokenBudget;
       const blocks: ContextBlock[] = [];
       const currentSession = await kv.get<Session>(KV.sessions, data.sessionId);
       if (!currentSession) return { context: "", blocks: 0, tokens: 0 };
+      const isolated = isAgentScopeIsolated();
+      const explicitAgentId =
+        typeof data.agentId === "string" && data.agentId.trim().length > 0
+          ? data.agentId.trim()
+          : undefined;
+      const wildcardAgent = explicitAgentId === "*";
+      const envAgentId = isolated ? getAgentId() : undefined;
+      const filterAgentId = wildcardAgent
+        ? undefined
+        : explicitAgentId ?? envAgentId;
+      if (isolated && !wildcardAgent && !explicitAgentId && !envAgentId) {
+        throw new Error(
+          "mem::context: AGENTMEMORY_AGENT_SCOPE=isolated is set but no " +
+            "agent id is available (env AGENT_ID unset and no explicit " +
+            'agentId in the call). Refusing to read cross-agent rows. Pass agentId: "*" to opt in to a wildcard read.',
+        );
+      }
+      if (
+        filterAgentId !== undefined &&
+        currentSession.agentId !== filterAgentId
+      ) {
+        return { context: "", blocks: 0, tokens: 0 };
+      }
       const project = currentSession.project;
       const header = `<agentmemory-context project="${escapeXmlAttr(project)}">`;
       const footer = `</agentmemory-context>`;
@@ -182,7 +211,11 @@ export function registerContextFunction(
       }
 
       blocks.push(
-        ...(await buildSessionContextBlocks(kv, { ...data, project })),
+        ...(await buildSessionContextBlocks(kv, {
+          ...data,
+          project,
+          ...(filterAgentId ? { agentId: filterAgentId } : {}),
+        })),
       );
 
       blocks.sort((a, b) => {

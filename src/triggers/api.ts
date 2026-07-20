@@ -686,11 +686,15 @@ export function registerApiTriggers(
       }
       if (!session) throw new Error("session upsert returned no session");
       const contextResult = await sdk.trigger<
-        { sessionId: string; project: string },
+        { sessionId: string; project: string; agentId?: string },
         { context: string }
       >({
         function_id: "mem::context",
-        payload: { sessionId, project: session.project },
+        payload: {
+          sessionId,
+          project: session.project,
+          ...(agentId ? { agentId } : {}),
+        },
       });
       return {
         status_code: 200,

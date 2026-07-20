@@ -60,6 +60,7 @@ async function main() {
     }
   }
 
+  if (!data || typeof data !== "object") data = {};
   if (isSdkChildContext(data)) return;
 
   const cwd =
@@ -110,4 +111,4 @@ async function main() {
   }
 }
 
-main();
+main().catch(() => process.exit(0));

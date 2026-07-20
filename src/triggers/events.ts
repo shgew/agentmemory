@@ -8,7 +8,7 @@ import type {
 import { KV, STREAM } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { isReflectEnabled } from "../functions/slots.js";
-import { getEnvVar, isGraphExtractionEnabled } from "../config.js";
+import { getAgentId, getEnvVar, isGraphExtractionEnabled } from "../config.js";
 import { logger } from "../logger.js";
 import { isAfter, isAtOrBefore } from "../state/timestamp-compare.js";
 import { getSummarizeTimeoutMs } from "../functions/summarize.js";
@@ -133,7 +133,12 @@ function enqueueSessionStopped(
 export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction(
     "event::session::started",
-    async (data: { sessionId: string; project: string; cwd: string }) => {
+    async (data: {
+      sessionId: string;
+      project: string;
+      cwd: string;
+      agentId?: string;
+    }) => {
       const { session, projectConflict, identityConflict } =
         await upsertSession(kv, data);
       if (identityConflict) {
@@ -149,12 +154,17 @@ export function registerEventTriggers(sdk: ISdk, kv: StateKV): void {
         };
       }
       if (!session) throw new Error("session upsert returned no session");
+      const contextAgentId = data.agentId ?? getAgentId();
       const contextResult = await sdk.trigger<
-        { sessionId: string; project: string },
+        { sessionId: string; project: string; agentId?: string },
         { context: string }
       >({
         function_id: "mem::context",
-        payload: { sessionId: data.sessionId, project: session.project },
+        payload: {
+          sessionId: data.sessionId,
+          project: session.project,
+          ...(contextAgentId ? { agentId: contextAgentId } : {}),
+        },
       });
       return { session, context: contextResult.context, projectConflict };
     },
