@@ -47,6 +47,7 @@ function makeObs(
     id: "obs_1",
     sessionId: "ses_1",
     timestamp: new Date().toISOString(),
+    sourceType: "post_tool_use",
     type: "file_edit",
     title: "Edit auth middleware",
     subtitle: "JWT validation",
@@ -272,6 +273,42 @@ describe("IndexPersistence", () => {
     const loaded = await persistence.load();
     expect(loaded.vector).not.toBeNull();
     expect(loaded.vector!.size).toBe(1);
+  });
+
+  it("writes bounded audit rows for sharded index generations", async () => {
+    const bm25 = new SearchIndex();
+    bm25.add(
+      makeObs({
+        title: "bounded audit rows ".repeat(40),
+        narrative: "persist one audit per generation phase ".repeat(40),
+      }),
+    );
+    const vector = new VectorIndex();
+    vector.add(
+      "obs_1",
+      "ses_1",
+      new Float32Array(Array.from({ length: 64 }, (_, index) => index / 10)),
+    );
+
+    await new IndexPersistence(kv as never, bm25, vector, {
+      shardChars: 40,
+      createGeneration: (() => {
+        const generations = ["gen_bm25", "gen_vector"];
+        return () => generations.shift() ?? "gen_fallback";
+      })(),
+    }).save();
+
+    const audit = await kv.list<{ operation: string; details: { action?: string } }>(
+      "mem:audit",
+    );
+    const persistenceAudit = audit.filter(
+      (entry) => entry.operation === "index_persist",
+    );
+
+    expect(persistenceAudit.length).toBeLessThanOrEqual(6);
+    expect(
+      persistenceAudit.filter((entry) => entry.details.action === "shard_write"),
+    ).toHaveLength(2);
   });
 
   it("persists empty vector snapshots so cleared vectors do not reload", async () => {

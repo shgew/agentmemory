@@ -216,24 +216,30 @@ export class IndexPersistence {
       shards.map(async (shard, index) => {
         const chunk = chunks[index] ?? "";
         await this.kv.set(shard.scope, shard.key, chunk);
-        await this.auditIndexPersistence("shard_write", [
-          statePath(shard.scope, shard.key),
-        ], {
-          scope: shard.scope,
-          key: shard.key,
-          manifestKey,
-          generation,
-          chars: chunk.length,
-        });
       }),
     );
     const failedWrite = writeResults.find(
       (result): result is PromiseRejectedResult => result.status === "rejected",
     );
     if (failedWrite) {
-      await this.deleteShards(shards, "shard_write_rollback");
+      await this.deleteShards(
+        shards,
+        "shard_write_rollback",
+        manifestKey,
+        generation,
+      );
       throw failedWrite.reason;
     }
+    await this.auditIndexPersistence(
+      "shard_write",
+      [statePath(KV.bm25Index, manifestKey)],
+      {
+        manifestKey,
+        generation,
+        chars: serialized.length,
+        shards: shards.length,
+      },
+    );
 
     const nextManifest: IndexShardManifest = {
       v: 1,
@@ -269,7 +275,12 @@ export class IndexPersistence {
           error: errorMessage(err),
         });
       } else {
-        await this.deleteShards(shards, "manifest_publish_rollback");
+        await this.deleteShards(
+          shards,
+          "manifest_publish_rollback",
+          manifestKey,
+          generation,
+        );
       }
       throw err;
     }
@@ -279,10 +290,14 @@ export class IndexPersistence {
       const currentShardIds = new Set(
         shards.map((shard) => `${shard.scope}\0${shard.key}`),
       );
-      for (const shard of previous.shards) {
-        if (currentShardIds.has(`${shard.scope}\0${shard.key}`)) continue;
-        await this.deleteShards([shard], "previous_generation_cleanup");
-      }
+      await this.deleteShards(
+        previous.shards.filter(
+          (shard) => !currentShardIds.has(`${shard.scope}\0${shard.key}`),
+        ),
+        "previous_generation_cleanup",
+        manifestKey,
+        previous.generation,
+      );
     }
   }
 
@@ -325,10 +340,26 @@ export class IndexPersistence {
   private async deleteShards(
     shards: IndexShardManifest["shards"],
     reason: string,
+    manifestKey: string,
+    generation?: string,
   ): Promise<void> {
-    for (const shard of shards) {
-      await this.deleteKey(shard.scope, shard.key, reason);
-    }
+    if (shards.length === 0) return;
+    const results = await Promise.allSettled(
+      shards.map((shard) => this.kv.delete(shard.scope, shard.key)),
+    );
+    const failed = results.filter((result) => result.status === "rejected");
+    await this.auditIndexPersistence(
+      "delete",
+      [statePath(KV.bm25Index, manifestKey)],
+      {
+        manifestKey,
+        generation,
+        reason,
+        shards: shards.length,
+        deleted: shards.length - failed.length,
+        failed: failed.length,
+      },
+    );
   }
 
   private async isManifestPublished(
