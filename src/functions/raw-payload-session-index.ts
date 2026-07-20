@@ -7,6 +7,7 @@ import { recordAudit } from "./audit.js";
 
 const COMPLETION_KEY = "completed";
 const MIGRATION_LOCK = "migration:raw-payloads-by-session";
+const INDEX_WRITE_CONCURRENCY = 32;
 
 export interface RawPayloadSessionIndexBackfillResult {
   success: true;
@@ -34,36 +35,50 @@ export async function backfillRawPayloadSessionIndex(
     }
 
     const rawPayloads = await kv.list<RawObservation>(KV.rawPayloads);
+    if (dryRun) {
+      return {
+        success: true,
+        indexed: rawPayloads.length,
+        alreadyComplete: false,
+        dryRun: true,
+      };
+    }
+
     let indexed = 0;
-    for (const raw of rawPayloads) {
-      await withObservationOwnerLock(raw.id, async () => {
-        const current = await kv.get<RawObservation>(KV.rawPayloads, raw.id);
-        if (!current || current.sessionId !== raw.sessionId) return;
-        indexed += 1;
-        if (dryRun) return;
-        await kv.set(KV.rawPayloadsBySession(current.sessionId), current.id, {
-          id: current.id,
-          sessionId: current.sessionId,
-        });
-      });
-    }
-
-    if (!dryRun) {
-      const completedAt = new Date().toISOString();
-      await recordAudit(
-        kv,
-        "raw_payload_session_index_backfill",
-        "mem::migrate",
-        [],
-        { indexed, completedAt },
-      );
-      await kv.set<RawPayloadSessionIndexMigration>(
-        KV.rawPayloadsBySessionMigration,
-        COMPLETION_KEY,
-        { indexed, completedAt },
+    for (
+      let batchStart = 0;
+      batchStart < rawPayloads.length;
+      batchStart += INDEX_WRITE_CONCURRENCY
+    ) {
+      await Promise.all(
+        rawPayloads
+          .slice(batchStart, batchStart + INDEX_WRITE_CONCURRENCY)
+          .map((raw) =>
+            withObservationOwnerLock(raw.id, async () => {
+              await kv.set(KV.rawPayloadsBySession(raw.sessionId), raw.id, {
+                id: raw.id,
+                sessionId: raw.sessionId,
+              });
+              indexed += 1;
+            }),
+          ),
       );
     }
 
-    return { success: true, indexed, alreadyComplete: false, dryRun };
+    const completedAt = new Date().toISOString();
+    await recordAudit(
+      kv,
+      "raw_payload_session_index_backfill",
+      "mem::migrate",
+      [],
+      { indexed, completedAt },
+    );
+    await kv.set<RawPayloadSessionIndexMigration>(
+      KV.rawPayloadsBySessionMigration,
+      COMPLETION_KEY,
+      { indexed, completedAt },
+    );
+
+    return { success: true, indexed, alreadyComplete: false, dryRun: false };
   });
 }

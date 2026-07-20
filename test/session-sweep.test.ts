@@ -636,6 +636,7 @@ describe("Session Sweep Scheduling", () => {
       return { success: true };
     });
     const list = vi.spyOn(kv, "list");
+    const get = vi.spyOn(kv, "get");
 
     const firstMigration = (await sdk.trigger({
       function_id: "mem::migrate",
@@ -655,6 +656,9 @@ describe("Session Sweep Scheduling", () => {
     expect(
       list.mock.calls.filter(([scope]) => scope === KV.rawPayloads),
     ).toHaveLength(1);
+    expect(
+      get.mock.calls.filter(([scope]) => scope === KV.rawPayloads),
+    ).toHaveLength(0);
     list.mockClear();
 
     const result = (await sdk.trigger({
