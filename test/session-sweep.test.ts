@@ -619,6 +619,30 @@ describe("Session Sweep Scheduling", () => {
       makeSession({ id: sessionId, updatedAt: staleAt }),
     );
     await kv.set(KV.rawPayloads, raw.id, raw);
+    await kv.set(KV.pendingCompression(sessionId), raw.id, {
+      id: raw.id,
+      sessionId,
+    });
+    const compressedRaw: RawObservation = {
+      ...raw,
+      id: "obs_legacy_compressed_raw",
+      raw: { prompt: "legacy compressed raw payload" },
+      userPrompt: "legacy compressed raw payload",
+    };
+    await kv.set(KV.rawPayloads, compressedRaw.id, compressedRaw);
+    await kv.set(KV.observations(sessionId), compressedRaw.id, {
+      id: compressedRaw.id,
+      sessionId,
+      timestamp: staleAt,
+      sourceType: compressedRaw.hookType,
+      type: "conversation",
+      title: "Legacy compressed observation",
+      facts: [],
+      narrative: compressedRaw.userPrompt ?? "",
+      concepts: [],
+      files: [],
+      importance: 5,
+    } satisfies CompressedObservation);
     sdk.registerFunction("mem::compress", async () => {
       await kv.set(KV.observations(sessionId), raw.id, {
         id: raw.id,
@@ -636,7 +660,6 @@ describe("Session Sweep Scheduling", () => {
       return { success: true };
     });
     const list = vi.spyOn(kv, "list");
-    const get = vi.spyOn(kv, "get");
 
     const firstMigration = (await sdk.trigger({
       function_id: "mem::migrate",
@@ -647,18 +670,25 @@ describe("Session Sweep Scheduling", () => {
       payload: { step: "raw-payloads-by-session" },
     })) as { success: boolean; indexed?: number; alreadyComplete?: boolean };
 
-    expect(firstMigration).toMatchObject({ success: true, indexed: 1 });
+    expect(firstMigration).toMatchObject({ success: true, indexed: 2 });
     expect(secondMigration).toMatchObject({
       success: true,
-      indexed: 1,
+      indexed: 2,
       alreadyComplete: true,
     });
     expect(
       list.mock.calls.filter(([scope]) => scope === KV.rawPayloads),
-    ).toHaveLength(1);
-    expect(
-      get.mock.calls.filter(([scope]) => scope === KV.rawPayloads),
     ).toHaveLength(0);
+    const pendingListCall = list.mock.calls.findIndex(
+      ([scope]) => scope === KV.pendingCompression(sessionId),
+    );
+    const observationListCall = list.mock.calls.findIndex(
+      ([scope]) => scope === KV.observations(sessionId),
+    );
+    expect(pendingListCall).toBeLessThan(observationListCall);
+    expect(
+      await kv.get(KV.rawPayloadsBySession(sessionId), compressedRaw.id),
+    ).not.toBeNull();
     list.mockClear();
 
     const result = (await sdk.trigger({

@@ -1,4 +1,10 @@
-import type { RawObservation, RawPayloadSessionIndexMigration } from "../types.js";
+import type {
+  CompressedObservation,
+  PendingCompressionEntry,
+  RawObservation,
+  RawPayloadSessionIndexMigration,
+  Session,
+} from "../types.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
@@ -34,35 +40,52 @@ export async function backfillRawPayloadSessionIndex(
       };
     }
 
-    const rawPayloads = await kv.list<RawObservation>(KV.rawPayloads);
+    const sessions = await kv.list<Session>(KV.sessions);
+    let indexed = 0;
+    for (const session of sessions) {
+      const pending = await kv.list<PendingCompressionEntry>(
+        KV.pendingCompression(session.id),
+      );
+      const observations = await kv.list<CompressedObservation>(
+        KV.observations(session.id),
+      );
+      const rawIds = [
+        ...new Set([
+          ...observations.map((observation) => observation.id),
+          ...pending.map((entry) => entry.id),
+        ]),
+      ];
+      for (
+        let batchStart = 0;
+        batchStart < rawIds.length;
+        batchStart += INDEX_WRITE_CONCURRENCY
+      ) {
+        await Promise.all(
+          rawIds
+            .slice(batchStart, batchStart + INDEX_WRITE_CONCURRENCY)
+            .map((rawId) =>
+              withObservationOwnerLock(rawId, async () => {
+                const raw = await kv.get<RawObservation>(KV.rawPayloads, rawId);
+                if (!raw || raw.sessionId !== session.id) return;
+                indexed += 1;
+                if (dryRun) return;
+                await kv.set(KV.rawPayloadsBySession(session.id), raw.id, {
+                  id: raw.id,
+                  sessionId: session.id,
+                });
+              }),
+            ),
+        );
+      }
+    }
+
     if (dryRun) {
       return {
         success: true,
-        indexed: rawPayloads.length,
+        indexed,
         alreadyComplete: false,
         dryRun: true,
       };
-    }
-
-    let indexed = 0;
-    for (
-      let batchStart = 0;
-      batchStart < rawPayloads.length;
-      batchStart += INDEX_WRITE_CONCURRENCY
-    ) {
-      await Promise.all(
-        rawPayloads
-          .slice(batchStart, batchStart + INDEX_WRITE_CONCURRENCY)
-          .map((raw) =>
-            withObservationOwnerLock(raw.id, async () => {
-              await kv.set(KV.rawPayloadsBySession(raw.sessionId), raw.id, {
-                id: raw.id,
-                sessionId: raw.sessionId,
-              });
-              indexed += 1;
-            }),
-          ),
-      );
     }
 
     const completedAt = new Date().toISOString();
