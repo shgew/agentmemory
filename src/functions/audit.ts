@@ -3,6 +3,8 @@ import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
 
+const AUDIT_DELETE_CONCURRENCY = 128;
+
 // Audit coverage policy (issue #125).
 //
 // Every structural deletion of a memory, observation, session, or
@@ -110,4 +112,29 @@ export async function queryAudit(
   }
 
   return entries.slice(0, filter?.limit || 100);
+}
+
+export async function compactIndexPersistenceAudit(
+  kv: StateKV,
+  dryRun: boolean,
+): Promise<{ matched: number; deleted: number; dryRun: boolean }> {
+  const entries = (await kv.list<AuditEntry>(KV.audit)).filter(
+    (entry) => entry.functionId === "mem::index-persistence",
+  );
+  if (dryRun) {
+    return { matched: entries.length, deleted: 0, dryRun };
+  }
+
+  for (let start = 0; start < entries.length; start += AUDIT_DELETE_CONCURRENCY) {
+    await Promise.all(
+      entries
+        .slice(start, start + AUDIT_DELETE_CONCURRENCY)
+        .map((entry) => kv.delete(KV.audit, entry.id)),
+    );
+  }
+  await recordAudit(kv, "index_persist", "mem::migrate", [], {
+    action: "compact",
+    deleted: entries.length,
+  });
+  return { matched: entries.length, deleted: entries.length, dryRun };
 }

@@ -4,7 +4,11 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { recordAudit, queryAudit } from "../src/functions/audit.js";
+import {
+  compactIndexPersistenceAudit,
+  queryAudit,
+  recordAudit,
+} from "../src/functions/audit.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -102,5 +106,35 @@ describe("Audit Functions", () => {
 
     const entries = await queryAudit(kv as never, { limit: 3 });
     expect(entries.length).toBe(3);
+  });
+
+  it("compacts historical index persistence rows without deleting user audit history", async () => {
+    await recordAudit(kv as never, "observe", "mem::observe", ["obs_1"]);
+    await recordAudit(
+      kv as never,
+      "index_persist",
+      "mem::index-persistence",
+      ["shard_1"],
+    );
+    await recordAudit(
+      kv as never,
+      "index_persist",
+      "mem::index-persistence",
+      ["shard_2"],
+    );
+
+    const result = await compactIndexPersistenceAudit(kv as never, false);
+    const remaining = await kv.list<{ functionId: string }>("mem:audit");
+
+    expect(result).toEqual({ matched: 2, deleted: 2, dryRun: false });
+    expect(
+      remaining.filter((entry) => entry.functionId === "mem::observe"),
+    ).toHaveLength(1);
+    expect(
+      remaining.filter((entry) => entry.functionId === "mem::index-persistence"),
+    ).toHaveLength(0);
+    expect(
+      remaining.filter((entry) => entry.functionId === "mem::migrate"),
+    ).toHaveLength(1);
   });
 });

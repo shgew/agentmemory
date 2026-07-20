@@ -13,7 +13,7 @@ import type {
   SessionSummary,
 } from "../types.js";
 import { logger } from "../logger.js";
-import { recordAudit } from "./audit.js";
+import { compactIndexPersistenceAudit, recordAudit } from "./audit.js";
 import { canonicalizeFilePath } from "./profile.js";
 import { backfillRawPayloadSessionIndex } from "./raw-payload-session-index.js";
 
@@ -751,6 +751,12 @@ export function registerMigrateFunction(sdk: ISdk, kv: StateKV): void {
 
       if (data.step === "raw-payloads-by-session") {
         return backfillRawPayloadSessionIndex(kv, data.dryRun ?? false);
+      }
+
+      if (data.step === "compact-index-audit") {
+        const dryRun = data.dryRun ?? false;
+        logger.info("Migration step: compact-index-audit", { dryRun });
+        return compactIndexPersistenceAudit(kv, dryRun);
       }
 
       if (data.step === "canonicalize-profile-paths") {

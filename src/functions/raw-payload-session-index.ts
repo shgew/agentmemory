@@ -1,4 +1,10 @@
-import type { RawObservation, RawPayloadSessionIndexMigration } from "../types.js";
+import type {
+  CompressedObservation,
+  PendingCompressionEntry,
+  RawObservation,
+  RawPayloadSessionIndexMigration,
+  Session,
+} from "../types.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
@@ -7,6 +13,7 @@ import { recordAudit } from "./audit.js";
 
 const COMPLETION_KEY = "completed";
 const MIGRATION_LOCK = "migration:raw-payloads-by-session";
+const INDEX_WRITE_CONCURRENCY = 32;
 
 export interface RawPayloadSessionIndexBackfillResult {
   success: true;
@@ -33,37 +40,68 @@ export async function backfillRawPayloadSessionIndex(
       };
     }
 
-    const rawPayloads = await kv.list<RawObservation>(KV.rawPayloads);
+    const sessions = await kv.list<Session>(KV.sessions);
     let indexed = 0;
-    for (const raw of rawPayloads) {
-      await withObservationOwnerLock(raw.id, async () => {
-        const current = await kv.get<RawObservation>(KV.rawPayloads, raw.id);
-        if (!current || current.sessionId !== raw.sessionId) return;
-        indexed += 1;
-        if (dryRun) return;
-        await kv.set(KV.rawPayloadsBySession(current.sessionId), current.id, {
-          id: current.id,
-          sessionId: current.sessionId,
-        });
-      });
+    for (const session of sessions) {
+      const pending = await kv.list<PendingCompressionEntry>(
+        KV.pendingCompression(session.id),
+      );
+      const observations = await kv.list<CompressedObservation>(
+        KV.observations(session.id),
+      );
+      const rawIds = [
+        ...new Set([
+          ...observations.map((observation) => observation.id),
+          ...pending.map((entry) => entry.id),
+        ]),
+      ];
+      for (
+        let batchStart = 0;
+        batchStart < rawIds.length;
+        batchStart += INDEX_WRITE_CONCURRENCY
+      ) {
+        await Promise.all(
+          rawIds
+            .slice(batchStart, batchStart + INDEX_WRITE_CONCURRENCY)
+            .map((rawId) =>
+              withObservationOwnerLock(rawId, async () => {
+                const raw = await kv.get<RawObservation>(KV.rawPayloads, rawId);
+                if (!raw || raw.sessionId !== session.id) return;
+                indexed += 1;
+                if (dryRun) return;
+                await kv.set(KV.rawPayloadsBySession(session.id), raw.id, {
+                  id: raw.id,
+                  sessionId: session.id,
+                });
+              }),
+            ),
+        );
+      }
     }
 
-    if (!dryRun) {
-      const completedAt = new Date().toISOString();
-      await recordAudit(
-        kv,
-        "raw_payload_session_index_backfill",
-        "mem::migrate",
-        [],
-        { indexed, completedAt },
-      );
-      await kv.set<RawPayloadSessionIndexMigration>(
-        KV.rawPayloadsBySessionMigration,
-        COMPLETION_KEY,
-        { indexed, completedAt },
-      );
+    if (dryRun) {
+      return {
+        success: true,
+        indexed,
+        alreadyComplete: false,
+        dryRun: true,
+      };
     }
 
-    return { success: true, indexed, alreadyComplete: false, dryRun };
+    const completedAt = new Date().toISOString();
+    await recordAudit(
+      kv,
+      "raw_payload_session_index_backfill",
+      "mem::migrate",
+      [],
+      { indexed, completedAt },
+    );
+    await kv.set<RawPayloadSessionIndexMigration>(
+      KV.rawPayloadsBySessionMigration,
+      COMPLETION_KEY,
+      { indexed, completedAt },
+    );
+
+    return { success: true, indexed, alreadyComplete: false, dryRun: false };
   });
 }
