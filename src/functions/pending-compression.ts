@@ -13,6 +13,7 @@ import { buildSyntheticCompression } from "./compress-synthetic.js";
 import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
 import {
   clearPendingCompression,
+  deleteRawObservation,
   markPendingCompression,
 } from "./raw-observations.js";
 import { withObservationOwnerLock } from "./observation-lock.js";
@@ -46,6 +47,7 @@ export interface PendingCompressionDrainResult {
 
 export interface PendingCompressionDrainOptions {
   rawPayloads?: readonly RawObservation[];
+  rawPayloadRetentionCutoff?: string;
 }
 
 async function loadPendingRawObservations(
@@ -144,10 +146,29 @@ export async function drainPendingCompression(
     const completedBeforeDrain = rawPayloads.filter(
       (raw) => pendingRawPayloads.has(raw.id) && compressedIds.has(raw.id),
     );
+    const rawPayloadRetentionCutoff = options?.rawPayloadRetentionCutoff;
+    const expiredRawIds = new Set(
+      rawPayloadRetentionCutoff
+        ? rawPayloads
+            .filter(
+              (raw) =>
+                compressedIds.has(raw.id) &&
+                raw.timestamp <= rawPayloadRetentionCutoff,
+            )
+            .map((raw) => raw.id)
+        : [],
+    );
     await Promise.all(
-      completedBeforeDrain.map((raw) =>
-        clearPendingCompression(kv, sessionId, raw.id),
-      ),
+      rawPayloads
+        .filter((raw) => compressedIds.has(raw.id))
+        .map((raw) => {
+          if (expiredRawIds.has(raw.id)) {
+            return deleteRawObservation(kv, sessionId, raw.id);
+          }
+          return pendingRawPayloads.has(raw.id)
+            ? clearPendingCompression(kv, sessionId, raw.id)
+            : Promise.resolve();
+        }),
     );
     const pending = rawPayloads.filter((raw) => !compressedIds.has(raw.id));
 
@@ -250,7 +271,11 @@ export async function drainPendingCompression(
     await Promise.all(
       pending
         .filter((raw) => !remainingIdSet.has(raw.id))
-        .map((raw) => clearPendingCompression(kv, sessionId, raw.id)),
+        .map((raw) =>
+          expiredRawIds.has(raw.id)
+            ? deleteRawObservation(kv, sessionId, raw.id)
+            : clearPendingCompression(kv, sessionId, raw.id),
+        ),
     );
 
     return {

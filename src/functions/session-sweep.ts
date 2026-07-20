@@ -13,6 +13,7 @@ import { drainPendingImageReleases } from "./image-owner.js";
 import { withImageOwnershipReadLock } from "./observation-lock.js";
 
 const DEFAULT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+const RAW_PAYLOAD_RETENTION_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_SWEEP_CONCURRENCY = 4;
 const MAX_SWEEP_CONCURRENCY = 32;
 
@@ -205,6 +206,13 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
               const drain = await withImageOwnershipReadLock(async () =>
                 drainPendingCompression(sdk, kv, session.id, {
                   rawPayloads: await listSessionRawObservations(kv, session.id),
+                  ...(mode === "finalize"
+                    ? {
+                        rawPayloadRetentionCutoff: new Date(
+                          now - RAW_PAYLOAD_RETENTION_MS,
+                        ).toISOString(),
+                      }
+                    : {}),
                 }),
               );
               if (drain.remainingIds.length > 0) {

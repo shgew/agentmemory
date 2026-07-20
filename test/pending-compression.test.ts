@@ -144,6 +144,44 @@ describe("pending compression recovery", () => {
     ).toBeNull();
   });
 
+  it("deletes an expired raw payload after its compressed observation is searchable", async () => {
+    const kv = mockKV();
+    const raw = rawObservation();
+    await storeRawObservation(kv as never, raw);
+    await kv.set(KV.observations(raw.sessionId), raw.id, {
+      id: raw.id,
+      sessionId: raw.sessionId,
+      timestamp: raw.timestamp,
+      sourceType: raw.hookType,
+      type: "conversation",
+      title: "Already compressed",
+      facts: [],
+      narrative: "retain this",
+      concepts: [],
+      files: [],
+      importance: 5,
+    } satisfies CompressedObservation);
+
+    const result = await drainPendingCompression(
+      { trigger: vi.fn() } as never,
+      kv as never,
+      raw.sessionId,
+      {
+        rawPayloads: [raw],
+        rawPayloadRetentionCutoff: "2026-07-17T10:00:00.000Z",
+      },
+    );
+
+    expect(result).toEqual({ attempted: 0, completed: 1, remainingIds: [] });
+    expect(await kv.get(KV.rawPayloads, raw.id)).toBeNull();
+    expect(
+      await kv.get(KV.rawPayloadsBySession(raw.sessionId), raw.id),
+    ).toBeNull();
+    expect(
+      await kv.get<CompressedObservation>(KV.observations(raw.sessionId), raw.id),
+    ).not.toBeNull();
+  });
+
   it("uses mem::compress when automatic compression is enabled", async () => {
     vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "true");
     const kv = mockKV();
