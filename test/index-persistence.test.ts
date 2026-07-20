@@ -7,6 +7,7 @@ import type { CompressedObservation } from "../src/types.js";
 const BM25_SCOPE = "mem:index:bm25";
 const BM25_LEGACY_KEY = "data";
 const BM25_MANIFEST_KEY = "data:manifest";
+const BM25_PENDING_KEY = "data:pending";
 const VECTOR_LEGACY_KEY = "vectors";
 const VECTOR_MANIFEST_KEY = "vectors:manifest";
 
@@ -15,6 +16,12 @@ type TestIndexShardManifest = {
   generation?: string;
   shards: Array<{ scope: string; key: string; chars: number }>;
   chars: number;
+};
+
+type TestPendingIndexGeneration = {
+  v: 1;
+  manifest: TestIndexShardManifest;
+  previous: TestIndexShardManifest | null;
 };
 
 function mockKV() {
@@ -105,6 +112,85 @@ describe("IndexPersistence", () => {
     expect(loaded.bm25!.size).toBe(1);
     const results = loaded.bm25!.search("auth");
     expect(results.length).toBe(1);
+  });
+
+  it("removes an unpublished pending generation before loading the current index", async () => {
+    const current = makeBm25("obs_current", "current searchable snapshot");
+    await new IndexPersistence(kv as never, current, null, {
+      createGeneration: () => "gen_current",
+    }).save();
+    const currentManifest = await getBm25Manifest(kv);
+    const abandonedManifest: TestIndexShardManifest = {
+      v: 1,
+      generation: "gen_abandoned",
+      chars: 7,
+      shards: [
+        {
+          scope: "mem:index:bm25:bm25:gen_abandoned:00000",
+          key: "data",
+          chars: 7,
+        },
+      ],
+    };
+    await kv.set(abandonedManifest.shards[0].scope, "data", "orphaned");
+    await kv.set<TestPendingIndexGeneration>(BM25_SCOPE, BM25_PENDING_KEY, {
+      v: 1,
+      manifest: abandonedManifest,
+      previous: currentManifest,
+    });
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+
+    expect(loaded.bm25?.search("current")).toHaveLength(1);
+    await expect(
+      kv.get(abandonedManifest.shards[0].scope, "data"),
+    ).resolves.toBeNull();
+    await expect(kv.get(BM25_SCOPE, BM25_PENDING_KEY)).resolves.toBeNull();
+  });
+
+  it("finishes previous generation cleanup when pending generation is published", async () => {
+    const previous = makeBm25("obs_previous", "previous searchable snapshot");
+    await new IndexPersistence(kv as never, previous, null, {
+      createGeneration: () => "gen_previous",
+    }).save();
+    const previousManifest = await getBm25Manifest(kv);
+    const next = makeBm25("obs_next", "next searchable snapshot");
+    const serialized = next.serialize();
+    const nextManifest: TestIndexShardManifest = {
+      v: 1,
+      generation: "gen_next",
+      chars: serialized.length,
+      shards: [
+        {
+          scope: "mem:index:bm25:bm25:gen_next:00000",
+          key: "data",
+          chars: serialized.length,
+        },
+      ],
+    };
+    await kv.set(nextManifest.shards[0].scope, "data", serialized);
+    await kv.set(BM25_SCOPE, BM25_MANIFEST_KEY, nextManifest);
+    await kv.set<TestPendingIndexGeneration>(BM25_SCOPE, BM25_PENDING_KEY, {
+      v: 1,
+      manifest: nextManifest,
+      previous: previousManifest,
+    });
+
+    const loaded = await new IndexPersistence(
+      kv as never,
+      new SearchIndex(),
+      null,
+    ).load();
+
+    expect(loaded.bm25?.search("next")).toHaveLength(1);
+    await expect(
+      kv.get(previousManifest.shards[0].scope, previousManifest.shards[0].key),
+    ).resolves.toBeNull();
+    await expect(kv.get(BM25_SCOPE, BM25_PENDING_KEY)).resolves.toBeNull();
   });
 
   it("saves BM25 index shards outside the BM25 metadata scope", async () => {
