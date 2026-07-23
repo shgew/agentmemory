@@ -49,6 +49,7 @@ function mockKV() {
 
 function mockSdk() {
   const functions = new Map<string, Function>();
+  functions.set("stream::delete", async () => ({ old_value: null }));
   return {
     registerFunction: (id: string, handler: Function) => {
       functions.set(id, handler);

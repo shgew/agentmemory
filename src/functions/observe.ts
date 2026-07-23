@@ -17,6 +17,11 @@ import {
 import {
   withObservationSessionOwnerLock,
 } from "./image-owner.js";
+import {
+  classifyCaptureTier,
+  shouldVectorizeObservation,
+} from "./capture-policy.js";
+import { aggregateCaptureEvent } from "./capture-aggregate.js";
 
 const postCompletionWarned = new Set<string>();
 const NOISE_HOOK_TYPES = new Set([
@@ -27,9 +32,6 @@ const NOISE_HOOK_TYPES = new Set([
   "config_loaded",
   "file_watcher",
 ]);
-const STEP_FINISH_SAMPLE_EVERY = 20;
-let stepFinishCaptureCount = 0;
-
 const EVENT_IDENTITY_KEYS = [
   "event_id",
   "call_id",
@@ -160,7 +162,11 @@ export function registerObserveFunction(
         };
       }
 
-      if (NOISE_HOOK_TYPES.has(payload.hookType)) {
+      const initialTier = classifyCaptureTier({ hookType: payload.hookType });
+      if (
+        NOISE_HOOK_TYPES.has(payload.hookType) ||
+        initialTier === "drop"
+      ) {
         return withKeyedLock(`obs:${payload.sessionId}`, async () => {
           const session = await kv.get<Session>(KV.sessions, payload.sessionId);
           if (session) {
@@ -191,6 +197,19 @@ export function registerObserveFunction(
             return { deduplicated: true, sessionId: payload.sessionId };
           }
         }
+      }
+
+      if (initialTier === "aggregate") {
+        return withObservationSessionOwnerLock(payload.sessionId, async () => {
+          if (dedupMap && dedupHash && dedupMap.isDuplicate(dedupHash)) {
+            return { deduplicated: true, sessionId: payload.sessionId };
+          }
+          const result = await aggregateCaptureEvent(kv, payload);
+          if (result.success && dedupMap && dedupHash) {
+            dedupMap.record(dedupHash);
+          }
+          return result;
+        });
       }
 
       let sanitizedRaw: unknown = payload.data;
@@ -250,8 +269,12 @@ export function registerObserveFunction(
       }
 
       const pendingImageData = extractedImage;
+      const captureTier = classifyCaptureTier(raw);
 
       const captureObservation = async () => {
+        if (dedupMap && dedupHash && dedupMap.isDuplicate(dedupHash)) {
+          return { deduplicated: true, sessionId: payload.sessionId };
+        }
         // The existing session row is the source of truth for both agentId
         // (even when undefined) and the observation-count cap. Env AGENT_ID
         // only applies when no row exists yet; otherwise an unscoped session
@@ -434,6 +457,17 @@ export function registerObserveFunction(
           });
         }
 
+        if (captureTier === "raw_only") {
+          await clearPendingCompression(kv, payload.sessionId, raw.id);
+          logger.info("Observation captured", {
+            obsId,
+            sessionId: payload.sessionId,
+            hook: payload.hookType,
+            compress: "raw_only",
+          });
+          return { observationId: obsId };
+        }
+
         // Per-observation LLM compression is opt-in as of 0.8.8.
         // Default path: build a zero-LLM synthetic compression so recall
         // and BM25 search still work without burning the user's Claude
@@ -457,12 +491,14 @@ export function registerObserveFunction(
             synthetic,
           );
           getSearchIndex().add(synthetic);
-          await vectorIndexAddGuarded(
-            synthetic.id,
-            synthetic.sessionId,
-            synthetic.title + " " + (synthetic.narrative || ""),
-            { kind: "synthetic", logId: synthetic.id },
-          );
+          if (shouldVectorizeObservation(synthetic.type)) {
+            await vectorIndexAddGuarded(
+              synthetic.id,
+              synthetic.sessionId,
+              synthetic.title + " " + (synthetic.narrative || ""),
+              { kind: "synthetic", logId: synthetic.id },
+            );
+          }
           await clearPendingCompression(
             kv,
             payload.sessionId,
@@ -500,15 +536,6 @@ export function registerObserveFunction(
           hook: payload.hookType,
           compress: isAutoCompressEnabled() ? "llm" : "synthetic",
         });
-        if (payload.hookType === "step_finish") {
-          stepFinishCaptureCount++;
-          if (stepFinishCaptureCount % STEP_FINISH_SAMPLE_EVERY === 0) {
-            logger.info("Step-finish capture sample", {
-              captured: stepFinishCaptureCount,
-              sampleEvery: STEP_FINISH_SAMPLE_EVERY,
-            });
-          }
-        }
         return { observationId: obsId };
       };
       return withObservationSessionOwnerLock(

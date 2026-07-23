@@ -209,7 +209,7 @@ describe("mem::observe stream publish failures are non-fatal", () => {
       cwd: "/r",
       hookType: "post_tool_use",
       timestamp: new Date().toISOString(),
-      data: { tool_name: "Read", tool_input: { file_path: "x.ts" } },
+      data: { tool_name: "Edit", tool_input: { file_path: "x.ts" } },
     })) as Record<string, unknown>;
 
     // observe must NOT throw / fail just because the live-viewer stream is down
