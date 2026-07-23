@@ -29,6 +29,7 @@ import {
 } from "./compress-synthetic.js";
 import { clearPendingCompression } from "./raw-observations.js";
 import { withObservationOwnerLock } from "./observation-lock.js";
+import { shouldVectorizeObservation } from "./capture-policy.js";
 
 const VALID_TYPES = new Set<string>([
   "file_read",
@@ -259,12 +260,14 @@ export function registerCompressFunction(
             });
           }
 
-          await vectorIndexAddGuarded(
-            compressed.id,
-            compressed.sessionId,
-            compressed.title + " " + (compressed.narrative || ""),
-            { kind: "observation", logId: compressed.id },
-          );
+          if (shouldVectorizeObservation(compressed.type)) {
+            await vectorIndexAddGuarded(
+              compressed.id,
+              compressed.sessionId,
+              compressed.title + " " + (compressed.narrative || ""),
+              { kind: "observation", logId: compressed.id },
+            );
+          }
           if (searchIndexed) {
             await clearPendingCompression(
               kv,

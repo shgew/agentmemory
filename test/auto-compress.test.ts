@@ -64,7 +64,7 @@ function validPayload(overrides: Partial<Record<string, unknown>> = {}) {
     hookType: "post_tool_use",
     timestamp: new Date().toISOString(),
     data: {
-      tool_name: "Read",
+      tool_name: "Edit",
       tool_input: { file_path: "src/foo.ts" },
       tool_output: "file contents here",
     },
@@ -126,8 +126,8 @@ describe("mem::observe auto-compress gate (#138)", () => {
       files: string[];
       confidence: number;
     };
-    expect(obs.type).toBe("file_read");
-    expect(obs.title).toBe("Read");
+    expect(obs.type).toBe("file_edit");
+    expect(obs.title).toBe("Edit");
     expect(obs.files).toContain("src/foo.ts");
     expect(obs.confidence).toBe(0.3);
   });

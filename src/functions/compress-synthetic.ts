@@ -100,7 +100,7 @@ function inferToolType(toolName: string | undefined): ObservationType {
 }
 
 export function inferObservationType(
-  raw: RawObservation,
+  raw: Pick<RawObservation, "hookType" | "toolName" | "modality">,
   fallback: ObservationType = "other",
 ): ObservationType {
   if (raw.modality === "image") return "image";
