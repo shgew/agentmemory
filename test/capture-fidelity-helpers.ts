@@ -2,6 +2,7 @@ import { vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   searchAdd: vi.fn(),
+  vectorAdd: vi.fn().mockResolvedValue(false),
   loggerInfo: vi.fn(),
 }));
 
@@ -11,7 +12,7 @@ vi.mock("../src/logger.js", () => ({
 
 vi.mock("../src/functions/search.js", () => ({
   getSearchIndex: () => ({ add: mocks.searchAdd, has: () => false }),
-  vectorIndexAddGuarded: vi.fn().mockResolvedValue(false),
+  vectorIndexAddGuarded: mocks.vectorAdd,
 }));
 
 export function getSearchAddMock() {
@@ -20,6 +21,10 @@ export function getSearchAddMock() {
 
 export function getLoggerInfoMock() {
   return mocks.loggerInfo;
+}
+
+export function getVectorAddMock() {
+  return mocks.vectorAdd;
 }
 
 export function mockKV() {
@@ -54,7 +59,12 @@ export function mockKV() {
 
 export function mockSdk() {
   const functions = new Map<string, (payload: unknown) => unknown>();
+  const triggerCalls: Array<{
+    function_id: string;
+    payload: unknown;
+  }> = [];
   return {
+    triggerCalls,
     registerFunction: (
       idOrOptions: string | { id: string },
       handler: (payload: unknown) => unknown,
@@ -71,6 +81,7 @@ export function mockSdk() {
       const id =
         typeof idOrInput === "string" ? idOrInput : idOrInput.function_id;
       const input = typeof idOrInput === "string" ? payload : idOrInput.payload;
+      triggerCalls.push({ function_id: id, payload: input });
       return functions.get(id)?.(input) ?? null;
     },
   };
@@ -79,6 +90,7 @@ export function mockSdk() {
 export function resetCaptureMocks(): void {
   vi.resetModules();
   mocks.searchAdd.mockClear();
+  mocks.vectorAdd.mockClear();
   mocks.loggerInfo.mockClear();
   vi.unstubAllEnvs();
   vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "");

@@ -281,7 +281,7 @@ describe("capture fidelity characterization", () => {
     expect(result.files).toEqual([]);
   });
 
-  it("keeps session_diff as a file-edit observation", async () => {
+  it("keeps session_diff as a session file aggregate", async () => {
     const { registerObserveFunction } = await import(
       "../src/functions/observe.js"
     );
@@ -298,14 +298,17 @@ describe("capture fidelity characterization", () => {
       data: { files: ["src/functions/observe.ts"] },
     })) as Record<string, unknown>;
 
-    expect(result.observationId).toBeTruthy();
-    const observations = await kv.list<Record<string, unknown>>(
-      "mem:obs:ses_diff",
-    );
-    expect(observations[0]).toMatchObject({
-      type: "file_edit",
-      sourceType: "session_diff",
-      importance: 7,
+    expect(result).toMatchObject({ aggregated: true, sessionId: "ses_diff" });
+    expect(await kv.list("mem:obs:ses_diff")).toHaveLength(0);
+    expect(await kv.get("mem:sessions", "ses_diff")).toMatchObject({
+      observationCount: 0,
+      diffTotals: {
+        events: 1,
+        additions: 0,
+        deletions: 0,
+        files: ["src/functions/observe.ts"],
+        lastAt: "2026-07-15T10:00:00.000Z",
+      },
     });
   });
 
