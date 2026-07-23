@@ -60,4 +60,43 @@ describe("capture replay provenance", () => {
       toolInput: { command: "npm test" },
     });
   });
+
+  it("replays a raw-only tool event without a compressed observation", async () => {
+    const { registerReplayFunctions } = await import(
+      "../src/functions/replay.js"
+    );
+    const sdk = mockSdk();
+    const kv = mockKV();
+    await kv.set("mem:sessions", "ses_raw_replay", {
+      id: "ses_raw_replay",
+      project: "agentmemory",
+      cwd: "/repo/agentmemory",
+      startedAt: "2026-07-15T09:00:00.000Z",
+      status: "completed",
+      observationCount: 1,
+    });
+    await kv.set("mem:raw-payloads", "obs_raw_replay", {
+      id: "obs_raw_replay",
+      sessionId: "ses_raw_replay",
+      timestamp: "2026-07-15T10:00:00.000Z",
+      hookType: "post_tool_use",
+      toolName: "read",
+      toolInput: { filePath: "src/functions/observe.ts" },
+      toolOutput: "source",
+      raw: {},
+    });
+    registerReplayFunctions(sdk as never, kv as never);
+
+    const result = (await sdk.trigger("mem::replay::load", {
+      sessionId: "ses_raw_replay",
+    })) as {
+      timeline: { events: Array<{ toolName?: string; toolInput?: unknown }> };
+    };
+
+    expect(result.timeline.events).toHaveLength(1);
+    expect(result.timeline.events[0]).toMatchObject({
+      toolName: "read",
+      toolInput: { filePath: "src/functions/observe.ts" },
+    });
+  });
 });

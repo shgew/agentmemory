@@ -14,9 +14,14 @@ import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
 import {
   clearPendingCompression,
   deleteRawObservation,
+  deleteRawObservationWithStreams,
   markPendingCompression,
 } from "./raw-observations.js";
 import { withObservationOwnerLock } from "./observation-lock.js";
+import {
+  classifyCaptureTier,
+  shouldVectorizeObservation,
+} from "./capture-policy.js";
 
 const PENDING_COMPRESSION_CONCURRENCY = 4;
 
@@ -48,6 +53,36 @@ export interface PendingCompressionDrainResult {
 export interface PendingCompressionDrainOptions {
   rawPayloads?: readonly RawObservation[];
   rawPayloadRetentionCutoff?: string;
+}
+
+export async function retireExpiredRawOnlyObservations(
+  sdk: ISdk,
+  kv: StateKV,
+  rawPayloads: readonly RawObservation[],
+  retentionCutoff: string,
+): Promise<string[]> {
+  const failedIds: string[] = [];
+  await Promise.all(
+    rawPayloads
+      .filter(
+        (raw) =>
+          classifyCaptureTier(raw) === "raw_only" &&
+          raw.timestamp <= retentionCutoff,
+      )
+      .map(async (raw) => {
+        try {
+          await deleteRawObservationWithStreams(sdk, kv, raw);
+        } catch (error) {
+          failedIds.push(raw.id);
+          logger.warn("Raw-only stream retirement failed", {
+            sessionId: raw.sessionId,
+            observationId: raw.id,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }),
+  );
+  return failedIds;
 }
 
 async function loadPendingRawObservations(
@@ -101,12 +136,14 @@ async function rebuildSyntheticObservation(
     const synthetic = buildSyntheticCompression(currentRaw);
     await kv.set(KV.observations(raw.sessionId), raw.id, synthetic);
     ensureSearchIndexed(synthetic);
-    await vectorIndexAddGuarded(
-      synthetic.id,
-      synthetic.sessionId,
-      synthetic.title + " " + (synthetic.narrative || ""),
-      { kind: "synthetic", logId: synthetic.id },
-    );
+    if (shouldVectorizeObservation(synthetic.type)) {
+      await vectorIndexAddGuarded(
+        synthetic.id,
+        synthetic.sessionId,
+        synthetic.title + " " + (synthetic.narrative || ""),
+        { kind: "synthetic", logId: synthetic.id },
+      );
+    }
   });
 }
 
@@ -143,8 +180,15 @@ export async function drainPendingCompression(
           ).values(),
         ]
       : indexedRawPayloads;
+    const rawOnlyIds = new Set(
+      rawPayloads
+        .filter((raw) => classifyCaptureTier(raw) === "raw_only")
+        .map((raw) => raw.id),
+    );
     const completedBeforeDrain = rawPayloads.filter(
-      (raw) => pendingRawPayloads.has(raw.id) && compressedIds.has(raw.id),
+      (raw) =>
+        pendingRawPayloads.has(raw.id) &&
+        (compressedIds.has(raw.id) || rawOnlyIds.has(raw.id)),
     );
     const rawPayloadRetentionCutoff = options?.rawPayloadRetentionCutoff;
     const expiredRawIds = new Set(
@@ -152,31 +196,52 @@ export async function drainPendingCompression(
         ? rawPayloads
             .filter(
               (raw) =>
-                compressedIds.has(raw.id) &&
+                (compressedIds.has(raw.id) || rawOnlyIds.has(raw.id)) &&
                 raw.timestamp <= rawPayloadRetentionCutoff,
             )
             .map((raw) => raw.id)
         : [],
     );
+    const failedRetirements = new Set(
+      rawPayloadRetentionCutoff
+        ? await retireExpiredRawOnlyObservations(
+            sdk,
+            kv,
+            rawPayloads,
+            rawPayloadRetentionCutoff,
+          )
+        : [],
+    );
+    const completedBeforeDrainIds = new Set(completedBeforeDrain.map((raw) => raw.id));
+    for (const failedId of failedRetirements) {
+      completedBeforeDrainIds.delete(failedId);
+    }
     await Promise.all(
       rawPayloads
-        .filter((raw) => compressedIds.has(raw.id))
-        .map((raw) => {
+        .filter(
+          (raw) =>
+            (compressedIds.has(raw.id) || rawOnlyIds.has(raw.id)) &&
+            !(rawOnlyIds.has(raw.id) && expiredRawIds.has(raw.id)),
+        )
+        .map(async (raw) => {
           if (expiredRawIds.has(raw.id)) {
-            return deleteRawObservation(kv, sessionId, raw.id);
+            await deleteRawObservation(kv, sessionId, raw.id);
+            return;
           }
-          return pendingRawPayloads.has(raw.id)
-            ? clearPendingCompression(kv, sessionId, raw.id)
-            : Promise.resolve();
+          if (pendingRawPayloads.has(raw.id)) {
+            await clearPendingCompression(kv, sessionId, raw.id);
+          }
         }),
     );
-    const pending = rawPayloads.filter((raw) => !compressedIds.has(raw.id));
+    const pending = rawPayloads.filter(
+      (raw) => !compressedIds.has(raw.id) && !rawOnlyIds.has(raw.id),
+    );
 
     if (pending.length === 0) {
       return {
         attempted: 0,
-        completed: completedBeforeDrain.length,
-        remainingIds: [],
+        completed: completedBeforeDrainIds.size,
+        remainingIds: [...failedRetirements],
       };
     }
 
@@ -280,8 +345,8 @@ export async function drainPendingCompression(
 
     return {
       attempted: pending.length,
-      completed: completedBeforeDrain.length + completedIds.length,
-      remainingIds,
+      completed: completedBeforeDrainIds.size + completedIds.length,
+      remainingIds: [...failedRetirements, ...remainingIds],
     };
   });
 }

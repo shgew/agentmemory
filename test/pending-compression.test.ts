@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const searchAdd = vi.hoisted(() => vi.fn());
 const searchIds = vi.hoisted(() => new Set<string>());
+const vectorAdd = vi.hoisted(() => vi.fn().mockResolvedValue(false));
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -15,7 +16,7 @@ vi.mock("../src/functions/search.js", () => ({
     },
     has: (id: string) => searchIds.has(id),
   }),
-  vectorIndexAddGuarded: vi.fn().mockResolvedValue(false),
+  vectorIndexAddGuarded: vectorAdd,
 }));
 
 import { drainPendingCompression } from "../src/functions/pending-compression.js";
@@ -78,6 +79,7 @@ describe("pending compression recovery", () => {
     vi.stubEnv("AGENTMEMORY_AUTO_COMPRESS", "false");
     searchAdd.mockReset();
     searchIds.clear();
+    vectorAdd.mockClear();
   });
 
   it("rebuilds synthetic observations without invoking mem::compress", async () => {
@@ -180,6 +182,102 @@ describe("pending compression recovery", () => {
     expect(
       await kv.get<CompressedObservation>(KV.observations(raw.sessionId), raw.id),
     ).not.toBeNull();
+  });
+
+  it("does not resurrect an expired raw-only observation", async () => {
+    const kv = mockKV();
+    const raw: RawObservation = {
+      id: "obs_raw_only",
+      sessionId: "ses_pending",
+      timestamp: "2026-07-16T10:00:00.000Z",
+      hookType: "post_tool_use",
+      toolName: "read",
+      toolInput: { filePath: "src/functions/observe.ts" },
+      toolOutput: "source",
+      raw: {},
+    };
+    await storeRawObservation(kv as never, raw);
+    const trigger = vi.fn();
+
+    const result = await drainPendingCompression(
+      { trigger } as never,
+      kv as never,
+      raw.sessionId,
+      {
+        rawPayloads: [raw],
+        rawPayloadRetentionCutoff: "2026-07-17T10:00:00.000Z",
+      },
+    );
+
+    expect(result).toEqual({ attempted: 0, completed: 1, remainingIds: [] });
+    expect(trigger).toHaveBeenCalledWith({
+      function_id: "stream::delete",
+      payload: {
+        stream_name: "mem-live",
+        group_id: "ses_pending",
+        item_id: raw.id,
+      },
+    });
+    expect(searchAdd).not.toHaveBeenCalled();
+    expect(vectorAdd).not.toHaveBeenCalled();
+    expect(await kv.get(KV.rawPayloads, raw.id)).toBeNull();
+    expect(await kv.get(KV.observations(raw.sessionId), raw.id)).toBeNull();
+  });
+
+  it("retains raw-only data when stream retirement fails", async () => {
+    const kv = mockKV();
+    const raw: RawObservation = {
+      id: "obs_raw_retry",
+      sessionId: "ses_pending",
+      timestamp: "2026-07-16T10:00:00.000Z",
+      hookType: "post_tool_use",
+      toolName: "read",
+      raw: {},
+    };
+    await storeRawObservation(kv as never, raw);
+    const trigger = vi.fn().mockRejectedValue(new Error("stream unavailable"));
+
+    const result = await drainPendingCompression(
+      { trigger } as never,
+      kv as never,
+      raw.sessionId,
+      {
+        rawPayloads: [raw],
+        rawPayloadRetentionCutoff: "2026-07-17T10:00:00.000Z",
+      },
+    );
+
+    expect(result).toEqual({
+      attempted: 0,
+      completed: 0,
+      remainingIds: [raw.id],
+    });
+    expect(await kv.get(KV.rawPayloads, raw.id)).toEqual(raw);
+  });
+
+  it("rebuilds command observations without vectorizing them", async () => {
+    const kv = mockKV();
+    const raw: RawObservation = {
+      id: "obs_command",
+      sessionId: "ses_pending",
+      timestamp: "2026-07-16T10:00:00.000Z",
+      hookType: "post_tool_use",
+      toolName: "bash",
+      toolInput: { command: "npm test" },
+      toolOutput: "passed",
+      raw: {},
+    };
+    await seedPending(kv, raw);
+
+    const result = await drainPendingCompression(
+      { trigger: vi.fn() } as never,
+      kv as never,
+      raw.sessionId,
+    );
+
+    expect(result).toEqual({ attempted: 1, completed: 1, remainingIds: [] });
+    expect(searchAdd).toHaveBeenCalledOnce();
+    expect(vectorAdd).not.toHaveBeenCalled();
   });
 
   it("uses mem::compress when automatic compression is enabled", async () => {

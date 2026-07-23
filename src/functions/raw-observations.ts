@@ -1,12 +1,14 @@
+import type { ISdk } from "iii-sdk";
 import type {
   RawObservation,
   PendingCompressionEntry,
   RawPayloadSessionIndexEntry,
 } from "../types.js";
-import { KV } from "../state/schema.js";
+import { KV, STREAM } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
 import { withObservationOwnerLock } from "./observation-lock.js";
+import { classifyCaptureTier } from "./capture-policy.js";
 
 export async function storeRawObservation(
   kv: StateKV,
@@ -113,4 +115,22 @@ export async function deleteRawObservation(
   await kv.delete(KV.pendingCompression(sessionId), observationId);
   await kv.delete(KV.rawPayloads, observationId);
   await clearRawPayloadSessionIndex(kv, sessionId, observationId);
+}
+
+export async function deleteRawObservationWithStreams(
+  sdk: ISdk,
+  kv: StateKV,
+  raw: RawObservation,
+): Promise<void> {
+  if (classifyCaptureTier(raw) === "raw_only") {
+    await sdk.trigger({
+      function_id: "stream::delete",
+      payload: {
+        stream_name: STREAM.name,
+        group_id: STREAM.group(raw.sessionId),
+        item_id: raw.id,
+      },
+    });
+  }
+  await deleteRawObservation(kv, raw.sessionId, raw.id);
 }
