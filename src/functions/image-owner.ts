@@ -6,7 +6,7 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import { logger } from "../logger.js";
 import { deleteAccessLog } from "./access-tracker.js";
 import { flushIndexSave, getSearchIndex, vectorIndexRemove } from "./search.js";
-import { deleteRawObservation } from "./raw-observations.js";
+import { deleteRawObservationWithStreams } from "./raw-observations.js";
 import {
   withImageOwnershipReadLock,
   withObservationOwnerLock,
@@ -335,7 +335,7 @@ export async function deleteObservationOwnersWithinSessionLock<
     if (observation) {
       await kv.delete(KV.observations(sessionId), observationId);
     }
-    if (raw) await deleteRawObservation(kv, sessionId, observationId);
+    if (raw) await deleteRawObservationWithStreams(sdk, kv, raw);
     release = await markObservationCountAdjusted(kv, release, sessionId);
     release = await releaseImageRefs(sdk, kv, release);
     release = await clearObservationCountToken(kv, release, sessionId);

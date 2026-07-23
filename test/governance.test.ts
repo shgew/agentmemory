@@ -442,6 +442,61 @@ describe("Governance Functions", () => {
     ).toBe(0);
   });
 
+  it("governance-delete retires a raw-only stream item before KV deletion", async () => {
+    const deleteStream = vi.fn().mockResolvedValue({ old_value: {} });
+    sdk.registerFunction("stream::delete", deleteStream);
+    await kv.set(KV.sessions, "ses_1", makeSession(1));
+    await kv.set(KV.rawPayloads, "obs_raw", {
+      id: "obs_raw",
+      sessionId: "ses_1",
+      timestamp: "2026-07-15T10:00:00.000Z",
+      hookType: "post_tool_use",
+      toolName: "read",
+      raw: {},
+    });
+
+    const result = (await sdk.trigger("mem::governance-delete", {
+      memoryIds: ["obs_raw"],
+    })) as { deleted: number };
+
+    expect(result.deleted).toBe(1);
+    expect(deleteStream).toHaveBeenCalledWith({
+      stream_name: "mem-live",
+      group_id: "ses_1",
+      item_id: "obs_raw",
+    });
+    expect(await kv.get(KV.rawPayloads, "obs_raw")).toBeNull();
+  });
+
+  it("governance-delete retains raw-only KV data when stream retirement fails", async () => {
+    sdk.registerFunction("stream::delete", async () => {
+      throw new Error("stream unavailable");
+    });
+    await kv.set(KV.sessions, "ses_1", makeSession(1));
+    await kv.set(KV.rawPayloads, "obs_raw_retry", {
+      id: "obs_raw_retry",
+      sessionId: "ses_1",
+      timestamp: "2026-07-15T10:00:00.000Z",
+      hookType: "post_tool_use",
+      toolName: "read",
+      raw: {},
+    });
+
+    await expect(
+      sdk.trigger("mem::governance-delete", {
+        memoryIds: ["obs_raw_retry"],
+      }),
+    ).rejects.toThrow("stream unavailable");
+    expect(await kv.get(KV.rawPayloads, "obs_raw_retry")).not.toBeNull();
+
+    sdk.registerFunction("stream::delete", async () => ({ old_value: {} }));
+    const retry = (await sdk.trigger("mem::governance-delete", {
+      memoryIds: ["obs_raw_retry"],
+    })) as { deleted: number };
+    expect(retry.deleted).toBe(1);
+    expect(await kv.get(KV.rawPayloads, "obs_raw_retry")).toBeNull();
+  });
+
   it("observation deletion applies its session count journal once", async () => {
     await kv.set(KV.sessions, "ses_1", makeSession(2));
     await kv.set(KV.observations("ses_1"), "obs_1", {
