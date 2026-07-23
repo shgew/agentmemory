@@ -30,7 +30,8 @@ type IndexPersistenceOptions = {
 export class IndexPersistence {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private lastFailureLogAt = 0;
-  private saveQueue: Promise<void> = Promise.resolve();
+  private inFlightSave: Promise<void> | null = null;
+  private pendingSave: Promise<void> | null = null;
 
   constructor(
     private kv: StateKV,
@@ -63,9 +64,37 @@ export class IndexPersistence {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    const save = this.acquireSave();
+    if (reportFailure) {
+      await save;
+      return;
+    }
+    try {
+      await save;
+    } catch {
+      // runSave already routed the failure through logFailure()
+    }
+  }
+
+  private acquireSave(): Promise<void> {
+    if (!this.inFlightSave) {
+      this.inFlightSave = this.runSave();
+      return this.inFlightSave;
+    }
+    if (!this.pendingSave) {
+      this.pendingSave = this.inFlightSave.catch(() => undefined).then(() => {
+        this.pendingSave = null;
+        this.inFlightSave = this.runSave();
+        return this.inFlightSave;
+      });
+    }
+    return this.pendingSave;
+  }
+
+  private runSave(): Promise<void> {
     const bm25 = this.bm25.serialize();
     const vector = this.vector?.serialize();
-    const queued = this.saveQueue.then(async () => {
+    const done = (async () => {
       try {
         await this.saveBm25Index(bm25);
         if (vector !== undefined) {
@@ -73,14 +102,15 @@ export class IndexPersistence {
         }
       } catch (err) {
         this.logFailure(err);
-        if (reportFailure) throw err;
+        throw err;
       }
-    });
-    this.saveQueue = queued.then(
-      () => undefined,
-      () => undefined,
-    );
-    await queued;
+    })();
+    done
+      .catch(() => undefined)
+      .then(() => {
+        if (this.inFlightSave === done) this.inFlightSave = null;
+      });
+    return done;
   }
 
   async load(): Promise<{

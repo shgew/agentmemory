@@ -860,6 +860,99 @@ describe("IndexPersistence", () => {
     expect(loaded.bm25!.search("alpha")).toHaveLength(0);
   });
 
+  it("coalesces saves queued during an in-flight write into one trailing generation", async () => {
+    const bm25 = makeBm25("obs_0", "alpha snapshot 0");
+    let firstWriteReached: (() => void) | undefined;
+    let releaseFirstWrite: (() => void) | undefined;
+    const reached = new Promise<void>((resolve) => {
+      firstWriteReached = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve;
+    });
+    let manifestCommits = 0;
+    const gatedKv = {
+      ...kv,
+      set: vi.fn(async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope === BM25_SCOPE && key === BM25_MANIFEST_KEY) {
+          manifestCommits += 1;
+          if (manifestCommits === 1) {
+            firstWriteReached?.();
+            await gate;
+          }
+        }
+        return kv.set(scope, key, data);
+      }),
+    };
+    let generation = 0;
+    const persistence = new IndexPersistence(gatedKv as never, bm25, null, {
+      shardChars: 80,
+      createGeneration: () => `gen_${++generation}`,
+    });
+
+    const inFlight = persistence.save();
+    await reached;
+
+    bm25.add(makeObs({ id: "obs_1", title: "bravo snapshot 1" }));
+    const queued1 = persistence.save();
+    bm25.add(makeObs({ id: "obs_2", title: "charlie snapshot 2" }));
+    const queued2 = persistence.save();
+    bm25.add(makeObs({ id: "obs_3", title: "delta snapshot 3" }));
+    const queued3 = persistence.save();
+
+    releaseFirstWrite?.();
+    await Promise.all([inFlight, queued1, queued2, queued3]);
+
+    expect(generation).toBe(2);
+
+    const loaded = await persistence.load();
+    expect(loaded.bm25!.search("delta")).toHaveLength(1);
+    expect(loaded.bm25!.search("alpha")).toHaveLength(1);
+  });
+
+  it("saveStrict queued behind an in-flight write persists data at least as new as the request", async () => {
+    const bm25 = makeBm25("obs_0", "alpha snapshot 0");
+    let firstWriteReached: (() => void) | undefined;
+    let releaseFirstWrite: (() => void) | undefined;
+    const reached = new Promise<void>((resolve) => {
+      firstWriteReached = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve;
+    });
+    let manifestCommits = 0;
+    const gatedKv = {
+      ...kv,
+      set: vi.fn(async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope === BM25_SCOPE && key === BM25_MANIFEST_KEY) {
+          manifestCommits += 1;
+          if (manifestCommits === 1) {
+            firstWriteReached?.();
+            await gate;
+          }
+        }
+        return kv.set(scope, key, data);
+      }),
+    };
+    let generation = 0;
+    const persistence = new IndexPersistence(gatedKv as never, bm25, null, {
+      shardChars: 80,
+      createGeneration: () => `gen_${++generation}`,
+    });
+
+    const inFlight = persistence.save();
+    await reached;
+
+    bm25.add(makeObs({ id: "obs_late", title: "omega latest snapshot" }));
+    const strict = persistence.saveStrict();
+
+    releaseFirstWrite?.();
+    await expect(strict).resolves.toBeUndefined();
+
+    const loaded = await persistence.load();
+    expect(loaded.bm25!.search("omega")).toHaveLength(1);
+  });
+
   it("stop clears the pending timer", async () => {
     const bm25 = new SearchIndex();
     bm25.add(makeObs({ id: "obs_1", title: "auth handler" }));
