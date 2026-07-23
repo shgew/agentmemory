@@ -7,7 +7,10 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import { logger } from "../logger.js";
 import { isAfter } from "../state/timestamp-compare.js";
 import { getEnvVar } from "../config.js";
-import { drainPendingCompression } from "./pending-compression.js";
+import {
+  drainPendingCompression,
+  retireExpiredRawOnlyObservations,
+} from "./pending-compression.js";
 import { listSessionRawObservations } from "./raw-observations.js";
 import { drainPendingImageReleases } from "./image-owner.js";
 import { withImageOwnershipReadLock } from "./observation-lock.js";
@@ -158,6 +161,27 @@ export function registerSessionSweepFunction(sdk: ISdk, kv: StateKV): void {
           : candidates;
 
         const processSession = async (session: Session): Promise<void> => {
+          if (!dryRun && mode === "finalize") {
+            const retentionCutoff = new Date(
+              now - RAW_PAYLOAD_RETENTION_MS,
+            ).toISOString();
+            const failedRawOnlyIds = await withImageOwnershipReadLock(
+              async () =>
+                retireExpiredRawOnlyObservations(
+                  sdk,
+                  kv,
+                  await listSessionRawObservations(kv, session.id),
+                  retentionCutoff,
+                ),
+            );
+            if (failedRawOnlyIds.length > 0) {
+              failed.push({
+                sessionId: session.id,
+                error: `raw_only_retention_failed: ${failedRawOnlyIds.length} observation(s) remain`,
+              });
+              return;
+            }
+          }
           const anchor = activityAnchor(session);
           if (!anchor) {
             skipped.push(session.id);

@@ -259,6 +259,50 @@ describe("Session Sweep Function", () => {
     expect(stored?.endedAt).toBeUndefined();
   });
 
+  it("retires expired raw-only observations from an active recent session", async () => {
+    const session = makeSession({
+      id: "ses_recent_raw",
+      startedAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const raw: RawObservation = {
+      id: "obs_recent_raw",
+      sessionId: session.id,
+      timestamp: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+      hookType: "post_tool_use",
+      toolName: "read",
+      raw: {},
+    };
+    await kv.set(KV.sessions, session.id, session);
+    await kv.set(KV.rawPayloads, raw.id, raw);
+    await kv.set(KV.rawPayloadsBySession(session.id), raw.id, {
+      id: raw.id,
+      sessionId: session.id,
+    });
+
+    const result = (await sdk.trigger({
+      function_id: "mem::session-sweep",
+      payload: {},
+    })) as { swept: string[]; skipped: string[]; failed: unknown[] };
+
+    expect(result.swept).not.toContain(session.id);
+    expect(result.skipped).toContain(session.id);
+    expect(result.failed).toHaveLength(0);
+    expect(await kv.get(KV.rawPayloads, raw.id)).toBeNull();
+    expect(await kv.get(KV.sessions, session.id)).toMatchObject({
+      status: "active",
+    });
+    expect(sdk.triggerCalls).toContainEqual({
+      function_id: "stream::delete",
+      payload: {
+        stream_name: "mem-live",
+        group_id: session.id,
+        item_id: raw.id,
+      },
+      action: undefined,
+    });
+  });
+
   it("skips legacy completed sessions whose activity anchor is <= endedAt (no post-close activity)", async () => {
     const done = makeSession({
       id: "ses_done",
