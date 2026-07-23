@@ -16,6 +16,25 @@ export interface Session {
   commitShas?: string[];
   agentId?: string;
   appliedObservationDeletionIds?: string[];
+  stepTotals?: SessionStepTotals;
+  diffTotals?: SessionDiffTotals;
+}
+
+export interface SessionStepTotals {
+  count: number;
+  cost: number;
+  inputTokens: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  lastAt: string;
+}
+
+export interface SessionDiffTotals {
+  events: number;
+  additions: number;
+  deletions: number;
+  files: string[];
+  lastAt: string;
 }
 
 export interface CommitLink {
