@@ -29,15 +29,6 @@ type QuestionOptionPayload = { label?: unknown; description?: unknown };
 type QuestionPayload = { question?: unknown; header?: unknown; options?: readonly QuestionOptionPayload[] };
 type QuestionToolPayload = { callID?: string; messageID?: string };
 const API = normalizeApiUrl(env.AGENTMEMORY_URL || "http://localhost:3111");
-const FILE_TOOLS = new Set(["read", "write", "edit", "glob", "grep"]);
-const FILE_PATH_KEYS: Record<string, readonly string[]> = {
-  read: ["filePath", "file_path", "path", "file"],
-  write: ["filePath", "file_path", "path", "file"],
-  edit: ["filePath", "file_path", "path", "file"],
-  glob: ["path"],
-  grep: ["path"],
-};
-const MAX_STASHED_FILES = 20;
 
 const DEBUG = env.OPENCODE_AGENTMEMORY_DEBUG === "1";
 const SECRET = env.AGENTMEMORY_SECRET || "";
@@ -634,22 +625,12 @@ function assertHttpsOrLoopback(): void {
   }
 }
 
-function extractFilePaths(tool: string, args: Record<string, unknown>): string[] {
-  const files: string[] = [];
-  for (const key of FILE_PATH_KEYS[tool] ?? []) {
-    const val = args[key];
-    if (typeof val === "string" && val.length > 0) {
-      files.push(val);
-    }
-  }
-  return files;
-}
 
 export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
   const sessionCwd = pluginInput?.directory || process.cwd();
   const projectPath = resolveProject(sessionCwd);
   let activeSessionId: string | null = null;
-  const stashedFiles = new Map<string, Set<string>>();
+  const seenSessions = new Set<string>();
   const seenSubtaskIds = new Map<string, Set<string>>();
   const seenToolCallIds = new Map<string, Set<string>>();
   const contextInjectedSessions = new Set<string>();
@@ -752,25 +733,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
     return next;
   }
 
-  function stashFor(sid: string): Set<string> {
-    let stash = stashedFiles.get(sid);
-    if (!stash) {
-      stash = new Set<string>();
-      stashedFiles.set(sid, stash);
-    }
-    return stash;
-  }
-
-  function addToStash(sid: string, file: string | null | undefined): void {
-    if (typeof file !== "string" || file.length === 0) return;
-    const stash = stashFor(sid);
-    stash.add(file);
-    if (stash.size > MAX_STASHED_FILES) {
-      const keep = [...stash].slice(-MAX_STASHED_FILES);
-      stash.clear();
-      for (const keptFile of keep) stash.add(keptFile);
-    }
-  }
 
   function subtaskSetFor(sid: string): Set<string> {
     let ids = seenSubtaskIds.get(sid);
@@ -811,7 +773,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         const sessionId = info?.id || (event.properties as SessionIdPayload).sessionID;
         if (!sessionId) return;
         if (!info?.parentID || !activeSessionId) activeSessionId = sessionId;
-        stashedFiles.set(sessionId, new Set());
+        seenSessions.add(sessionId);
         seenSubtaskIds.delete(sessionId);
         seenToolCallIds.delete(sessionId);
         contextInjectedSessions.delete(sessionId);
@@ -864,9 +826,9 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         const info = event.properties.info as SessionInfoPayload | undefined;
         const sid = info?.id || ((event.properties as SessionIdPayload).sessionID ?? activeSessionId);
         if (!sid) return;
-        const isResumed = !stashedFiles.has(sid);
+        const isResumed = !seenSessions.has(sid);
         if (isResumed) {
-          stashedFiles.set(sid, new Set());
+          seenSessions.add(sid);
           contextInjectedSessions.delete(sid);
           if (!activeSessionId) activeSessionId = sid;
           const resumeResult: ContextResponse | null = await postJson("/session/start", {
@@ -911,7 +873,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         }
         await post("/session/end", { sessionId: sid });
         if (sid === activeSessionId) activeSessionId = null;
-        stashedFiles.delete(sid);
+        seenSessions.delete(sid);
         startContextCache.delete(sid);
         seenSubtaskIds.delete(sid);
         seenToolCallIds.delete(sid);
@@ -1053,11 +1015,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
           return;
         }
 
-        if (part.type === "file") {
-          const filename = part.filename || part.url || null;
-          addToStash(sid, filename);
-          return;
-        }
 
         if (part.type === "patch") {
           await observe(sid, "patch_applied", {
@@ -1098,13 +1055,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         }
       }
 
-      // ── file.edited ──
-      if (event.type === "file.edited") {
-        const sid = (event.properties as SessionIdPayload).sessionID ?? activeSessionId;
-        if (sid && typeof event.properties.file === "string" && event.properties.file.length > 0) {
-          addToStash(sid, event.properties.file);
-        }
-      }
 
       // ── permission.updated ──
       if (event.type === "permission.updated") {
@@ -1329,9 +1279,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         .filter((p): p is Extract<Part, { type: "file" }> => p.type === "file")
         .map((p) => p.filename || p.url)
         .filter((file): file is string => typeof file === "string" && file.length > 0);
-      for (const f of files) {
-        addToStash(sid, f);
-      }
 
       const textParts = parts.filter((p): p is Extract<Part, { type: "text" }> => p.type === "text" && !p.synthetic && !p.ignored);
       const userText = textParts.map((p) => p.text || "").join("\n");
@@ -1345,19 +1292,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         files: files.slice(0, 20),
         parts_summary: parts.map((p) => p.type).filter(Boolean),
       });
-    },
-
-    // ── tool.execute.before ──
-    "tool.execute.before": async (input, output) => {
-      const tool = input.tool.toLowerCase();
-      if (!FILE_TOOLS.has(tool)) return;
-      const sid = input.sessionID || activeSessionId;
-      if (!sid) return;
-      const args = output.args as Record<string, unknown> | undefined;
-      if (!args) return;
-      for (const fp of extractFilePaths(tool, args)) {
-        addToStash(sid, fp);
-      }
     },
 
     "tool.execute.after": async (input, output) => {
@@ -1426,26 +1360,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         }
         if (contextLoaded) contextInjectedSessions.add(sid);
       }
-
-      const stash = stashFor(sid);
-      if (stash.size === 0) return;
-      const files = [...stash].slice(0, 10);
-
-      const enrichResult: ContextResponse | null = await postJson("/enrich", {
-        sessionId: sid,
-        files,
-        toolName: "enrich_inject",
-      });
-
-      // Clear processed files on any non-null response (not just non-empty
-      // context) so empty-result files do not re-fire /enrich every transform.
-      if (enrichResult !== null) {
-        for (const f of files) stash.delete(f);
-        const enrichCtx = enrichResult.context;
-        if (typeof enrichCtx === "string" && enrichCtx.length > 0 && Array.isArray(output.system)) {
-          output.system.push(enrichCtx);
-        }
-      }
     },
 
     // ── experimental.session.compacting (WIP) ──
@@ -1495,7 +1409,7 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
       if (activeSessionId) {
         void post("/session/checkpoint", { sessionId: activeSessionId });
       }
-      stashedFiles.clear();
+      seenSessions.clear();
       seenSubtaskIds.clear();
       seenToolCallIds.clear();
       contextInjectedSessions.clear();

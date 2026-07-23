@@ -94,7 +94,7 @@ describe("OpenCode plugin: dispose cleanup hook", () => {
     const start = pluginSource.indexOf("dispose:");
     expect(start).toBeGreaterThan(-1);
     const block = pluginSource.slice(start, start + 800);
-    expect(block).toMatch(/stashedFiles\.clear\(\)/);
+    expect(block).toMatch(/seenSessions\.clear\(\)/);
     expect(block).toMatch(/seenSubtaskIds\.clear\(\)/);
     expect(block).toMatch(/seenToolCallIds\.clear\(\)/);
     expect(block).toMatch(/contextInjectedSessions\.clear\(\)/);
@@ -558,43 +558,27 @@ describe("OpenCode plugin behavior: installation.update-available", () => {
   });
 });
 
-describe("OpenCode plugin behavior: file stash invariants", () => {
+describe("no mid-session enrich injection", () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(async () => { await teardownPlugin(); });
 
   const transformInput = (sid: string) => ({ sessionID: sid, model: {} as any });
 
-  it("stashes file.edited paths and surfaces them on the next experimental.chat.system.transform via /enrich", async () => {
+  it("does not call /agentmemory/enrich after file.edited or file parts, and pushes start context once", async () => {
     const { plugin, calls } = await loadPlugin();
-    await createActiveSession(plugin, calls, "s_stash_edited");
+    await createActiveSession(plugin, calls, "s_no_enrich_first");
     await plugin.event!({
-      event: { type: "file.edited", properties: { sessionID: "s_stash_edited", file: "src/auth/jwt.ts" } } as any,
+      event: { type: "file.edited", properties: { sessionID: "s_no_enrich_first", file: "src/auth/jwt.ts" } } as any,
     });
     await plugin.event!({
-      event: { type: "file.edited", properties: { sessionID: "s_stash_edited", file: "src/auth/refresh.ts" } } as any,
-    });
-    const transformOutput = { system: [] as string[] };
-    await plugin["experimental.chat.system.transform"]!(transformInput("s_stash_edited"), transformOutput);
-    const enrichCalls = calls.filter((c) => c.url.endsWith("/agentmemory/enrich"));
-    expect(enrichCalls.length).toBe(1);
-    expect(enrichCalls[0].body.files).toEqual(
-      expect.arrayContaining(["src/auth/jwt.ts", "src/auth/refresh.ts"]),
-    );
-    expect(enrichCalls[0].body.sessionId).toBe("s_stash_edited");
-  });
-
-  it("stashes message.part.updated (file) attachments alongside file.edited entries", async () => {
-    const { plugin, calls } = await loadPlugin();
-    await createActiveSession(plugin, calls, "s_stash_part");
-    await plugin.event!({
-      event: { type: "file.edited", properties: { sessionID: "s_stash_part", file: "docs/spec.md" } } as any,
+      event: { type: "file.edited", properties: { sessionID: "s_no_enrich_first", file: "src/auth/refresh.ts" } } as any,
     });
     await plugin.event!({
       event: {
         type: "message.part.updated",
         properties: {
           part: {
-            sessionID: "s_stash_part",
+            sessionID: "s_no_enrich_first",
             id: "part-file-1",
             type: "file",
             filename: "assets/diagram.png",
@@ -603,45 +587,48 @@ describe("OpenCode plugin behavior: file stash invariants", () => {
       } as any,
     });
     const transformOutput = { system: [] as string[] };
-    await plugin["experimental.chat.system.transform"]!(transformInput("s_stash_part"), transformOutput);
-    const enrichCalls = calls.filter((c) => c.url.endsWith("/agentmemory/enrich"));
-    expect(enrichCalls.length).toBe(1);
-    expect(enrichCalls[0].body.files).toEqual(
-      expect.arrayContaining(["docs/spec.md", "assets/diagram.png"]),
-    );
+    await plugin["experimental.chat.system.transform"]!(transformInput("s_no_enrich_first"), transformOutput);
+    expect(calls.filter((c) => c.url.endsWith("/agentmemory/enrich"))).toHaveLength(0);
+    expect(transformOutput.system).toHaveLength(1);
   });
 
-  it("clears the stash after a successful /enrich so the next transform skips /enrich", async () => {
+  it("does not add another start context on a later transform", async () => {
     const { plugin, calls } = await loadPlugin();
-    await createActiveSession(plugin, calls, "s_stash_clear");
+    await createActiveSession(plugin, calls, "s_no_enrich_second");
     await plugin.event!({
-      event: { type: "file.edited", properties: { sessionID: "s_stash_clear", file: "only.ts" } } as any,
+      event: { type: "file.edited", properties: { sessionID: "s_no_enrich_second", file: "docs/spec.md" } } as any,
     });
-    const output1 = { system: [] as string[] };
-    await plugin["experimental.chat.system.transform"]!(transformInput("s_stash_clear"), output1);
-    expect(calls.filter((c) => c.url.endsWith("/agentmemory/enrich")).length).toBe(1);
-    calls.length = 0;
-    const output2 = { system: [] as string[] };
-    await plugin["experimental.chat.system.transform"]!(transformInput("s_stash_clear"), output2);
-    expect(calls.filter((c) => c.url.endsWith("/agentmemory/enrich")).length).toBe(0);
+    await plugin.event!({
+      event: {
+        type: "file.edited",
+        properties: {
+          sessionID: "s_no_enrich_second",
+          file: "docs/guide.md",
+        },
+      } as any,
+    });
+    const firstOutput = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!(transformInput("s_no_enrich_second"), firstOutput);
+    expect(calls.filter((c) => c.url.endsWith("/agentmemory/enrich"))).toHaveLength(0);
+    expect(firstOutput.system).toHaveLength(1);
+
+    await plugin.event!({
+      event: { type: "file.edited", properties: { sessionID: "s_no_enrich_second", file: "docs/more.md" } } as any,
+    });
+    const secondOutput = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!(transformInput("s_no_enrich_second"), secondOutput);
+    expect(calls.filter((c) => c.url.endsWith("/agentmemory/enrich"))).toHaveLength(0);
+    expect(secondOutput.system).toHaveLength(0);
   });
 
-  it("trims the stash to MAX_STASHED_FILES (20) when the cap is exceeded", async () => {
+  it("does not let tool.execute.after trigger /agentmemory/enrich", async () => {
     const { plugin, calls } = await loadPlugin();
-    await createActiveSession(plugin, calls, "s_stash_cap");
-    for (let i = 0; i < 25; i++) {
-      await plugin.event!({
-        event: { type: "file.edited", properties: { sessionID: "s_stash_cap", file: `f-${i}.ts` } } as any,
-      });
-    }
-    const transformOutput = { system: [] as string[] };
-    await plugin["experimental.chat.system.transform"]!(transformInput("s_stash_cap"), transformOutput);
-    const enrichCall = calls.find((c) => c.url.endsWith("/agentmemory/enrich"));
-    expect(enrichCall).toBeDefined();
-    expect(enrichCall!.body.files.length).toBe(10);
-    expect(enrichCall!.body.files).not.toContain("f-0.ts");
-    expect(enrichCall!.body.files).not.toContain("f-4.ts");
-    expect(enrichCall!.body.files).toContain("f-5.ts");
-    expect(enrichCall!.body.files).toContain("f-14.ts");
+    await createActiveSession(plugin, calls, "s_no_enrich_tool");
+    await plugin.event!({
+      event: { type: "tool.execute.after", properties: { sessionID: "s_no_enrich_tool", tool: "read", args: { filePath: "/tmp/x.ts" } } } as any,
+    });
+    const output = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!(transformInput("s_no_enrich_tool"), output);
+    expect(calls.filter((c) => c.url.endsWith("/agentmemory/enrich"))).toHaveLength(0);
   });
 });

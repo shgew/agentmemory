@@ -55,7 +55,7 @@ describe("OpenCode plugin: resumed-session re-injection", () => {
       plugin.indexOf('if (event.type === "session.diff")'),
     );
     expect(updatedBlock).toMatch(/contextInjectedSessions\.delete\(/);
-    expect(updatedBlock).toMatch(/stashedFiles\.has\(/);
+    expect(updatedBlock).toMatch(/seenSessions\.has\(/);
   });
 });
 

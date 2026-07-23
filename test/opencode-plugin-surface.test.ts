@@ -18,7 +18,6 @@ const EVENT_BRANCHES = [
   "message.removed",
   "message.part.updated",
   "message.part.removed",
-  "file.edited",
   "permission.updated",
   "permission.asked",
   "permission.replied",
@@ -43,7 +42,6 @@ const EVENT_BRANCHES = [
 
 const TYPED_HOOKS = [
   "chat.message",
-  "tool.execute.before",
   "tool.execute.after",
   "shell.env",
   "experimental.chat.system.transform",
@@ -57,7 +55,6 @@ const PART_SUBTYPES = [
   "tool",
   "step-finish",
   "reasoning",
-  "file",
   "patch",
   "compaction",
   "agent",
@@ -83,6 +80,24 @@ describe("OpenCode plugin surface: typed hooks", () => {
 
   it("registers dispose lifecycle hook", () => {
     expect(plugin).toMatch(/\bdispose\s*:\s*async/);
+  });
+});
+
+describe("no enrich surface", () => {
+  it("does not expose /enrich", () => {
+    expect(plugin).not.toMatch(/"\/enrich"/);
+  });
+
+  it("does not expose tool.execute.before", () => {
+    expect(plugin).not.toMatch(/tool\.execute\.before/);
+  });
+
+  it("does not expose part.type === file", () => {
+    expect(plugin).not.toMatch(/part\.type\s*===\s*["']file["']/);
+  });
+
+  it("does not expose enrich stash helpers", () => {
+    expect(plugin).not.toMatch(/stashedFiles|stashFor|addToStash|FILE_TOOLS|FILE_PATH_KEYS|MAX_STASHED_FILES|extractFilePaths/);
   });
 });
 

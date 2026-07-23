@@ -10,7 +10,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/MCP-53_tools-1f6feb?style=flat-square" alt="53 MCP tools" />
-  <img src="https://img.shields.io/badge/Plugin-41_capture_paths-1f6feb?style=flat-square" alt="41 capture paths" />
+  <img src="https://img.shields.io/badge/Plugin-37_capture_paths-1f6feb?style=flat-square" alt="37 capture paths" />
   <img src="https://img.shields.io/badge/Skills-16-1f6feb?style=flat-square" alt="16 skills" />
   <img src="https://img.shields.io/badge/R@5-95.2%25-00875f?style=flat-square" alt="95.2% R@5" />
 </p>
@@ -61,7 +61,7 @@ cp plugin/opencode/agentmemory-capture.ts ~/.config/opencode/plugins/
 cp -R plugin/skills/* ~/.config/opencode/skills/
 ```
 
-OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not required. Restart OpenCode or open a new session. The plugin auto-captures session lifecycle, messages, tool execution, file edits, permissions, and todos.
+OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not required. Restart OpenCode or open a new session. The plugin auto-captures session lifecycle, messages, tool execution, permissions, and todos.
 
 ## What gets captured
 
@@ -100,16 +100,6 @@ OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not req
 | Auto/manual compaction | `message.part.updated` (compaction) | POST /observe |
 | Agent selection | `message.part.updated` (agent) | POST /observe |
 | API retry | `message.part.updated` (retry) | POST /observe |
-
-### File enrichment pipeline
-
-| Event | Hook | agentmemory API |
-|---|---|---|
-| File tool params | `tool.execute.before` -> stash paths | - |
-| File edited | `file.edited` -> stash paths | - |
-| File part attached | `message.part.updated` (file) -> stash paths | - |
-| Enrichment inject | `experimental.chat.system.transform` | POST /enrich -> `output.system[]` |
-| Memory context inject | `experimental.chat.system.transform` | POST /context -> `output.system[]` |
 
 ### Permissions
 
@@ -178,20 +168,6 @@ OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not req
 | Compaction auto-continue | `experimental.compaction.autocontinue` | POST /observe (agent, model_id, overflow, enabled) - observe-only, does NOT modify `output.enabled` |
 | Plugin reload | `dispose` | fires fire-and-forget POST /session/checkpoint for the active session if any, then clears all session-scoped maps in-process. Does NOT post /session/end - the OpenCode session is still alive |
 
-### File enrichment + memory injection (two-layer pipeline)
-
-`experimental.chat.system.transform` fires before every LLM call and injects two layers of context:
-
-1. **Memory context** (once per session): calls `/agentmemory/context` and injects project profile, recent session summaries, and important past observations into the system prompt. Equivalent to Claude's MEMORY.md bridge - instead of syncing to a markdown file, context is injected directly. **Resumed sessions** (when `session.updated` arrives without a prior `session.created` in this plugin process) re-trigger this injection automatically.
-
-2. **File enrichment** (every turn with stashed files): calls `/agentmemory/enrich` with files stashed by `tool.execute.before`, `file.edited`, and `message.part.updated` (file parts). File-specific context (past observations, related bugs, semantic search) is injected into the system prompt.
-
-```text
-System prompt = [OpenCode instructions] + [memory context] + [file enrichment] + [user message]
-                                        ^                 ^
-                               first turn or resume   every file-touching turn
-```
-
 ## Reliability
 
 The plugin is built to survive busy sessions, slow networks, and unattended shutdowns.
@@ -219,7 +195,7 @@ When `OPENCODE_AGENTMEMORY_DEBUG=1` the plugin fires a single `GET /agentmemory/
 
 ### Dispose cleanup
 
-The `dispose` hook fires when OpenCode unloads the plugin (hot reload, host shutdown). It fires a fire-and-forget POST `/session/checkpoint` for the active session if any, then clears every module-level map (`stashedFiles`, `seenSubtaskIds`, `seenToolCallIds`, `contextInjectedSessions`, `startContextCache`, `pendingCommitChecks`, `pendingCommitQueues`, `commitCheckChains`) and resets `activeSessionId` so a re-instantiated plugin starts clean.
+The `dispose` hook fires when OpenCode unloads the plugin (hot reload, host shutdown). It fires a fire-and-forget POST `/session/checkpoint` for the active session if any, then clears every module-level map (`seenSessions`, `seenSubtaskIds`, `seenToolCallIds`, `contextInjectedSessions`, `startContextCache`, `pendingCommitChecks`, `pendingCommitQueues`, `commitCheckChains`) and resets `activeSessionId` so a re-instantiated plugin starts clean.
 
 Explicit deletion calls `/session/end`. If a session is closed without deletion in the OpenCode UI, the server-side `session-sweep` cron handles late finalization. Corpus-wide crystallization and consolidation run only through their configured server schedules or explicit API calls.
 
@@ -227,7 +203,7 @@ Explicit deletion calls `/session/end`. If a session is closed without deletion 
 
 | Env var | Default | Applies to |
 |---|---|---|
-| `OPENCODE_AGENTMEMORY_TIMEOUT_MS` | `5000` | `/observe`, `/context`, `/enrich`, `/session/start`, `/session/end`, `/session/checkpoint`, `/session/commit` |
+| `OPENCODE_AGENTMEMORY_TIMEOUT_MS` | `5000` | `/observe`, `/context`, `/session/start`, `/session/end`, `/session/checkpoint`, `/session/commit` |
 | `OPENCODE_AGENTMEMORY_DEBUG` | unset | when `=1`, log POST failures + fire the init health probe |
 | `AGENTMEMORY_URL` | `http://localhost:3111` | inherited from shell; agentmemory server base URL |
 | `AGENTMEMORY_SECRET` | unset | inherited from shell; bearer token for protected deployments |
@@ -254,7 +230,7 @@ agentmemory  --push-->  OpenCode system prompt
 ```
 
 - `experimental.chat.system.transform` calls `/context` at runtime and pushes the response directly into `output.system[]`
-- Always current - context is fetched at session start (once) and before file-touching turns (per-batch). Resumed sessions re-fetch automatically.
+- Always current - context is fetched at session start (once). Resumed sessions re-fetch automatically.
 - No file intermediary - no stale copies, no merge conflicts, no disk I/O
 - `AGENTS.md` is a static instruction file for project conventions, coding standards, and tool guidance - agentmemory does not read or write it
 

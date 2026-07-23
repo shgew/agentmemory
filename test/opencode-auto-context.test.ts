@@ -34,19 +34,15 @@ describe("OpenCode plugin auto-context injection (#431)", () => {
   });
 });
 
-describe("OpenCode plugin /enrich idempotence", () => {
+describe("OpenCode plugin no enrich in plugin source", () => {
   const plugin = readFileSync(
     "plugin/opencode/agentmemory-capture.ts",
     "utf-8",
   );
 
-  it("drops enriched files from the stash on any non-null response, not only non-empty context", () => {
-    const enrichBlock = plugin.slice(plugin.indexOf('"/enrich"'));
-    // Clearing on enrichResult !== null (server processed the files) stops
-    // empty-result files being re-sent to /enrich on every later transform.
-    expect(enrichBlock).toMatch(
-      /if \(enrichResult !== null\)\s*\{[\s\S]*?for \(const f of files\) stash\.delete\(f\)/,
-    );
+  it("does not mention /enrich or enrich_inject in plugin source", () => {
+    expect(plugin).not.toMatch(/"\/enrich"/);
+    expect(plugin).not.toContain("enrich_inject");
   });
 });
 

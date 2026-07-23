@@ -607,29 +607,21 @@ describe("characterization: typed hooks", () => {
     expect(output.system).toContain("<test-context>");
   });
 
-  it("experimental.chat.system.transform posts /enrich with stashed files and clears the stash", async () => {
+  it("experimental.chat.system.transform does not post /agentmemory/enrich after session.created and file.edited", async () => {
     const { plugin, calls } = await loadPlugin();
     const sid = "s_char_enrich";
-    await plugin["tool.execute.before"]!(
-      { tool: "Read", sessionID: sid } as any,
-      { args: { filePath: "/tmp/enrich-me.ts" } } as any,
-    );
-    await plugin["experimental.chat.system.transform"]!(
-      { sessionID: sid } as any,
-      { system: [] as string[] } as any,
-    );
-    const enrich = findPost(calls, "/enrich");
-    expect(enrich).toBeDefined();
-    expect(enrich!.body.files).toContain("/tmp/enrich-me.ts");
-    expect(enrich!.body.toolName).toBe("enrich_inject");
-
-    const enrichCountBefore = calls.filter((c) => c.url.endsWith("/agentmemory/enrich")).length;
-    await plugin["experimental.chat.system.transform"]!(
-      { sessionID: sid } as any,
-      { system: [] as string[] } as any,
-    );
-    const enrichCountAfter = calls.filter((c) => c.url.endsWith("/agentmemory/enrich")).length;
-    expect(enrichCountAfter).toBe(enrichCountBefore);
+    await plugin.event!({
+      event: { type: "session.created", properties: { info: { id: sid } } } as any,
+    });
+    await plugin.event!({
+      event: { type: "file.edited", properties: { sessionID: sid, file: "/tmp/enrich-me.ts" } } as any,
+    });
+    const output1 = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!({ sessionID: sid } as any, output1 as any);
+    const output2 = { system: [] as string[] };
+    await plugin["experimental.chat.system.transform"]!({ sessionID: sid } as any, output2 as any);
+    const enrichCalls = calls.filter((c) => c.url.endsWith("/agentmemory/enrich"));
+    expect(enrichCalls).toHaveLength(0);
   });
 
   it("experimental.session.compacting posts /context and pushes into output.context", async () => {

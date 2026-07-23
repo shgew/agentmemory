@@ -188,38 +188,30 @@ describe("OpenCode plugin behavior: sanitizeOutput recurses into nested structur
   });
 });
 
-describe("OpenCode plugin behavior: file enrichment", () => {
+describe("OpenCode plugin behavior: file tools no longer trigger enrichment", () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(async () => { await teardownPlugin(); });
 
-  it("captures paths from lowercase file tools", async () => {
-    const { plugin, calls } = await loadPlugin();
-    await plugin["tool.execute.before"]!(
-      { tool: "read", sessionID: "s-file-read", callID: "read-1" } as any,
-      { args: { filePath: "src/index.ts" } } as any,
-    );
-    await plugin["experimental.chat.system.transform"]!(
-      { sessionID: "s-file-read" } as any,
-      { system: [] } as any,
-    );
-
-    const enrich = calls.find((c) => c.url.endsWith("/agentmemory/enrich"));
-    expect(enrich?.body.files).toEqual(["src/index.ts"]);
+  it("does not register tool.execute.before", async () => {
+    const { plugin } = await loadPlugin();
+    expect((plugin as any)["tool.execute.before"]).toBeUndefined();
   });
 
-  it("does not treat a grep pattern as a file path", async () => {
+  it("does not post /agentmemory/enrich after file.edited and transform", async () => {
     const { plugin, calls } = await loadPlugin();
-    await plugin["tool.execute.before"]!(
-      { tool: "grep", sessionID: "s-file-grep", callID: "grep-1" } as any,
-      { args: { path: "src", pattern: "AGENTMEMORY_SECRET" } } as any,
-    );
+    await plugin.event!({
+      event: {
+        type: "file.edited",
+        properties: { sessionID: "s-file-edit", path: "src/index.ts" },
+      } as any,
+    });
     await plugin["experimental.chat.system.transform"]!(
-      { sessionID: "s-file-grep" } as any,
+      { sessionID: "s-file-edit" } as any,
       { system: [] } as any,
     );
 
-    const enrich = calls.find((c) => c.url.endsWith("/agentmemory/enrich"));
-    expect(enrich?.body.files).toEqual(["src"]);
+    const enrichCalls = calls.filter((c) => c.url.endsWith("/agentmemory/enrich"));
+    expect(enrichCalls).toHaveLength(0);
   });
 });
 
