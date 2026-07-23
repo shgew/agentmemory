@@ -173,7 +173,7 @@ agentmemory works with any agent that supports hooks, MCP, or REST API. All agen
 <td align="center" width="12.5%">
 <a href="https://github.com/opencode-ai/opencode"><picture><source media="(prefers-color-scheme: dark)" srcset="https://svgl.app/library/opencode-dark.svg"><img src="https://svgl.app/library/opencode.svg" alt="OpenCode" width="48" height="48" /></picture></a><br/>
 <strong>OpenCode</strong><br/>
-<sub>38 capture paths + MCP + plugin</sub>
+<sub>37 capture paths + MCP + plugin</sub>
 </td>
 <td align="center" width="12.5%">
 <a href="https://github.com/cline/cline"><img src="https://github.com/cline.png?size=120" alt="Cline" width="48" height="48" /></a><br/>
@@ -670,7 +670,7 @@ The agentmemory entry is the **same MCP server block** across every host that us
 | **Codex CLI (MCP only)** | `.codex/config.toml` | TOML shape: `codex mcp add agentmemory -- npx -y @agentmemory/mcp`, or add `[mcp_servers.agentmemory]` manually. |
 | **Codex CLI (full plugin)** | Codex plugin marketplace | `codex plugin marketplace add rohitg00/agentmemory` then `codex plugin add agentmemory@agentmemory`. Registers MCP + 7 lifecycle hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, SubagentStart, SubagentStop, Stop) + 16 skills. On affected Codex Desktop builds, run `agentmemory connect codex --with-hooks` only when `/hooks` does not list the agentmemory plugin source. |
 | **OpenCode (MCP only)** | `opencode.jsonc` or `opencode.json` | Different shape: top-level `mcp` key, command as array: `{"mcp": {"agentmemory": {"type": "local", "command": ["npx", "-y", "@agentmemory/mcp"], "enabled": true}}}`. |
-| **OpenCode (full plugin)** | `plugin/opencode/` | 38 auto-capture paths (one `event` dispatcher with 30 narrowed bus-event branches plus 7 typed hooks plus `dispose`): session lifecycle, messages and parts (including `message.part.removed`), tool execution (`tool.execute.after`), per-tool commit attribution (`shell.env`), permissions (including `permission.asked` and `permission.v2.*`), todos, commands (including `command.execute.before`), git branch switches (`vcs.branch.updated`), LSP diagnostics (`lsp.client.diagnostics`), interactive questions with options summary (`question.asked` / `question.replied` / `question.rejected` v1 + v2 buses), MCP tool registry changes (`mcp.tools.changed`), MCP browser-open failures (`mcp.browser.open.failed`), installation update notifications (`installation.update-available`), PTY lifecycle (`pty.created` + `pty.exited`), compaction auto-continue (`experimental.compaction.autocontinue`, observe-only), server-side trailing-edge idle checkpoint (`AGENTMEMORY_IDLE_CHECKPOINT_MS`, default 10 min, plus a graph-enabled 3-min idle-checkpoint poll), plugin-reload `dispose`, base64/image sanitization, and resumed-session re-injection. Session-start memory context is injected into the system prompt once per session (and re-fetched after compaction/resume); the plugin deliberately performs no mid-session context injection, so the system prompt stays byte-stable and provider prompt caching keeps working. Plugin source is type-narrowed against `EventV1 | EventV2` with zero blanket as-any casts. 16 skills land at `~/.config/opencode/skills/<name>/SKILL.md` - OpenCode's command registry merges them into the slash command palette as `source: "skill"`, so `/recall`, `/remember`, `/health` and the other 6 invocable skills work directly from the palette. One-shot install: `agentmemory connect opencode --with-plugin`. It copies the plugin and skill tree, then updates an existing `opencode.jsonc` or `opencode.json`. OpenCode auto-discovers files in its `plugins/` directory, so no top-level `plugin` array is needed. See [`plugin/opencode/README.md`](plugin/opencode/README.md) for the full hook table. |
+| **OpenCode (full plugin)** | `plugin/opencode/` | 37 auto-capture paths (one `event` dispatcher with 29 narrowed bus-event branches plus 7 typed hooks plus `dispose`): session lifecycle, messages and parts (including `message.part.removed`), tool execution (`tool.execute.after`), per-tool commit attribution (`shell.env`), permissions (including `permission.asked` and `permission.v2.*`), todos, commands (including `command.execute.before`), git branch switches (`vcs.branch.updated`), LSP diagnostics (`lsp.client.diagnostics`), interactive questions with options summary (`question.asked` / `question.replied` / `question.rejected` v1 + v2 buses), MCP tool registry changes (`mcp.tools.changed`), MCP browser-open failures (`mcp.browser.open.failed`), installation update notifications (`installation.update-available`), PTY lifecycle (`pty.created` + `pty.exited`), compaction auto-continue (`experimental.compaction.autocontinue`, observe-only), graph-enabled server idle-checkpoint polling, plugin-reload `dispose`, base64/image sanitization, and resumed-session re-injection. Session-start memory context is injected into the system prompt once per session (and re-fetched after compaction/resume); the plugin deliberately performs no mid-session context injection, so the system prompt stays byte-stable and provider prompt caching keeps working. Plugin source is type-narrowed against `EventV1 | EventV2` with zero blanket as-any casts. 16 skills land at `~/.config/opencode/skills/<name>/SKILL.md` - OpenCode's command registry merges them into the slash command palette as `source: "skill"`, so `/recall`, `/remember`, `/health` and the other 6 invocable skills work directly from the palette. One-shot install: `agentmemory connect opencode --with-plugin`. It copies the plugin and skill tree, then updates an existing `opencode.jsonc` or `opencode.json`. OpenCode auto-discovers files in its `plugins/` directory, so no top-level `plugin` array is needed. See [`plugin/opencode/README.md`](plugin/opencode/README.md) for the full hook table. |
 | **pi** | `~/.pi/agent/extensions/agentmemory` | Copy [`integrations/pi`](integrations/pi/) and restart pi. |
 | **Hermes Agent** | `~/.hermes/config.yaml` | Use the deeper [memory provider plugin](integrations/hermes/) with `memory.provider: agentmemory`. |
 | **Qwen Code** | `~/.qwen/settings.json` | `agentmemory connect qwen` writes the standard `mcpServers` block. Hook payload is field-compatible with Claude Code, so the existing 12-hook scripts work without modification — wire them via the `hooks` section in the same `settings.json`. |
@@ -828,7 +828,7 @@ Every coding agent forgets everything when the session ends. You waste the first
 ```text
 Session 1: "Add auth to the API"
   Agent writes code, runs tests, fixes bugs
-  agentmemory silently captures every tool use
+  agentmemory captures prompts, edits, failures, and outcomes
   Session ends -> observations compressed into structured memory
 
 Session 2: "Now add rate limiting"
@@ -859,13 +859,11 @@ Every AI coding agent ships with built-in memory — Claude Code has `MEMORY.md`
 ### Memory Pipeline
 
 ```text
-PostToolUse hook fires
+Capture hook fires
   -> SHA-256 dedup (5min window)
   -> Privacy filter (strip secrets, API keys)
-  -> Store raw observation
-  -> LLM compress -> structured facts + concepts + narrative
-  -> Vector embedding (6 providers + local)
-  -> Index in BM25 + vector
+  -> Classify as indexed, raw-only, aggregate, or drop
+  -> Store and index only the selected tier
 
 Stop hook fires
   - Record completed assistant turn
@@ -881,6 +879,17 @@ SessionStart hook fires
   -> Token budget (default: 2000 tokens)
   -> Inject into conversation
 ```
+
+### Observation capture policy
+
+| Tier | Events | Storage and search |
+|---|---|---|
+| Indexed | Prompts, assistant responses, failures, edits, commands, tasks, and outcomes | Raw payload plus compressed observation and BM25. Conversation, error, decision, subagent, and task observations also get vectors. |
+| Raw-only | Successful file reads, searches, and web fetches | Available to session replay for 24 hours. Not added to BM25, vectors, file history, or long-term context. |
+| Aggregate | Step finish metrics and the current session diff snapshot | Stored on the session row as token/cost totals and the current changed-file set. No observation row or search entry. |
+| Drop | Reasoning parts and low-value lifecycle noise | Not stored. |
+
+After upgrading an existing deployment, call `POST /agentmemory/reindex-vectors` once to rebuild the vector index with the new observation whitelist. Existing BM25 rows age out through normal retention.
 
 ### 4-Tier Memory Consolidation
 
@@ -913,7 +922,7 @@ Memories decay over time (Ebbinghaus curve). Frequently accessed memories streng
 
 | Capability | Description |
 |---|---|
-| **Automatic capture** | Every tool use recorded via hooks — zero manual effort |
+| **Automatic capture** | Hook events routed into indexed, raw-only, aggregate, or dropped tiers |
 | **Semantic search** | BM25 + vector + knowledge graph with RRF fusion |
 | **Memory evolution** | Versioning, supersession, relationship graphs |
 | **Auto-forgetting** | TTL expiry, contradiction detection, importance eviction |

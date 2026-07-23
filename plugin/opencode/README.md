@@ -4,13 +4,13 @@
 </h1>
 
 <p align="center">
-  <strong>Your OpenCode agents remember everything. No more re-explaining.</strong><br/>
+  <strong>Your OpenCode agents remember decisions, edits, failures, and outcomes.</strong><br/>
   <sub>Persistent cross-session memory via <a href="https://github.com/rohitg00/agentmemory">agentmemory</a> - 95.2% retrieval accuracy on <a href="https://arxiv.org/abs/2410.10813">LongMemEval-S</a>.</sub>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/MCP-53_tools-1f6feb?style=flat-square" alt="53 MCP tools" />
-  <img src="https://img.shields.io/badge/Plugin-38_capture_paths-1f6feb?style=flat-square" alt="38 capture paths" />
+  <img src="https://img.shields.io/badge/Plugin-37_capture_paths-1f6feb?style=flat-square" alt="37 capture paths" />
   <img src="https://img.shields.io/badge/Skills-16-1f6feb?style=flat-square" alt="16 skills" />
   <img src="https://img.shields.io/badge/R@5-95.2%25-00875f?style=flat-square" alt="95.2% R@5" />
 </p>
@@ -70,10 +70,9 @@ OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not req
 | Event | Hook | agentmemory API |
 |---|---|---|
 | Session start | `session.created` | POST /session/start |
-| Idle | `session.status` (idle) | POST /session/checkpoint |
 | Compaction | `session.compacted` | POST /session/checkpoint + POST /observe |
 | Metadata updates / resume | `session.updated` | First sighting of a session without `session.created` calls POST /session/start with `resumed: true` |
-| Code change tracking | `session.diff` | POST /observe |
+| Code change tracking | `session.diff` | POST /observe; server replaces the current session diff snapshot |
 | Session delete | `session.deleted` | POST /session/end |
 | Session error | `session.error` | POST /observe |
 
@@ -94,12 +93,24 @@ OpenCode auto-discovers the copied plugin. A top-level `plugin` array is not req
 | Tool completed (early signal) | `tool.execute.after` | POST /observe (deduped against message.part.updated) |
 | Tool completed (state lag path) | `message.part.updated` (tool completed) | POST /observe (dedup via shared `seenToolCallIds`) |
 | Tool error | `message.part.updated` (tool error) | POST /observe |
-| Step finish (cost/tokens) | `message.part.updated` (step-finish) | POST /observe |
-| Reasoning trace | `message.part.updated` (reasoning) | POST /observe |
+| Step finish (cost/tokens) | `message.part.updated` (step-finish) | POST /observe; server adds session token and cost totals |
 | Patch applied | `message.part.updated` (patch) | POST /observe |
 | Auto/manual compaction | `message.part.updated` (compaction) | POST /observe |
 | Agent selection | `message.part.updated` (agent) | POST /observe |
 | API retry | `message.part.updated` (retry) | POST /observe |
+
+### Server capture tiers
+
+The plugin sends tool and lifecycle events to `/observe`. The server applies four tiers:
+
+| Tier | OpenCode events | Result |
+|---|---|---|
+| Indexed | Prompts, assistant responses, failures, edits, commands, tasks, and outcomes | Compressed observation plus BM25. Conversation, error, decision, subagent, and task types also get vectors. |
+| Raw-only | Successful read, search, and web tools | Replayable for 24 hours, with no compressed row, BM25 entry, vector, file-history entry, or long-term context entry. |
+| Aggregate | `step-finish` and `session.diff` | Session token/cost totals and the current diff snapshot. No observation row. |
+| Drop | Reasoning parts and low-value lifecycle noise | Not sent by this plugin or stored by the server. |
+
+After deploying this policy over an older server, call `POST /agentmemory/reindex-vectors` once to remove vectors for observation types that are now BM25-only.
 
 ### Permissions
 
@@ -174,10 +185,10 @@ The plugin is built to survive busy sessions, slow networks, and unattended shut
 
 ### Server-side deduplication and trailing-edge idle checkpoint
 
-`/session/checkpoint` is idempotent on the server. Graph checkpoint timing is trailing-edge and lives entirely server-side - the plugin posts unconditionally on idle, compaction, and dispose, and never debounces client-side.
+`/session/checkpoint` is idempotent on the server. Graph checkpoint timing is trailing-edge and lives entirely server-side. The plugin posts on compaction and dispose. Ordinary idle transitions do not call the endpoint.
 
 1. **Watermark no-op**: when nothing has been observed since `lastCheckpointAt`, the server returns `{ noOp: true }` and skips graph extraction.
-2. **Trailing-edge idle gate**: the reactive POST fires `event::session::checkpoint` only when `now - updatedAt >= AGENTMEMORY_IDLE_CHECKPOINT_MS` (default 10 min; `AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS` is honored as a back-compat alias). Because an idle POST lands right after activity, `updatedAt` is fresh and the reactive path almost always returns `{ throttled: true, retryAfterMs }` without graph work. Any new observation bumps `updatedAt` and resets the countdown. Set the threshold to `0` to disable the gate.
+2. **Trailing-edge idle gate**: the server fires `event::session::checkpoint` only when `now - updatedAt >= AGENTMEMORY_IDLE_CHECKPOINT_MS` (default 10 min; `AGENTMEMORY_CHECKPOINT_DEBOUNCE_MS` is honored as a back-compat alias). Any new observation bumps `updatedAt` and resets the countdown. Set the threshold to `0` to disable the gate.
 
 When graph extraction is enabled, a server-side **idle-checkpoint poll** runs every `AGENTMEMORY_IDLE_CHECKPOINT_POLL_MS` (default 3 min, gated by `AGENTMEMORY_IDLE_CHECKPOINT_ENABLED`). It extracts the new graph window for each active session idle past the threshold and keeps the session `active`. With graph extraction disabled, the poll stays off because idle checkpoints intentionally skip session summaries. Marking a session done is reserved for the 6h `session-sweep` and explicit `session.deleted` -> `/session/end`.
 
@@ -282,7 +293,7 @@ Agentmemory usage instructions are injected into the system prompt on the first 
 |---|---|
 | `permission.ask` typed hook | Declared in `@opencode-ai/plugin@1.17.7` types but the runtime never invokes it (regression from the Effect refactor, tracked in [opencode-ai/opencode#28066](https://github.com/anomalyco/opencode/issues/28066) / [#7006](https://github.com/anomalyco/opencode/issues/7006)). We capture the equivalent lifecycle via the `permission.asked` bus event instead. |
 | `experimental.session.compacting` | Still experimental upstream. The plugin handles it - if the Go binary wires the dispatch it takes effect automatically. |
-| `SubagentStop` / `task.completed` / `subtask.completed` | OpenCode's `SubtaskPart` type still has no completion / result fields ([packages/core SubtaskPart](https://github.com/anomalyco/opencode/blob/main/packages/core/src/v1/session.ts)). Closest signal is `session.status` (idle), already covered. |
+| `SubagentStop` / `task.completed` / `subtask.completed` | OpenCode's `SubtaskPart` type still has no completion / result fields ([packages/core SubtaskPart](https://github.com/anomalyco/opencode/blob/main/packages/core/src/v1/session.ts)). Session deletion and the server sweep provide completion boundaries. |
 | Claude `MEMORY.md` bridge | OpenCode-specific - OpenCode uses its own `AGENTS.md` mechanism, not Claude's `MEMORY.md`. |
 | `chat.headers`, `tool.definition`, `experimental.text.complete`, `experimental.provider.small_model` typed hooks | Lower-signal hooks; not wired. Open an issue if a use case appears. |
 | `installation.*` (apart from `installation.update-available`), `lsp.updated`, `pty.updated`, `pty.deleted`, `tui.*` bus events | Lower-signal bus events; not wired. Open an issue if a use case appears. (Code-health-shaped `lsp.client.diagnostics`, interactive `question.*` / `question.v2.*`, `mcp.tools.changed`, `mcp.browser.open.failed`, `installation.update-available`, and `pty.created` / `pty.exited` ARE wired - see tables above.) |
