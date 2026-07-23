@@ -9,7 +9,6 @@ const plugin = readFileSync(
 
 const EVENT_BRANCHES = [
   "session.created",
-  "session.status",
   "session.compacted",
   "session.updated",
   "session.diff",
@@ -54,7 +53,6 @@ const PART_SUBTYPES = [
   "subtask",
   "tool",
   "step-finish",
-  "reasoning",
   "patch",
   "compaction",
   "agent",
@@ -107,6 +105,10 @@ describe("OpenCode plugin surface: message.part subtypes", () => {
       expect(plugin).toMatch(new RegExp(`part\\.type\\s*===\\s*["']${sub}["']`));
     });
   }
+
+  it("does not capture reasoning parts", () => {
+    expect(plugin).not.toMatch(/part\.type\s*===\s*["']reasoning["']/);
+  });
 });
 
 describe("OpenCode plugin surface: dedup invariants", () => {

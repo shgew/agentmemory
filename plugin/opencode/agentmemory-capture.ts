@@ -796,21 +796,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
         }
       }
 
-      // session.idle (the deprecated v1 bus event) intentionally not handled.
-      // SessionStatus.set() publishes session.status first, then session.idle;
-      // both fire on the same idle transition. session.status is the typed v2
-      // superset (idle/busy/retry). We listen only to session.status to avoid
-      // duplicate /session/checkpoint POSTs.
-      // ── session.status ──
-      if (event.type === "session.status") {
-        const status = event.properties.status as { type?: string; attempt?: unknown; message?: unknown } | undefined;
-        const sid = event.properties.sessionID ?? activeSessionId;
-        if (!sid || !status) return;
-        if (status.type === "idle") {
-          await post("/session/checkpoint", { sessionId: sid });
-        }
-      }
-
       // ── session.compacted ──
       if (event.type === "session.compacted") {
         const sid = event.properties.sessionID ?? activeSessionId;
@@ -1005,16 +990,6 @@ export const AgentmemoryCapturePlugin: Plugin = async (pluginInput) => {
           });
           return;
         }
-
-        if (part.type === "reasoning") {
-          await observe(sid, "reasoning", {
-            messageID: part.messageID,
-            partID: part.id,
-            text: safeSlice(part.text, 4000),
-          });
-          return;
-        }
-
 
         if (part.type === "patch") {
           await observe(sid, "patch_applied", {

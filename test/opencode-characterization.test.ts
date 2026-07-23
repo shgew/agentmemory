@@ -83,12 +83,12 @@ describe("characterization: session lifecycle bus events", () => {
     expect(start!.body.parentID).toBe("s_char_parent");
   });
 
-  it("session.status idle posts only /session/checkpoint", async () => {
+  it("session.status idle does not post", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
       event: { type: "session.status", properties: { sessionID: "s_char_idle", status: { type: "idle", attempt: 0, message: "done" } } } as any,
     });
-    expect(findPost(calls, "/session/checkpoint")).toBeDefined();
+    expect(findPost(calls, "/session/checkpoint")).toBeUndefined();
     expect(findObserve(calls, "session_status")).toBeUndefined();
   });
 
@@ -351,7 +351,7 @@ describe("characterization: message.part.updated subtypes", () => {
     expect(obs!.body.data.reasoning_tokens).toBe(5);
   });
 
-  it("reasoning observes reasoning with sliced text", async () => {
+  it("reasoning does not post an observation", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
       event: {
@@ -359,9 +359,7 @@ describe("characterization: message.part.updated subtypes", () => {
         properties: { part: { type: "reasoning", sessionID: "s_char_reason", messageID: "m1", text: "thinking hard about it" } },
       } as any,
     });
-    const obs = findObserve(calls, "reasoning");
-    expect(obs).toBeDefined();
-    expect(obs!.body.data.text).toBe("thinking hard about it");
+    expect(findObserve(calls, "reasoning")).toBeUndefined();
   });
 
   it("patch observes patch_applied with hash and files", async () => {

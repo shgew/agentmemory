@@ -19,6 +19,7 @@ describe("capture noise filtering", () => {
     "messages_transform",
     "config_loaded",
     "file_watcher",
+    "reasoning",
   ])(
     "drops %s without extending session lifetime",
     async (hookType) => {
@@ -73,38 +74,23 @@ describe("capture noise filtering", () => {
     },
   );
 
-  it("logs one step_finish capture sample every 20 events", async () => {
+  it("does not log capture work for dropped reasoning", async () => {
     const { registerObserveFunction } = await import(
       "../src/functions/observe.js"
     );
     const sdk = mockSdk();
     const kv = mockKV();
-    await kv.set("mem:sessions", "ses_steps", {
-      id: "ses_steps",
-      project: "agentmemory",
-      cwd: "/repo/agentmemory",
-      startedAt: "2026-07-15T09:00:00.000Z",
-      updatedAt: "2026-07-15T09:00:00.000Z",
-      status: "active",
-      observationCount: 0,
-    });
     registerObserveFunction(sdk as never, kv as never);
 
-    for (let index = 0; index < 20; index++) {
-      await sdk.trigger("mem::observe", {
-        sessionId: "ses_steps",
-        project: "agentmemory",
-        cwd: "/repo/agentmemory",
-        hookType: "step_finish",
-        timestamp: `2026-07-15T10:00:${String(index).padStart(2, "0")}.000Z`,
-        data: { input_tokens: index },
-      });
-    }
+    await sdk.trigger("mem::observe", {
+      sessionId: "ses_reasoning",
+      project: "agentmemory",
+      cwd: "/repo/agentmemory",
+      hookType: "reasoning",
+      timestamp: "2026-07-15T10:00:00.000Z",
+      data: { text: "internal trace" },
+    });
 
-    expect(
-      getLoggerInfoMock().mock.calls.filter(
-        ([message]) => message === "Step-finish capture sample",
-      ),
-    ).toHaveLength(1);
+    expect(getLoggerInfoMock()).not.toHaveBeenCalled();
   });
 });

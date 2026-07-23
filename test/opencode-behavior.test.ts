@@ -424,11 +424,11 @@ describe("OpenCode plugin behavior: root session ownership", () => {
   });
 });
 
-describe("OpenCode plugin behavior: session.status is the canonical idle signal", () => {
+describe("OpenCode plugin behavior: idle checkpoints stay server-owned", () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(async () => { await teardownPlugin(); });
 
-  it("fires /session/checkpoint on session.status with type=idle", async () => {
+  it("does not fire /session/checkpoint on session.status with type=idle", async () => {
     const { plugin, calls } = await loadPlugin();
     await plugin.event!({
       event: {
@@ -437,7 +437,7 @@ describe("OpenCode plugin behavior: session.status is the canonical idle signal"
       } as any,
     });
     const checkpoint = calls.find((c) => c.url.endsWith("/agentmemory/session/checkpoint"));
-    expect(checkpoint).toBeDefined();
+    expect(checkpoint).toBeUndefined();
   });
 
   it("does NOT fire /session/checkpoint on session.status with type=busy", async () => {
@@ -461,7 +461,7 @@ describe("OpenCode plugin behavior: session.status is the canonical idle signal"
     expect(checkpoints.length).toBe(0);
   });
 
-  it("fires /session/checkpoint on every session.status idle (server applies the 10-min debounce)", async () => {
+  it("does not fire /session/checkpoint on repeated session.status idle", async () => {
     const { plugin, calls } = await loadPlugin();
     const evt = {
       event: {
@@ -472,7 +472,7 @@ describe("OpenCode plugin behavior: session.status is the canonical idle signal"
     await plugin.event!(evt);
     await plugin.event!(evt);
     const checkpoints = calls.filter((c) => c.url.endsWith("/agentmemory/session/checkpoint"));
-    expect(checkpoints.length).toBe(2);
+    expect(checkpoints.length).toBe(0);
   });
 });
 
