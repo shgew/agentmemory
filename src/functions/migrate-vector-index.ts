@@ -2,6 +2,7 @@ import type { EmbeddingProvider, CompressedObservation, Memory } from "../types.
 import { VectorIndex } from "../state/vector-index.js";
 import { KV } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
+import { shouldVectorizeObservation } from "./capture-policy.js";
 import { logger } from "../logger.js";
 import {
   clipEmbedInput,
@@ -168,7 +169,10 @@ export async function migrateVectorIndex(
       const observations = await kv.list<CompressedObservation>(
         KV.observations(session.id),
       );
-      const textObs = observations.filter((o) => o.title);
+      const textObs = observations.filter(
+        (observation) =>
+          observation.title && shouldVectorizeObservation(observation.type),
+      );
       const result = await embedJobs(
         textObs.map((observation) => ({
           id: observation.id,

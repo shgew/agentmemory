@@ -56,6 +56,18 @@ async function seedCorpus(kv: ReturnType<typeof mockKV>) {
     files: [],
     importance: 5,
   });
+  await kv.set("mem:obs:ses_1", "obs_command", {
+    id: "obs_command",
+    sessionId: "ses_1",
+    timestamp: new Date().toISOString(),
+    type: "command_run",
+    title: "npm test",
+    facts: [],
+    narrative: "passed",
+    concepts: [],
+    files: [],
+    importance: 5,
+  });
   await kv.set("mem:memories", "mem_1", {
     id: "mem_1",
     createdAt: new Date().toISOString(),
@@ -95,6 +107,7 @@ describe("reindexVectors", () => {
     expect(result.provider).toBe("test-4d");
     expect(result.dimensions).toBe(4);
     expect(getVectorIndex()!.size).toBe(2);
+    expect(getVectorIndex()!.serialize()).not.toContain("obs_command");
   });
 
   it("returns success:false without swapping when no embedding provider is configured", async () => {
@@ -205,7 +218,7 @@ describe("reindexVectors", () => {
     releaseReindex();
     await expect(Promise.all([reindexing, rebuilding])).resolves.toEqual([
       expect.objectContaining({ success: true }),
-      2,
+      3,
     ]);
   });
 });
